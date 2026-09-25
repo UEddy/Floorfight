@@ -10,15 +10,23 @@
  * positions, never send hits, never send scores. If a value can be produced by
  * a phone, it is untrusted.
  *
+ * Lag compensation lives inside this file on purpose. The obvious design is to
+ * rewind by the connection's measured latency, but latency is not in the match
+ * log, so a replay would not reproduce the result and the audit story would be
+ * worthless. Instead the client declares which tick it was rendering, the
+ * server clamps it to MAX_REWIND, and the clamped value travels in the input.
+ * Rewind then reproduces exactly on replay.
+ *
  * Determinism notes:
- *   - Only +, -, *, / and comparisons on IEEE-754 doubles. These are exact and
- *     identical across engines.
- *   - Math.sin and Math.cos are NOT specified to the last bit, so all angles are
+ *   - Only +, -, *, / and comparisons on IEEE-754 doubles.
+ *   - Math.sin and Math.cos are not specified to the last bit, so yaw is
  *     quantised to integer units and resolved through a lookup table.
- *   - The table itself is built with Math.sin at module load. Server (Node) and
- *     client (Chromium WebView) are both V8, so they agree today. Before anyone
- *     verifies a replay on a non-V8 engine, freeze this table to a checked-in
- *     binary asset.
+ *   - That table is built with Math.sin at load. Server (Node) and client
+ *     (Chromium WebView) are both V8, so they agree. Before anyone verifies a
+ *     replay on a non-V8 engine, freeze the table to a checked-in binary.
+ *   - Pitch still uses Math.sin and Math.cos directly. It only affects the ray
+ *     direction and both ends run V8. If that stops being true, quantise pitch
+ *     the same way as yaw.
  *   - No Date.now, no Math.random, no iteration over object keys.
  */
 
@@ -27,7 +35,7 @@ export const TICK_MS = 1000 / TICK_HZ;
 export const SNAPSHOT_EVERY = 3; // 20 Hz on the wire
 
 export const ARENA_HALF = 30;
-export const PLAYER_SPEED = 7.4; // units per second
+export const PLAYER_SPEED = 7.4;
 export const PLAYER_RADIUS = 0.45;
 export const EYE_HEIGHT = 1.7;
 
@@ -46,7 +54,10 @@ export const DAMAGE_HEAD = 100;
 export const RESPAWN_TICKS = 90;
 export const ROUND_TICKS = 90 * TICK_HZ;
 
-export const YAW_UNITS = 8192; // quantisation of a full turn
+export const MAX_REWIND = 15;     // ticks, 250 ms
+export const HISTORY_TICKS = 20;  // ring size, must exceed MAX_REWIND
+
+export const YAW_UNITS = 8192;
 export const PITCH_LIMIT = 1.45;
 
 /* ---------------------------------------------------------------- trig --- */
@@ -69,14 +80,9 @@ export function yawToRadians(u: number): number {
 /* ----------------------------------------------------------------- map --- */
 
 export interface Box {
-  x: number;
-  z: number;
-  hx: number;
-  hz: number;
-  top: number;
+  x: number; z: number; hx: number; hz: number; top: number;
 }
 
-/** Seeded LCG. Only ever used at load time to build the static map. */
 function makeMap(seed: number): Box[] {
   let s = seed >>> 0;
   const rnd = () => {
@@ -88,7 +94,7 @@ function makeMap(seed: number): Box[] {
     const sx = 2 + rnd() * 4;
     const sy = 1.6 + rnd() * 3.4;
     const sz = 2 + rnd() * 4;
-    let px = (rnd() - 0.5) * (ARENA_HALF * 1.8);
+    const px = (rnd() - 0.5) * (ARENA_HALF * 1.8);
     let pz = (rnd() - 0.5) * (ARENA_HALF * 1.8);
     if (Math.abs(px) < 5 && Math.abs(pz) < 5) pz += 9;
     out.push({ x: px, z: pz, hx: sx / 2, hz: sz / 2, top: sy });
@@ -111,7 +117,7 @@ export interface PlayerState {
   id: number;
   x: number;
   z: number;
-  yaw: number;   // integer, 0..YAW_UNITS
+  yaw: number;   // integer units
   pitch: number; // radians, clamped
   hp: number;
   kills: number;
@@ -122,13 +128,23 @@ export interface PlayerState {
   lastInputTick: number;
 }
 
+/** Positions as they stood at the end of one tick. Used only for rewind. */
+export interface HistFrame {
+  tick: number;
+  x: Float64Array;
+  z: Float64Array;
+  alive: Uint8Array;
+}
+
 export interface WorldState {
   tick: number;
-  players: PlayerState[]; // stable order, indexed by slot
+  players: PlayerState[];  // stable order, indexed by slot
+  history: HistFrame[];    // ring of HISTORY_TICKS, indexed tick % HISTORY_TICKS
 }
 
 export interface Input {
-  tick: number;
+  tick: number;  // the tick this input is meant for
+  view: number;  // the tick the client was rendering when it fired
   moveX: number; // -127..127, strafe
   moveY: number; // -127..127, forward positive
   yaw: number;   // 0..YAW_UNITS-1
@@ -142,6 +158,7 @@ export interface HitEvent {
   victim: number;
   head: boolean;
   lethal: boolean;
+  rewind: number; // ticks the server rewound, after clamping
 }
 
 export function newPlayer(id: number, slot: number): PlayerState {
@@ -151,6 +168,22 @@ export function newPlayer(id: number, slot: number): PlayerState {
     hp: MAX_HP, kills: 0, deaths: 0, alive: true,
     respawnAt: 0, lastFireTick: -999, lastInputTick: -1,
   };
+}
+
+export function createWorld(slots: number): WorldState {
+  const players: PlayerState[] = [];
+  for (let i = 0; i < slots; i++) players.push(newPlayer(i, i));
+
+  const history: HistFrame[] = [];
+  for (let i = 0; i < HISTORY_TICKS; i++) {
+    history.push({
+      tick: -1,
+      x: new Float64Array(slots),
+      z: new Float64Array(slots),
+      alive: new Uint8Array(slots),
+    });
+  }
+  return { tick: 0, players, history };
 }
 
 /* ----------------------------------------------------------- collision --- */
@@ -177,34 +210,28 @@ function rayBox(
   let tmin = 0;
   let tmax = WEAPON_RANGE;
 
-  // x
   if (dx === 0) { if (ox < minX || ox > maxX) return -1; }
   else {
     const inv = 1 / dx;
-    let t1 = (minX - ox) * inv;
-    let t2 = (maxX - ox) * inv;
+    let t1 = (minX - ox) * inv, t2 = (maxX - ox) * inv;
     if (t1 > t2) { const t = t1; t1 = t2; t2 = t; }
     if (t1 > tmin) tmin = t1;
     if (t2 < tmax) tmax = t2;
     if (tmin > tmax) return -1;
   }
-  // y
   if (dy === 0) { if (oy < minY || oy > maxY) return -1; }
   else {
     const inv = 1 / dy;
-    let t1 = (minY - oy) * inv;
-    let t2 = (maxY - oy) * inv;
+    let t1 = (minY - oy) * inv, t2 = (maxY - oy) * inv;
     if (t1 > t2) { const t = t1; t1 = t2; t2 = t; }
     if (t1 > tmin) tmin = t1;
     if (t2 < tmax) tmax = t2;
     if (tmin > tmax) return -1;
   }
-  // z
   if (dz === 0) { if (oz < minZ || oz > maxZ) return -1; }
   else {
     const inv = 1 / dz;
-    let t1 = (minZ - oz) * inv;
-    let t2 = (maxZ - oz) * inv;
+    let t1 = (minZ - oz) * inv, t2 = (maxZ - oz) * inv;
     if (t1 > t2) { const t = t1; t1 = t2; t2 = t; }
     if (t1 > tmin) tmin = t1;
     if (t2 < tmax) tmax = t2;
@@ -214,31 +241,27 @@ function rayBox(
 }
 
 /**
- * Resolve one shot against a given world snapshot.
+ * Resolve one shot against a historical frame.
  *
- * Called by the server twice: once against the live world, and once against a
- * rewound snapshot for lag compensation. Never called with client-supplied
- * geometry.
+ * Only victims are rewound. The shooter fires from where they are now, because
+ * they were never wrong about their own position. This asymmetry is what makes
+ * "I shot them, they were right there" agree with what the server decides.
  */
-export function hitscan(
-  world: WorldState,
+export function hitscanFrame(
+  frame: HistFrame,
   shooterSlot: number,
+  ox: number,
+  oz: number,
   yaw: number,
   pitch: number,
 ): { victimSlot: number; head: boolean; dist: number } | null {
-  const shooter = world.players[shooterSlot];
-  if (!shooter || !shooter.alive) return null;
-
   const cp = Math.cos(pitch);
   const dx = -sinU(yaw) * cp;
   const dy = Math.sin(pitch);
   const dz = -cosU(yaw) * cp;
-
-  const ox = shooter.x;
   const oy = EYE_HEIGHT;
-  const oz = shooter.z;
 
-  // nearest wall or crate first, so cover actually works
+  // World geometry is static, so cover is checked against the live map.
   let wall = WEAPON_RANGE;
   for (let i = 0; i < CRATES.length; i++) {
     const c = CRATES[i];
@@ -248,17 +271,17 @@ export function hitscan(
   }
 
   let best: { victimSlot: number; head: boolean; dist: number } | null = null;
-  for (let i = 0; i < world.players.length; i++) {
-    if (i === shooterSlot) continue;
-    const p = world.players[i];
-    if (!p || !p.alive) continue;
+  for (let i = 0; i < frame.alive.length; i++) {
+    if (i === shooterSlot || !frame.alive[i]) continue;
+    const px = frame.x[i];
+    const pz = frame.z[i];
 
     const dHead = rayBox(ox, oy, oz, dx, dy, dz,
-      p.x - HEAD_HALF, HEAD_BOTTOM, p.z - HEAD_HALF,
-      p.x + HEAD_HALF, HEAD_TOP, p.z + HEAD_HALF);
+      px - HEAD_HALF, HEAD_BOTTOM, pz - HEAD_HALF,
+      px + HEAD_HALF, HEAD_TOP, pz + HEAD_HALF);
     const dBody = rayBox(ox, oy, oz, dx, dy, dz,
-      p.x - BODY_HALF_X, 0, p.z - BODY_HALF_Z,
-      p.x + BODY_HALF_X, BODY_TOP, p.z + BODY_HALF_Z);
+      px - BODY_HALF_X, 0, pz - BODY_HALF_Z,
+      px + BODY_HALF_X, BODY_TOP, pz + BODY_HALF_Z);
 
     let d = -1;
     let head = false;
@@ -272,15 +295,32 @@ export function hitscan(
   return best;
 }
 
+function record(world: WorldState): void {
+  const f = world.history[world.tick % HISTORY_TICKS];
+  f.tick = world.tick;
+  for (let i = 0; i < world.players.length; i++) {
+    const p = world.players[i];
+    f.x[i] = p.x;
+    f.z[i] = p.z;
+    f.alive[i] = p.alive ? 1 : 0;
+  }
+}
+
+function frameAt(world: WorldState, tick: number): HistFrame {
+  const f = world.history[((tick % HISTORY_TICKS) + HISTORY_TICKS) % HISTORY_TICKS];
+  // A ring slot holding a different tick means the request fell outside the
+  // window. Fall back to the current frame rather than trusting stale data.
+  return f.tick === tick ? f : world.history[world.tick % HISTORY_TICKS];
+}
+
 /* ---------------------------------------------------------------- step --- */
 
 /**
  * Advance the world exactly one tick.
  *
  * `inputs` is indexed by slot. A missing input means the player sent nothing
- * for this tick, which is treated as "no movement, no fire" rather than as a
- * reason to extrapolate. Dropping input is the client's problem, not a licence
- * for the server to invent motion.
+ * for this tick and is treated as no movement and no fire. Dropped input is
+ * the client's problem, never a licence for the server to invent motion.
  */
 export function step(
   world: WorldState,
@@ -305,15 +345,15 @@ export function step(
     const inp = inputs[slot];
     if (!inp) continue;
 
-    // Sanitise. Anything out of range is a malformed or hostile client.
+    // Sanitise. Out of range means a malformed or hostile client.
     const mx = clamp(inp.moveX, -127, 127) / 127;
     const my = clamp(inp.moveY, -127, 127) / 127;
-    p.yaw = ((inp.yaw | 0) % YAW_UNITS + YAW_UNITS) % YAW_UNITS;
+    p.yaw = (((inp.yaw | 0) % YAW_UNITS) + YAW_UNITS) % YAW_UNITS;
     p.pitch = clamp((inp.pitch / 32767) * PITCH_LIMIT, -PITCH_LIMIT, PITCH_LIMIT);
     p.lastInputTick = inp.tick;
 
-    // Magnitude clamp: diagonal input cannot beat straight input.
-    let mag = Math.sqrt(mx * mx + my * my);
+    // Diagonal input must not beat straight input.
+    const mag = Math.sqrt(mx * mx + my * my);
     let ax = mx, ay = my;
     if (mag > 1) { ax = mx / mag; ay = my / mag; }
 
@@ -326,7 +366,11 @@ export function step(
     if (!blocked(p.x, p.z + vz, PLAYER_RADIUS)) p.z += vz;
   }
 
-  // Firing resolves after all movement so ordering cannot be gamed by slot.
+  // Positions for this tick are final. Record before any shot resolves, so a
+  // shot that rewinds zero ticks sees the state the shooter is looking at.
+  record(world);
+
+  // Firing resolves in a second pass, so slot order cannot buy an advantage.
   for (let slot = 0; slot < world.players.length; slot++) {
     const p = world.players[slot];
     const inp = inputs[slot];
@@ -334,12 +378,17 @@ export function step(
     if (tick - p.lastFireTick < FIRE_COOLDOWN) continue;
     p.lastFireTick = tick;
 
-    const hit = hitscan(world, slot, p.yaw, p.pitch);
+    const view = clamp(inp.view | 0, tick - MAX_REWIND, tick);
+    const rewind = tick - view;
+    const hit = hitscanFrame(frameAt(world, view), slot, p.x, p.z, p.yaw, p.pitch);
     if (!hit) continue;
 
     const victim = world.players[hit.victimSlot];
-    const dmg = hit.head ? DAMAGE_HEAD : DAMAGE_BODY;
-    victim.hp -= dmg;
+    // The victim may have died between the rewound frame and now. A shot into
+    // the past does not kill someone twice.
+    if (!victim.alive) continue;
+
+    victim.hp -= hit.head ? DAMAGE_HEAD : DAMAGE_BODY;
 
     const lethal = victim.hp <= 0;
     if (lethal) {
@@ -349,7 +398,10 @@ export function step(
       victim.respawnAt = tick + RESPAWN_TICKS;
       p.kills++;
     }
-    hits.push({ tick, shooter: slot, victim: hit.victimSlot, head: hit.head, lethal });
+    hits.push({
+      tick, shooter: slot, victim: hit.victimSlot,
+      head: hit.head, lethal, rewind,
+    });
   }
 
   world.tick = tick + 1;
