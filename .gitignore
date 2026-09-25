@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+.env.*
+*.pem
+*.key
+keypair*.json
+resolver*.json
+target/
+.anchor/
+.expo/
