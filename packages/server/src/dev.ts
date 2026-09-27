@@ -7,8 +7,10 @@ import { DEV_SEATS, devSeedLabel } from "../../shared/dev";
  * Decide whether the dev room may open.
  *
  * The dev room lets anyone holding the public dev keys play, so it must never
- * be reachable on the droplet. Two separate conditions guard it: ARENA_DEV has
- * to be set to exactly "1", and NODE_ENV must not be production. If both are
+ * run on a machine that holds the resolver key. It may run on the droplet for
+ * play-testing only until the resolver key is installed there (CLAUDE.md,
+ * Secrets). Two separate conditions guard it: ARENA_DEV has to be set to
+ * exactly "1", and NODE_ENV must not be production. If both are
  * set at once the environment is contradictory, most likely a dev flag left in
  * a deploy script, and the server refuses to start at all rather than quietly
  * picking one. Failing loudly there is the point.
@@ -31,7 +33,8 @@ export function devWarning(): string {
     bar,
     "!!  ARENA DEV MODE IS ON",
     "!!  A room with a public, derivable roster is open. Anyone who can reach",
-    "!!  this port can join it. Never run this on the droplet.",
+    "!!  this port can join it. Never run this on a machine that holds the",
+    "!!  resolver key.",
     bar,
   ].join("\n");
 }

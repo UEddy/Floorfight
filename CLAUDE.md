@@ -86,6 +86,12 @@ The repo is public from the first commit.
 - If a secret ever lands in a commit, rotating it is the fix. Deleting the file
   in a later commit does not remove it from history.
 - The program upgrade authority is a separate key from the resolver.
+- Dev mode (`ARENA_DEV=1`) may run on the droplet for play-testing only until
+  the resolver key is installed there, and never on any machine that holds the
+  resolver key. The dev roster keys are public, so a dev room is open to anyone
+  who can reach the port. The server refuses to start with `ARENA_DEV` set and
+  `NODE_ENV=production`, so a play-testing droplet runs without
+  `NODE_ENV=production`.
 
 ## Performance budget
 

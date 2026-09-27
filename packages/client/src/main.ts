@@ -37,6 +37,16 @@ let lastFireSeq = -FIRE_COOLDOWN;
 let lastSnap: { tick: number; players: SnapshotPlayer[] } | null = null;
 let firstSnap: SnapshotPlayer[] | null = null;
 const active = new Set<number>();
+
+/**
+ * Remote players the server has killed but the interpolation buffer, 100 ms
+ * behind, still shows alive. Keyed by slot, value is the hit's server tick.
+ *
+ * Display only. The server has already decided the kill; this just stops the
+ * body lingering for the length of the buffer. Nothing here feeds prediction,
+ * the view tick, or anything sent to the server.
+ */
+const killedAt = new Map<number, number>();
 /** Counters for the dev test hook. Filled from server hit events only. */
 const stats = {
   shots: 0, hits: 0, kills: 0, rewinds: [] as number[], corrections: 0, maxCorrection: 0,
@@ -107,7 +117,10 @@ const net = new Net(serverUrl, DEV_MATCH_ID, keys, {
         stats.hitsOn[h.victim] = (stats.hitsOn[h.victim] ?? 0) + 1;
         stats.lastHitAt = performance.now();
       }
-      if (h.lethal) hud.kill(h);
+      if (h.lethal) {
+        hud.kill(h);
+        if (h.victim !== slot) killedAt.set(h.victim, h.tick);
+      }
     }
   },
 
@@ -209,7 +222,18 @@ function frame(): void {
   const yaw = yawToRadians(quantYaw(intent.yaw));
   const pitch = (quantPitch(intent.pitch) / 32767) * PITCH_LIMIT;
 
-  if (interp.ready) interp.sample(now, remotes);
+  if (interp.ready) {
+    interp.sample(now, remotes);
+    // A kill at server tick T first shows as dead in the snapshot stamped
+    // T + 1. Until the buffer reaches that, hide the body ourselves. After it,
+    // the snapshots carry the death and the later respawn on their own.
+    const rt = interp.renderTick(now);
+    for (const [victim, tick] of killedAt) {
+      const r = remotes.get(victim);
+      if (rt >= tick + 1) killedAt.delete(victim);
+      else if (r) r.alive = false;
+    }
+  }
   renderer.draw(now, { x, z, yaw, pitch }, slot, remotes);
 
   if (phase === "playing" && interp.ready) {
