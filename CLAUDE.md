@@ -1,11 +1,14 @@
-# Arena
+# Floorfight
 
-Mobile multiplayer arena shooter on Solana. Players stake SOL into a match, top
+Floorfight is a mobile multiplayer arena shooter on Solana. Players stake SOL into a match, top
 three split the pot. Playable characters are Solana NFTs, resolved by verified
 on-chain ownership rather than by anything the client claims.
 
-Entry for the Solana Mobile CLOCK IN hackathon. Working name only, expect it to
-change before launch.
+Entry for the Solana Mobile CLOCK IN hackathon.
+
+The Anchor program is still named `arena`, with its existing program ID, on
+purpose. Renaming it changes the IDL and the generated client, which is not
+worth doing before deploy.
 
 ## Hard deadline
 
@@ -138,7 +141,6 @@ Flag these rather than deciding alone.
   not, staking gets gated to a demo tournament and the app ships free to play.
 - Per-collection NFT licensing. Most Solana collections are not CC0. Holder
   gating is the intended answer, but each collection still needs checking.
-- The real product name.
 
 ## Status
 

@@ -13,7 +13,7 @@
 import type { HitEvent, Input } from "./sim";
 import { PITCH_LIMIT, YAW_UNITS } from "./sim";
 
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 /** Abuse limits. Exceed any of these and the connection is closed. */
 export const MAX_MSG_BYTES = 4096;
@@ -65,7 +65,7 @@ export type ClientMsg =
 /**
  * join carries an ed25519 signature over the exact string
  *
- *   arena:join:v<PROTOCOL_VERSION>:<matchId>:<nonce>
+ *   floorfight:join:v<PROTOCOL_VERSION>:<matchId>:<nonce>
  *
  * where nonce was issued by the server on this socket moments earlier. Binding
  * the matchId into the signed message means a signature captured from one match
@@ -82,7 +82,7 @@ export type ClientMsg =
  * failed join.
  */
 export function joinMessage(matchId: string, nonce: string): string {
-  return `arena:join:v${PROTOCOL_VERSION}:${matchId}:${nonce}`;
+  return `floorfight:join:v${PROTOCOL_VERSION}:${matchId}:${nonce}`;
 }
 
 /* -------------------------------------------------------------- server --- */
