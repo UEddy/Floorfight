@@ -11,11 +11,17 @@ import { Hud } from "./hud";
 /*
  * URL parameters:
  *   seat    dev seat 0..5, picks which dev keypair signs the join
- *   server  WebSocket URL, defaults to port 8080 on the page's host
+ *   server  dev builds only: WebSocket URL, defaults to port 8080 on the
+ *           page's host. Production always uses wss://<page host>/ws
  */
 const params = new URLSearchParams(location.search);
 const seat = Number(params.get("seat") ?? "0");
-const serverUrl = params.get("server") ?? `ws://${location.hostname || "localhost"}:8080`;
+const serverUrl = import.meta.env.DEV
+  ? params.get("server") ?? `ws://${location.hostname || "localhost"}:8080`
+  : // Production is always the page's own origin, behind Caddy's TLS. There is
+    // deliberately no override: a link that could point the socket elsewhere
+    // would let another server relay our challenge and collect a signature.
+    `wss://${location.host}/ws`;
 
 const canvas = document.getElementById("view") as HTMLCanvasElement;
 const controls = new Controls(canvas, document.getElementById("fire")!);

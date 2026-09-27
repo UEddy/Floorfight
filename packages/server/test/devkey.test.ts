@@ -28,6 +28,7 @@ interface Server {
 async function startServer(dev: boolean): Promise<Server> {
   const port = 20_000 + Math.floor(Math.random() * 20_000);
   const env: NodeJS.ProcessEnv = { ...process.env, PORT: String(port) };
+  delete env.HOST;
   delete env.ARENA_DEV;
   delete env.NODE_ENV;
   if (dev) env.ARENA_DEV = "1";
@@ -42,7 +43,7 @@ async function startServer(dev: boolean): Promise<Server> {
     const timer = setTimeout(() => reject(new Error(`server did not start:\n${out}`)), 30_000);
     const onData = (d: Buffer) => {
       out += d.toString();
-      if (out.includes(`listening on ${port}`)) {
+      if (out.includes(`listening on 127.0.0.1:${port}`)) {
         clearTimeout(timer);
         resolve();
       }

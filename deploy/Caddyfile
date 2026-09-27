@@ -1,0 +1,24 @@
+# Floorfight front door. Caddy gets and renews the TLS certificate itself.
+#
+# The game server listens on 127.0.0.1:8080 only. Everything under /ws is
+# proxied to it (Caddy upgrades WebSocket connections without extra config).
+# Everything else is the built client, copied from packages/client/dist.
+
+floorfight.duckdns.org {
+	encode gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+	}
+
+	handle /ws* {
+		reverse_proxy 127.0.0.1:8080
+	}
+
+	handle {
+		root * /var/www/floorfight
+		file_server
+	}
+}

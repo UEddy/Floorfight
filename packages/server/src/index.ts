@@ -17,6 +17,12 @@ import { DEV_MATCH_ID, DEV_MIN_SEATED } from "../../shared/dev";
 import { devModeFromEnv, devRoster, devWarning } from "./dev";
 import { Room, type Seat } from "./room";
 
+/**
+ * Loopback by default. In deployment Caddy terminates TLS and proxies /ws to
+ * this port, so nothing else should reach it directly. Listening on every
+ * interface takes an explicit HOST=0.0.0.0, never a default.
+ */
+const HOST = process.env.HOST || "127.0.0.1";
 const PORT = Number(process.env.PORT ?? 8080);
 
 let DEV = false;
@@ -79,7 +85,7 @@ interface Pending {
   used: boolean;
 }
 
-const wss = new WebSocketServer({ port: PORT, maxPayload: MAX_MSG_BYTES });
+const wss = new WebSocketServer({ host: HOST, port: PORT, maxPayload: MAX_MSG_BYTES });
 
 wss.on("connection", (ws: WebSocket) => {
   const pending: Pending = {
@@ -223,7 +229,7 @@ async function verifyCharacter(
   return null;
 }
 
-console.log(`arena server listening on ${PORT}`);
+wss.on("listening", () => console.log(`floorfight server listening on ${HOST}:${PORT}`));
 
 if (DEV) {
   console.warn(devWarning());

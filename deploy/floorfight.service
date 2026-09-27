@@ -1,0 +1,47 @@
+# Floorfight game server.
+#
+# Install: copy the repo to /opt/floorfight (the server imports
+# packages/shared directly, so the whole tree is needed, not just
+# packages/server), run `npm ci --omit=dev` in packages/server, then
+#   cp deploy/floorfight.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now floorfight
+#
+# Node must be installed system wide (for example /usr/bin/node). tsx starts
+# through `#!/usr/bin/env node`, and a per-user nvm install is not on the
+# service's PATH.
+
+[Unit]
+Description=Floorfight game server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=floorfight
+Group=floorfight
+WorkingDirectory=/opt/floorfight/packages/server
+ExecStart=/opt/floorfight/packages/server/node_modules/.bin/tsx src/index.ts
+
+# Remove before the resolver key is installed, per CLAUDE.md. Dev mode opens a
+# room anyone holding the public dev keys can join. NODE_ENV is deliberately
+# not set to production while this line is here: the server refuses to start
+# with both.
+Environment=ARENA_DEV=1
+# Loopback only. Caddy terminates TLS and proxies /ws to this port.
+Environment=HOST=127.0.0.1
+Environment=PORT=8080
+# The droplet has 512 MB. Cap the heap well below that.
+Environment=NODE_OPTIONS=--max-old-space-size=256
+
+Restart=always
+RestartSec=2
+
+NoNewPrivileges=true
+# The whole filesystem is read only to the service. tsx compiles into its
+# cache under the temp dir, which PrivateTmp makes a writable private /tmp.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
