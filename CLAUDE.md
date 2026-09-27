@@ -109,6 +109,19 @@ S10 before trusting any of this. The S10 is the floor, not the S24.
 - `anchor build` fails on this machine with an edition2024 error because the
   bundled platform-tools ship an old rustc. Use
   `cargo build-sbf --tools-version v1.57` and deploy the resulting `.so`.
+- `anchor test` calls `anchor build`, so it fails too. Build, generate the
+  IDL and run the LiteSVM tests from the repo root instead:
+
+  ```
+  cd programs/arena && cargo build-sbf --tools-version v1.57 && cd ../..
+  anchor idl build -p arena -o target/idl/arena.json
+  npm test
+  ```
+
+  The test script sets `NODE_OPTIONS=--no-experimental-strip-types` because
+  Node 24 otherwise loads the `.ts` file itself as an ES module and the
+  `@coral-xyz/anchor` import fails. LiteSVM is pinned at 0.8.0, the last
+  release built on web3.js, which the Anchor TypeScript client needs.
 
 ## Style
 
@@ -129,7 +142,8 @@ Flag these rather than deciding alone.
 
 ## Status
 
-Done: deterministic sim core, wire protocol, greybox feel test.
+Done: deterministic sim core, wire protocol, greybox feel test, server tick
+loop and join handshake, Anchor escrow program with 17 LiteSVM tests covering
+the attack cases and payout paths.
 
-Next: server tick loop and join handshake, then the Anchor escrow program,
-then the Expo shell and MWA wiring.
+Next: the Expo shell and MWA wiring.
