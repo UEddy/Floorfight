@@ -13,9 +13,19 @@ import {
   type ClientMsg,
   type RosterEntry,
 } from "../../shared/protocol";
+import { DEV_MATCH_ID, DEV_MIN_SEATED } from "../../shared/dev";
+import { devModeFromEnv, devRoster, devWarning } from "./dev";
 import { Room, type Seat } from "./room";
 
 const PORT = Number(process.env.PORT ?? 8080);
+
+let DEV = false;
+try {
+  DEV = devModeFromEnv(process.env);
+} catch (e) {
+  console.error((e as Error).message);
+  process.exit(1);
+}
 
 /**
  * Match registry.
@@ -28,16 +38,34 @@ const PORT = Number(process.env.PORT ?? 8080);
  */
 const rooms = new Map<string, Room>();
 
-export function openRoom(matchId: string, roster: RosterEntry[]): Room {
-  const room = new Room(matchId, roster, (log, hash) => {
+export function openRoom(
+  matchId: string,
+  roster: RosterEntry[],
+  startWhenSeated = 0,
+  onDone?: () => void,
+): Room {
+  const room = new Room(matchId, roster, (_log, hash) => {
     // Settlement goes here. The resolver signs (matchId, hash, standings) and
     // submits the payout instruction. Until the Anchor program exists, the log
     // is written to disk so replays can be tested against a real match.
     console.log(`[match ${matchId}] finished, log hash ${hash}`);
-  });
+    onDone?.();
+  }, startWhenSeated);
   rooms.set(matchId, room);
-  room.start();
+  if (startWhenSeated === 0) room.start();
   return room;
+}
+
+/**
+ * Dev only. Reached solely through the DEV flag, which devModeFromEnv never
+ * sets in production. When a round ends a fresh room replaces it, so tabs can
+ * reload and play again without restarting the server.
+ */
+function openDevRoom(): void {
+  openRoom(DEV_MATCH_ID, devRoster(), DEV_MIN_SEATED, () => {
+    setTimeout(openDevRoom, 3000);
+  });
+  console.warn(`[dev] room "${DEV_MATCH_ID}" open, starts when ${DEV_MIN_SEATED} players join`);
 }
 
 /* ------------------------------------------------------------- socket --- */
@@ -59,6 +87,7 @@ wss.on("connection", (ws: WebSocket) => {
 
   let room: Room | null = null;
   let slot = -1;
+  let mySeat: Seat | null = null;
   let budget = MAX_MSGS_PER_SECOND;
   const refill = setInterval(() => { budget = MAX_MSGS_PER_SECOND; }, 1000);
 
@@ -106,7 +135,7 @@ wss.on("connection", (ws: WebSocket) => {
 
   ws.on("close", () => {
     clearInterval(refill);
-    if (room && slot >= 0) room.unseat(slot);
+    if (room && mySeat) room.unseat(slot, mySeat);
   });
 
   async function handleJoin(msg: Extract<ClientMsg, { t: "join" }>): Promise<void> {
@@ -155,6 +184,7 @@ wss.on("connection", (ws: WebSocket) => {
       send: (m) => { if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(m)); },
       close: (reason) => kick(reason),
     };
+    mySeat = seat;
     target.seat(seat);
 
     ws.send(JSON.stringify({
@@ -185,3 +215,8 @@ async function verifyCharacter(
 }
 
 console.log(`arena server listening on ${PORT}`);
+
+if (DEV) {
+  console.warn(devWarning());
+  openDevRoom();
+}

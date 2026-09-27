@@ -95,6 +95,7 @@ export interface SnapshotPlayer {
   p: number; // pitch quantised
   h: number; // hp
   k: number; // kills
+  d: number; // deaths, shown on the scoreboard and the standings tiebreak
   a: 0 | 1;  // alive
 }
 

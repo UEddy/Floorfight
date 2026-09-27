@@ -83,6 +83,15 @@ export interface Box {
   x: number; z: number; hx: number; hz: number; top: number;
 }
 
+export const SPAWNS: readonly { x: number; z: number }[] = [
+  { x: -22, z: -22 }, { x: 22, z: -22 }, { x: -22, z: 22 },
+  { x: 22, z: 22 }, { x: 0, z: -25 }, { x: 0, z: 25 },
+  { x: -25, z: 0 }, { x: 25, z: 0 },
+];
+
+/** Open ground kept around every spawn, measured from the spawn point. */
+const SPAWN_CLEARANCE = 2;
+
 function makeMap(seed: number): Box[] {
   let s = seed >>> 0;
   const rnd = () => {
@@ -90,26 +99,38 @@ function makeMap(seed: number): Box[] {
     return s / 4294967296;
   };
   const out: Box[] = [];
-  for (let i = 0; i < 34; i++) {
+  while (out.length < 34) {
     const sx = 2 + rnd() * 4;
     const sy = 1.6 + rnd() * 3.4;
     const sz = 2 + rnd() * 4;
     const px = (rnd() - 0.5) * (ARENA_HALF * 1.8);
     let pz = (rnd() - 0.5) * (ARENA_HALF * 1.8);
     if (Math.abs(px) < 5 && Math.abs(pz) < 5) pz += 9;
-    out.push({ x: px, z: pz, hx: sx / 2, hz: sz / 2, top: sy });
+    // A crate over a spawn traps whoever spawns there: they cannot move, and
+    // a ray that starts inside a box hits the box, so they can neither shoot
+    // nor be shot. Reject and draw again rather than trusting the seed.
+    // Rejection only consumes more of the same deterministic stream, so the
+    // map is still a pure function of the seed.
+    const hx = sx / 2;
+    const hz = sz / 2;
+    let clear = true;
+    for (let i = 0; i < SPAWNS.length; i++) {
+      const sp = SPAWNS[i];
+      const dx = px - sp.x;
+      const dz = pz - sp.z;
+      if ((dx < 0 ? -dx : dx) < hx + SPAWN_CLEARANCE && (dz < 0 ? -dz : dz) < hz + SPAWN_CLEARANCE) {
+        clear = false;
+        break;
+      }
+    }
+    if (!clear) continue;
+    out.push({ x: px, z: pz, hx, hz, top: sy });
   }
   return out;
 }
 
 export const MAP_SEED = 1337;
 export const CRATES: readonly Box[] = makeMap(MAP_SEED);
-
-export const SPAWNS: readonly { x: number; z: number }[] = [
-  { x: -22, z: -22 }, { x: 22, z: -22 }, { x: -22, z: 22 },
-  { x: 22, z: 22 }, { x: 0, z: -25 }, { x: 0, z: 25 },
-  { x: -25, z: 0 }, { x: 25, z: 0 },
-];
 
 /* --------------------------------------------------------------- state --- */
 

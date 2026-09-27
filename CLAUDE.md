@@ -146,4 +146,4 @@ Done: deterministic sim core, wire protocol, greybox feel test, server tick
 loop and join handshake, Anchor escrow program with 17 LiteSVM tests covering
 the attack cases and payout paths.
 
-Next: the Expo shell and MWA wiring.
+Next: Playable client with dev room, then droplet deploy, then Expo shell and MWA.

@@ -47,19 +47,28 @@ export class Room {
   private timer: NodeJS.Timeout | null = null;
   private nextTickAt = 0;
   private startedAt = 0;
+  private started = false;
   private finished = false;
   private onFinish: (log: MatchLog, hash: string) => void;
+  private startWhenSeated: number;
 
+  /**
+   * `startWhenSeated` of 0 means the caller starts the clock. Anything higher
+   * starts it automatically once that many seats are connected, so a dev round
+   * does not burn its 90 seconds before the second tab has joined.
+   */
   constructor(
     matchId: string,
     roster: RosterEntry[],
     onFinish: (log: MatchLog, hash: string) => void,
+    startWhenSeated = 0,
   ) {
     this.matchId = matchId;
     this.roster = roster;
     this.world = createWorld(roster.length);
     this.seats = new Array(roster.length).fill(null);
     this.onFinish = onFinish;
+    this.startWhenSeated = startWhenSeated;
     this.log = {
       v: 1,
       matchId,
@@ -87,10 +96,29 @@ export class Room {
     }
     this.seats[seat.slot] = seat;
     seat.lastSeenTick = this.world.tick;
+
+    if (!this.started && this.startWhenSeated > 0 && this.seatedCount() >= this.startWhenSeated) {
+      this.start();
+    }
   }
 
-  unseat(slot: number): void {
-    this.seats[slot] = null;
+  /**
+   * Only clears the slot if it still holds this seat. A replaced connection
+   * closes after its successor has been seated, and without this check its
+   * close handler would evict the player who just reconnected.
+   */
+  unseat(slot: number, seat: Seat): void {
+    if (this.seats[slot] === seat) this.seats[slot] = null;
+  }
+
+  seatedCount(): number {
+    let n = 0;
+    for (const s of this.seats) if (s) n++;
+    return n;
+  }
+
+  get isStarted(): boolean {
+    return this.started;
   }
 
   /**
@@ -116,6 +144,8 @@ export class Room {
   /* ------------------------------------------------------------- loop --- */
 
   start(): void {
+    if (this.started) return;
+    this.started = true;
     this.startedAt = Date.now();
     this.log.startedAt = this.startedAt;
     this.nextTickAt = this.startedAt;
@@ -202,6 +232,7 @@ export class Room {
       p: quantPitch(p.pitch < -PITCH_LIMIT ? -PITCH_LIMIT : p.pitch),
       h: p.hp,
       k: p.kills,
+      d: p.deaths,
       a: p.alive ? 1 : 0,
     }));
 
