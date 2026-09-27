@@ -5,6 +5,7 @@ import {
   SNAPSHOT_EVERY,
   TICK_MS,
   createWorld,
+  step,
   type HitEvent,
   type Input,
   type WorldState,
@@ -260,7 +261,3 @@ export class Room {
 function round3(v: number): number {
   return Math.round(v * 1000) / 1000;
 }
-
-// Imported last to keep the module graph obvious: the room drives the sim, the
-// sim never reaches back into the room.
-import { step } from "../../shared/sim";
