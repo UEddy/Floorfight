@@ -1,0 +1,22 @@
+{
+  "name": "arena-program-tests",
+  "private": true,
+  "license": "ISC",
+  "scripts": {
+    "test": "NODE_OPTIONS=--no-experimental-strip-types ts-mocha -p ./tsconfig.json -t 1000000 \"tests/**/*.ts\""
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "0.32.1",
+    "@solana/web3.js": "1.99.0",
+    "litesvm": "0.8.0"
+  },
+  "devDependencies": {
+    "@types/chai": "^4.3.20",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^26.6.3",
+    "chai": "^4.5.0",
+    "mocha": "^10.8.2",
+    "ts-mocha": "^10.1.0",
+    "typescript": "^5.9.3"
+  }
+}
