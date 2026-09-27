@@ -24,6 +24,15 @@ import { PITCH_LIMIT } from "../../shared/sim";
 const BUFFER_TARGET = 2;
 const BUFFER_MAX = 8;
 
+/**
+ * Ticks the queue must stay above BUFFER_TARGET before we drain two. Draining
+ * two applies only the later input, so the earlier one's movement is lost and
+ * the client's prediction snaps back. A burst from ordinary timer jitter clears
+ * on its own within a few ticks, so only a sustained backlog, a client clock
+ * genuinely running fast, is worth that cost. Half a second.
+ */
+const OVER_TARGET_TICKS = 30;
+
 /** Ticks of silence before a seat is considered gone. Ten seconds. */
 const TIMEOUT_TICKS = 600;
 
@@ -43,6 +52,8 @@ export class Room {
   readonly world: WorldState;
 
   private seats: (Seat | null)[];
+  /** Consecutive ticks each slot's queue has been above BUFFER_TARGET. */
+  private overTarget: number[];
   private log: MatchLog;
   private timer: NodeJS.Timeout | null = null;
   private nextTickAt = 0;
@@ -67,6 +78,7 @@ export class Room {
     this.roster = roster;
     this.world = createWorld(roster.length);
     this.seats = new Array(roster.length).fill(null);
+    this.overTarget = new Array(roster.length).fill(0);
     this.onFinish = onFinish;
     this.startWhenSeated = startWhenSeated;
     this.log = {
@@ -95,6 +107,7 @@ export class Room {
       existing.close("replaced by a newer connection");
     }
     this.seats[seat.slot] = seat;
+    this.overTarget[seat.slot] = 0;
     seat.lastSeenTick = this.world.tick;
 
     if (!this.started && this.startWhenSeated > 0 && this.seatedCount() >= this.startWhenSeated) {
@@ -198,9 +211,12 @@ export class Room {
         continue;
       }
 
-      // Drain one input, or two when the client has run ahead of us, which
-      // keeps the buffer near target without ever inventing motion.
-      const drain = seat.queue.length > BUFFER_TARGET ? 2 : 1;
+      // Drain one input, or two once the client has stayed ahead of us for
+      // OVER_TARGET_TICKS, which keeps the buffer near target without ever
+      // inventing motion.
+      if (seat.queue.length > BUFFER_TARGET) this.overTarget[slot]++;
+      else this.overTarget[slot] = 0;
+      const drain = this.overTarget[slot] >= OVER_TARGET_TICKS ? 2 : 1;
       let used: Input | null = null;
       for (let i = 0; i < drain && seat.queue.length > 0; i++) {
         used = seat.queue.shift()!;

@@ -80,8 +80,12 @@ const net = new Net(serverUrl, DEV_MATCH_ID, keys, {
 
     const me = msg.players.find((p) => p.s === slot);
     if (me) {
+      // Count only divergence this snapshot introduced. errX also carries
+      // the still-fading remainder of earlier corrections, which is not new.
+      const ex = predictor.errX;
+      const ez = predictor.errZ;
       predictor.reconcile(msg.ack, me);
-      const c = Math.hypot(predictor.errX, predictor.errZ);
+      const c = Math.hypot(predictor.errX - ex, predictor.errZ - ez);
       if (c > 0.01) stats.corrections++;
       if (c > stats.maxCorrection) stats.maxCorrection = c;
     }

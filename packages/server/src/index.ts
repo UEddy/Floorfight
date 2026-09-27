@@ -38,6 +38,9 @@ try {
  */
 const rooms = new Map<string, Room>();
 
+/** Public keys of the six dev seats. Refused at join unless DEV is on. */
+const DEV_WALLETS = new Set(devRoster().map((r) => r.wallet));
+
 export function openRoom(
   matchId: string,
   roster: RosterEntry[],
@@ -142,6 +145,12 @@ wss.on("connection", (ws: WebSocket) => {
     if (msg.v !== PROTOCOL_VERSION) return kick("protocol version mismatch");
     if (pending.used) return kick("nonce already used");
     if (Date.now() - pending.issuedAt > NONCE_TTL_MS) return kick("challenge expired");
+
+    // The dev keys are public by design, so outside dev mode they must never
+    // get a seat, whatever roster a bug or a bad config might put them on.
+    // Checked before anything else about the match, so the refusal does not
+    // depend on which rooms happen to exist.
+    if (!DEV && DEV_WALLETS.has(msg.wallet)) return kick("dev key");
 
     const target = rooms.get(msg.matchId);
     if (!target) return kick("no such match");
