@@ -15,7 +15,7 @@ import {
 } from "../../shared/protocol";
 import { DEV_MATCH_ID, DEV_MIN_SEATED } from "../../shared/dev";
 import { devModeFromEnv, devRoster, devWarning } from "./dev";
-import { Room, type Seat } from "./room";
+import { Room, type RoomKind, type Seat } from "./room";
 
 /**
  * Loopback by default. In deployment Caddy terminates TLS and proxies /ws to
@@ -47,11 +47,20 @@ const rooms = new Map<string, Room>();
 /** Public keys of the six dev seats. Refused at join unless DEV is on. */
 const DEV_WALLETS = new Set(devRoster().map((r) => r.wallet));
 
+/**
+ * Open a room.
+ *
+ * `kind` defaults to staked, which is the safe default: a caller that forgets
+ * to say gets a room that refuses to seat bots rather than one that allows
+ * them. `fillWithBots` only does anything in a free room.
+ */
 export function openRoom(
   matchId: string,
   roster: RosterEntry[],
   startWhenSeated = 0,
   onDone?: () => void,
+  kind: RoomKind = "staked",
+  fillWithBots = false,
 ): Room {
   const room = new Room(matchId, roster, (_log, hash) => {
     // Settlement goes here. The resolver signs (matchId, hash, standings) and
@@ -59,7 +68,7 @@ export function openRoom(
     // is written to disk so replays can be tested against a real match.
     console.log(`[match ${matchId}] finished, log hash ${hash}`);
     onDone?.();
-  }, startWhenSeated);
+  }, startWhenSeated, kind, fillWithBots);
   rooms.set(matchId, room);
   if (startWhenSeated === 0) room.start();
   return room;
@@ -71,10 +80,12 @@ export function openRoom(
  * reload and play again without restarting the server.
  */
 function openDevRoom(): void {
+  // Free, and bots fill whatever seats are still empty when the round starts,
+  // so one or two tabs is a full six player match to play against.
   openRoom(DEV_MATCH_ID, devRoster(), DEV_MIN_SEATED, () => {
     setTimeout(openDevRoom, 3000);
-  });
-  console.warn(`[dev] room "${DEV_MATCH_ID}" open, starts when ${DEV_MIN_SEATED} players join`);
+  }, "free", true);
+  console.warn(`[dev] free room "${DEV_MATCH_ID}" open, starts when ${DEV_MIN_SEATED} players join, bots fill the rest`);
 }
 
 /* ------------------------------------------------------------- socket --- */

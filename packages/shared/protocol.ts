@@ -13,7 +13,7 @@
 import type { HitEvent, Input } from "./sim";
 import { PITCH_LIMIT, YAW_UNITS } from "./sim";
 
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
 /** Abuse limits. Exceed any of these and the connection is closed. */
 export const MAX_MSG_BYTES = 4096;
@@ -52,7 +52,8 @@ export function isWellFormedInput(v: unknown): v is Input {
     const n = o[k];
     if (typeof n !== "number" || !Number.isFinite(n)) return false;
   }
-  return o.fire === 0 || o.fire === 1;
+  if (o.fire !== 0 && o.fire !== 1) return false;
+  return o.jump === 0 || o.jump === 1;
 }
 
 /* -------------------------------------------------------------- client --- */
@@ -91,6 +92,10 @@ export interface SnapshotPlayer {
   s: number; // slot
   x: number;
   z: number;
+  e: number; // feet height. `y` was already taken by yaw when v1 shipped and
+             // renaming it now would silently swap two numbers of the same
+             // type at every call site, so the new field got the new name.
+  w: number; // vertical velocity
   y: number; // yaw units
   p: number; // pitch quantised
   h: number; // hp
@@ -98,6 +103,15 @@ export interface SnapshotPlayer {
   d: number; // deaths, shown on the scoreboard and the standings tiebreak
   a: 0 | 1;  // alive
 }
+
+/**
+ * `w` is there for one reason: the local player's prediction replays its
+ * unacknowledged inputs from the authoritative state, and with gravity and
+ * jumping in the simulation that state now includes vertical velocity. Left
+ * out, a reconcile in the middle of a jump would restart the arc from a
+ * standstill and the camera would stutter at the top of every jump. It costs
+ * a few bytes per player per snapshot and it is only ever read by its owner.
+ */
 
 export type ServerMsg =
   | { t: "challenge"; v: number; nonce: string }
@@ -132,9 +146,10 @@ export interface Standing {
 
 /**
  * The verifiable artifact. Every input the server accepted, in tick order,
- * plus the roster and map seed. Re-running sim.step over this reproduces the
- * standings exactly, including lag compensation, because the rewind target
- * travels inside each input rather than being derived from live latency.
+ * plus the roster and the id of the map it was played on. Re-running sim.step
+ * over this reproduces the standings exactly, including lag compensation,
+ * because the rewind target travels inside each input rather than being
+ * derived from live latency.
  *
  * sha256 of the canonical serialisation is written on chain alongside the
  * payout, so a loser can download the log, replay it, and check the winner
@@ -146,7 +161,7 @@ export interface Standing {
 export interface MatchLog {
   v: number;
   matchId: string;
-  mapSeed: number;
+  map: string;
   roster: RosterEntry[];
   startedAt: number;
   ticks: { tick: number; inputs: (Input | null)[] }[];
@@ -160,10 +175,10 @@ export function canonicalise(log: MatchLog): string {
   const ticks = log.ticks.map((t) => [
     t.tick,
     t.inputs.map((i) =>
-      i ? [i.tick, i.view, i.moveX, i.moveY, i.yaw, i.pitch, i.fire] : null,
+      i ? [i.tick, i.view, i.moveX, i.moveY, i.yaw, i.pitch, i.fire, i.jump] : null,
     ),
   ]);
   const roster = log.roster.map((r) => [r.slot, r.wallet, r.collection, r.mint]);
   const standings = log.standings.map((s) => [s.slot, s.wallet, s.kills, s.deaths, s.place]);
-  return JSON.stringify([log.v, log.matchId, log.mapSeed, roster, log.startedAt, ticks, standings]);
+  return JSON.stringify([log.v, log.matchId, log.map, roster, log.startedAt, ticks, standings]);
 }

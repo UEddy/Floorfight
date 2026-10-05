@@ -10,6 +10,7 @@ export interface Intent {
   yaw: number;   // radians, continuous
   pitch: number; // radians, clamped
   fire: boolean;
+  jump: boolean;
 }
 
 const MOUSE_SENS = 0.0022;
@@ -17,22 +18,27 @@ const TOUCH_LOOK_SENS = 0.006;
 const STICK_RADIUS = 60;
 
 export class Controls {
-  readonly intent: Intent = { moveX: 0, moveY: 0, yaw: 0, pitch: 0, fire: false };
+  readonly intent: Intent = { moveX: 0, moveY: 0, yaw: 0, pitch: 0, fire: false, jump: false };
 
   private keys = new Set<string>();
   private mouseFire = false;
   private touchFire = false;
+  private touchJump = false;
   private stick: { id: number; ox: number; oy: number; x: number; y: number } | null = null;
   private look: { id: number; x: number; y: number } | null = null;
 
   /** Test hook overrides. Only set through the dev-only window.arena handle. */
   botMove: { x: number; y: number } | null = null;
   botFire = false;
+  botJump = false;
 
-  constructor(private canvas: HTMLCanvasElement, fireButton: HTMLElement) {
+  constructor(private canvas: HTMLCanvasElement, fireButton: HTMLElement, jumpButton: HTMLElement) {
     addEventListener("keydown", (e) => { this.keys.add(e.code); });
     addEventListener("keyup", (e) => { this.keys.delete(e.code); });
     addEventListener("blur", () => { this.keys.clear(); this.mouseFire = false; });
+    // Space scrolls the page by default, which on a phone browser in landscape
+    // is enough to hide the canvas.
+    addEventListener("keydown", (e) => { if (e.code === "Space") e.preventDefault(); });
 
     canvas.addEventListener("click", () => {
       if (document.pointerLockElement !== canvas && !isTouch()) void canvas.requestPointerLock();
@@ -83,6 +89,10 @@ export class Controls {
     fireButton.addEventListener("touchstart", (e) => { e.preventDefault(); this.touchFire = true; }, { passive: false });
     fireButton.addEventListener("touchend", () => { this.touchFire = false; });
     fireButton.addEventListener("touchcancel", () => { this.touchFire = false; });
+
+    jumpButton.addEventListener("touchstart", (e) => { e.preventDefault(); this.touchJump = true; }, { passive: false });
+    jumpButton.addEventListener("touchend", () => { this.touchJump = false; });
+    jumpButton.addEventListener("touchcancel", () => { this.touchJump = false; });
   }
 
   get locked(): boolean {
@@ -114,7 +124,11 @@ export class Controls {
     }
     i.moveX = Math.max(-1, Math.min(1, x));
     i.moveY = Math.max(-1, Math.min(1, y));
-    i.fire = this.mouseFire || this.touchFire || this.botFire || this.keys.has("Space");
+    // Space is jump, not fire: the mouse fires on a keyboard, and the hall is
+    // three levels tall, so jump has to be a key that is easy to hold.
+    i.fire = this.mouseFire || this.touchFire || this.botFire;
+    i.jump = this.touchJump || this.botJump ||
+      this.keys.has("Space") || this.keys.has("KeyJ");
     return i;
   }
 

@@ -35,10 +35,12 @@ export class Predictor {
 
   /** Position at the previous and current local tick, for render smoothing. */
   prevX = 0;
+  prevY = 0;
   prevZ = 0;
 
   /** Visual offset left over from a correction, decayed over a few frames. */
   errX = 0;
+  errY = 0;
   errZ = 0;
 
   constructor(slots: number, readonly slot: number) {
@@ -53,6 +55,7 @@ export class Predictor {
     }
     const me = this.me;
     this.prevX = me.x;
+    this.prevY = me.y;
     this.prevZ = me.z;
   }
 
@@ -64,6 +67,7 @@ export class Predictor {
   apply(inp: Input): void {
     this.pending.push(inp);
     this.prevX = this.me.x;
+    this.prevY = this.me.y;
     this.prevZ = this.me.z;
     this.stepOne(inp);
   }
@@ -80,10 +84,15 @@ export class Predictor {
 
     const p = this.me;
     const beforeX = p.x + this.errX;
+    const beforeY = p.y + this.errY;
     const beforeZ = p.z + this.errZ;
 
     p.x = me.x;
+    p.y = me.e;
     p.z = me.z;
+    // Vertical velocity has to come from the server too, or a correction in
+    // mid-jump would restart the arc from rest. See SnapshotPlayer.w.
+    p.vy = me.w;
     p.hp = me.h;
     p.kills = me.k;
     p.deaths = me.d;
@@ -99,14 +108,18 @@ export class Predictor {
     // Small corrections are blended out over a few frames so the camera does
     // not twitch. Large ones (respawn, a long stall) are taken at once.
     const dx = beforeX - p.x;
+    const dy = beforeY - p.y;
     const dz = beforeZ - p.z;
-    if (dx * dx + dz * dz < 4) {
+    if (dx * dx + dy * dy + dz * dz < 4) {
       this.errX = dx;
+      this.errY = dy;
       this.errZ = dz;
     } else {
       this.errX = 0;
+      this.errY = 0;
       this.errZ = 0;
       this.prevX = p.x;
+      this.prevY = p.y;
       this.prevZ = p.z;
     }
   }
@@ -114,6 +127,7 @@ export class Predictor {
   decayError(dtSeconds: number): void {
     const k = Math.exp(-dtSeconds * 12);
     this.errX *= k;
+    this.errY *= k;
     this.errZ *= k;
   }
 
@@ -140,6 +154,7 @@ interface Snap {
 
 export interface RemoteView {
   x: number;
+  y: number; // feet height
   z: number;
   yaw: number;   // units, may be fractional
   pitch: number; // radians
@@ -214,6 +229,7 @@ export class Interpolator {
       const t = jump ? (f < 0.5 ? 0 : 1) : f;
       out.set(pb.s, {
         x: pa.x + (pb.x - pa.x) * t,
+        y: pa.e + (pb.e - pa.e) * t,
         z: pa.z + (pb.z - pa.z) * t,
         yaw: lerpYaw(pa.y, pb.y, t),
         pitch: ((pa.p + (pb.p - pa.p) * t) / 32767) * PITCH_LIMIT,

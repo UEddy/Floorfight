@@ -95,9 +95,15 @@ The repo is public from the first commit.
 
 ## Performance budget
 
-Measured: the greybox test holds 60 fps with a 60 fps 1% low on a Galaxy S24 at
-full quality, 31 draw calls. That scene is roughly a twentieth of the real game,
-so the headroom is real but unearned.
+Measured: the greybox test held 60 fps with a 60 fps 1% low on a Galaxy S24 at
+full quality, 31 draw calls. That scene was a fraction of the real game, so the
+headroom was real but unearned.
+
+The Hall replaces it and is counted, not measured: 16485 solid blocks reduce to
+36668 triangles once hidden faces are dropped, in 9 merged meshes, one per
+material. With the sign strip, the three instanced player meshes, the gun and
+the flash that is 15 draw calls, and it does not grow with the map. Frame rate
+on device is still unmeasured, on either phone.
 
 Hold to: 60 fps floor, under 150 draw calls, instanced geometry for players, no
 dynamic shadows, fixed polygon ceiling per character. Re-measure on the Galaxy
@@ -150,8 +156,11 @@ Flag these rather than deciding alone.
 
 ## Status
 
-Done: deterministic sim core, wire protocol, greybox feel test, server tick
-loop and join handshake, Anchor escrow program with 17 LiteSVM tests covering
-the attack cases and payout paths.
+Done: deterministic sim core with height, gravity and jumping, block grid
+collision and grid hitscan, wire protocol v4, The Hall as authored map data,
+merged block renderer, server tick loop and join handshake, free and staked
+room types with server side bots, Anchor escrow program with 17 LiteSVM tests
+covering the attack cases and payout paths, 29 server tests covering replay
+determinism, the map's sightline and reachability rules, and the bot rules.
 
-Next: Playable client with dev room, then droplet deploy, then Expo shell and MWA.
+Next: droplet deploy, then Expo shell and MWA.

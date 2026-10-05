@@ -80,9 +80,12 @@
 
       #fire { right: 28px; bottom: 90px; width: 84px; height: 84px; border-radius: 50%; display: none;
         background: rgba(255, 75, 58, 0.45); border: 2px solid rgba(255, 255, 255, 0.6); pointer-events: auto; }
+      #jump { right: 124px; bottom: 38px; width: 68px; height: 68px; border-radius: 50%; display: none;
+        background: rgba(47, 109, 223, 0.45); border: 2px solid rgba(255, 255, 255, 0.6); pointer-events: auto;
+        color: var(--ink); font: 700 13px/68px var(--mono); text-align: center; letter-spacing: 1px; }
       #stick { width: 90px; height: 90px; margin: -45px 0 0 -45px; border-radius: 50%; display: none;
         border: 2px solid rgba(255, 255, 255, 0.4); }
-      @media (pointer: coarse) { #fire { display: block; } #board { font-size: 11px; min-width: 140px; } }
+      @media (pointer: coarse) { #fire, #jump { display: block; } #board { font-size: 11px; min-width: 140px; } }
     </style>
   </head>
   <body>
@@ -97,6 +100,7 @@
     <div id="center" class="hud"></div>
     <div id="stick" class="hud"></div>
     <div id="fire" class="hud"></div>
+    <div id="jump" class="hud">JUMP</div>
     <div id="over" class="hud">
       <div class="card">
         <h1>Round over</h1>

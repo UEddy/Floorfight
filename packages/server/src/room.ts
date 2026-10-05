@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import {
-  MAP_SEED,
+  MAP_ID,
   ROUND_TICKS,
   SNAPSHOT_EVERY,
   TICK_MS,
@@ -19,6 +19,17 @@ import {
   type Standing,
 } from "../../shared/protocol";
 import { PITCH_LIMIT } from "../../shared/sim";
+import { Bot } from "./bot";
+
+/**
+ * Free or staked.
+ *
+ * The distinction exists so that one rule can be enforced in one place: a
+ * staked room never gets a bot. Everything else about the two is identical,
+ * including the trust boundary, because a free room is where the trust
+ * boundary gets exercised before there is money on it.
+ */
+export type RoomKind = "free" | "staked";
 
 /** How far ahead of the server a client may buffer before we drain faster. */
 const BUFFER_TARGET = 2;
@@ -44,14 +55,18 @@ export interface Seat {
   lastSeenTick: number;
   send: (msg: unknown) => void;
   close: (reason: string) => void;
+  /** Set on a bot's seat. Everything below the queue ignores it. */
+  bot?: true;
 }
 
 export class Room {
   readonly matchId: string;
+  readonly kind: RoomKind;
   readonly roster: RosterEntry[];
   readonly world: WorldState;
 
   private seats: (Seat | null)[];
+  private bots: (Bot | null)[];
   /** Consecutive ticks each slot's queue has been above BUFFER_TARGET. */
   private overTarget: number[];
   private log: MatchLog;
@@ -62,29 +77,38 @@ export class Room {
   private finished = false;
   private onFinish: (log: MatchLog, hash: string) => void;
   private startWhenSeated: number;
+  private fillWithBots: boolean;
 
   /**
    * `startWhenSeated` of 0 means the caller starts the clock. Anything higher
    * starts it automatically once that many seats are connected, so a dev round
    * does not burn its 90 seconds before the second tab has joined.
+   *
+   * `fillWithBots` seats a bot in every empty slot at the moment the round
+   * starts. Free rooms only.
    */
   constructor(
     matchId: string,
     roster: RosterEntry[],
     onFinish: (log: MatchLog, hash: string) => void,
     startWhenSeated = 0,
+    kind: RoomKind = "staked",
+    fillWithBots = false,
   ) {
     this.matchId = matchId;
+    this.kind = kind;
     this.roster = roster;
     this.world = createWorld(roster.length);
     this.seats = new Array(roster.length).fill(null);
+    this.bots = new Array(roster.length).fill(null);
     this.overTarget = new Array(roster.length).fill(0);
     this.onFinish = onFinish;
     this.startWhenSeated = startWhenSeated;
+    this.fillWithBots = fillWithBots && kind === "free";
     this.log = {
-      v: 1,
+      v: 2,
       matchId,
-      mapSeed: MAP_SEED,
+      map: MAP_ID,
       roster,
       startedAt: 0,
       ticks: [],
@@ -100,8 +124,11 @@ export class Room {
    * depend on who dialled in first, and replays would not reproduce.
    */
   seat(seat: Seat): void {
+    // A human takes the slot off whatever bot was holding it.
+    this.bots[seat.slot] = null;
+
     const existing = this.seats[seat.slot];
-    if (existing) {
+    if (existing && !existing.bot) {
       // A second socket for the same wallet. Keep the new one and drop the old,
       // so a player whose phone dropped can rejoin, but never run two at once.
       existing.close("replaced by a newer connection");
@@ -124,10 +151,58 @@ export class Room {
     if (this.seats[slot] === seat) this.seats[slot] = null;
   }
 
+  /** Connected players, not counting bots. */
   seatedCount(): number {
     let n = 0;
-    for (const s of this.seats) if (s) n++;
+    for (const s of this.seats) if (s && !s.bot) n++;
     return n;
+  }
+
+  botCount(): number {
+    let n = 0;
+    for (const b of this.bots) if (b) n++;
+    return n;
+  }
+
+  /**
+   * Seat a bot in one slot.
+   *
+   * Refused outright in a staked room. The people in that room put SOL in the
+   * escrow to play each other, and a server controlled player in it would be
+   * the house taking a share of their pot. Throwing rather than returning
+   * false is deliberate: there is no sensible way for a caller to carry on
+   * after asking for this.
+   */
+  addBot(slot: number): void {
+    if (this.kind !== "free") {
+      throw new Error(`refusing to add a bot to staked match ${this.matchId}`);
+    }
+    if (slot < 0 || slot >= this.roster.length) {
+      throw new Error(`no slot ${slot} in match ${this.matchId}`);
+    }
+    if (this.seats[slot] && !this.seats[slot]!.bot) return;
+    this.bots[slot] = new Bot(slot, slot + 1);
+    // A bot gets a seat like anyone else. Its inputs then travel the queue,
+    // the backlog drain and the match log by exactly the same route a phone's
+    // do, which is the only way to be sure a bot cannot do something a player
+    // cannot.
+    this.seats[slot] = {
+      slot,
+      wallet: this.roster[slot].wallet,
+      queue: [],
+      ack: -1,
+      lastSeenTick: this.world.tick,
+      send: () => { /* nobody is listening */ },
+      close: () => { /* nothing to close */ },
+      bot: true,
+    };
+  }
+
+  /** Fill every empty slot with a bot. Free rooms only, same refusal. */
+  fillBots(): void {
+    for (let slot = 0; slot < this.roster.length; slot++) {
+      if (!this.seats[slot]) this.addBot(slot);
+    }
   }
 
   get isStarted(): boolean {
@@ -162,6 +237,7 @@ export class Room {
     this.startedAt = Date.now();
     this.log.startedAt = this.startedAt;
     this.nextTickAt = this.startedAt;
+    if (this.fillWithBots) this.fillBots();
     this.schedule();
   }
 
@@ -201,11 +277,21 @@ export class Room {
     const tick = this.world.tick;
     const inputs: (Input | null)[] = new Array(this.seats.length).fill(null);
 
+    // Bots go through acceptInputs, the queue and the drain below, exactly as
+    // a connected phone does. Nothing downstream of here can tell the
+    // difference, and their inputs land in the match log with everyone
+    // else's, so a round with bots in it still replays.
+    for (let slot = 0; slot < this.bots.length; slot++) {
+      const bot = this.bots[slot];
+      if (!bot) continue;
+      this.acceptInputs(slot, [bot.think(this.world)]);
+    }
+
     for (let slot = 0; slot < this.seats.length; slot++) {
       const seat = this.seats[slot];
       if (!seat) continue;
 
-      if (tick - seat.lastSeenTick > TIMEOUT_TICKS) {
+      if (!seat.bot && tick - seat.lastSeenTick > TIMEOUT_TICKS) {
         seat.close("timed out");
         this.seats[slot] = null;
         continue;
@@ -244,6 +330,8 @@ export class Room {
       s: slot,
       x: round3(p.x),
       z: round3(p.z),
+      e: round3(p.y),
+      w: round3(p.vy),
       y: p.yaw,
       p: quantPitch(p.pitch < -PITCH_LIMIT ? -PITCH_LIMIT : p.pitch),
       h: p.hp,

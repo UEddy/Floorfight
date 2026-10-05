@@ -24,7 +24,7 @@ const serverUrl = import.meta.env.DEV
     `wss://${location.host}/ws`;
 
 const canvas = document.getElementById("view") as HTMLCanvasElement;
-const controls = new Controls(canvas, document.getElementById("fire")!);
+const controls = new Controls(canvas, document.getElementById("fire")!, document.getElementById("jump")!);
 const hud = new Hud(seat);
 
 type Phase = "connecting" | "waiting" | "playing" | "over" | "gone";
@@ -76,7 +76,8 @@ const net = new Net(serverUrl, DEV_MATCH_ID, keys, {
     hud.setRoster(msg.roster);
     predictor = new Predictor(msg.roster.length, slot);
     renderer = new Renderer(canvas, msg.roster.length);
-    // Face the middle of the map from the spawn, which is where the action is.
+    // Face the middle of the hall from the spawn, which is where the clock
+    // tower is and where the action tends to be.
     const me = createWorld(msg.roster.length).players[slot];
     controls.intent.yaw = Math.atan2(me.x, me.z);
     phase = "waiting";
@@ -109,7 +110,7 @@ const net = new Net(serverUrl, DEV_MATCH_ID, keys, {
     if (!firstSnap) firstSnap = msg.players;
     for (const p of msg.players) {
       const f = firstSnap.find((q) => q.s === p.s);
-      if (f && (f.x !== p.x || f.z !== p.z || f.y !== p.y)) active.add(p.s);
+      if (f && (f.x !== p.x || f.z !== p.z || f.e !== p.e || f.y !== p.y)) active.add(p.s);
     }
     active.add(slot);
     hud.scoreboard(msg.players, active);
@@ -186,6 +187,7 @@ function tick(now: number): void {
     yaw: quantYaw(intent.yaw),
     pitch: quantPitch(intent.pitch),
     fire: wantsFire ? 1 : 0,
+    jump: intent.jump && alive ? 1 : 0,
   };
   predictor!.apply(inp);
 
@@ -220,6 +222,7 @@ function frame(): void {
   const me = predictor.me;
   const alpha = phase === "playing" ? Math.min(1, (now - lastTickAt) / TICK_MS) : 1;
   const x = predictor.prevX + (me.x - predictor.prevX) * alpha + predictor.errX;
+  const y = predictor.prevY + (me.y - predictor.prevY) * alpha + predictor.errY;
   const z = predictor.prevZ + (me.z - predictor.prevZ) * alpha + predictor.errZ;
 
   // Aim is drawn quantised, exactly as it will be sent, so the crosshair and
@@ -240,7 +243,7 @@ function frame(): void {
       else if (r) r.alive = false;
     }
   }
-  renderer.draw(now, { x, z, yaw, pitch }, slot, remotes);
+  renderer.draw(now, { x, y, z, yaw, pitch }, slot, remotes);
 
   if (phase === "playing" && interp.ready) {
     hud.clock((ROUND_TICKS - interp.serverTick(now)) / TICK_HZ);
@@ -250,7 +253,8 @@ function frame(): void {
     else if (!controls.locked && !matchMedia("(pointer: coarse)").matches) hud.message("Click to aim");
     else hud.message("");
     hud.netStats(
-      `seat ${slot}  view ${interp.viewTick(now)}  server ${Math.floor(interp.serverTick(now))}  unacked ${predictor.pendingCount}`,
+      `seat ${slot}  view ${interp.viewTick(now)}  server ${Math.floor(interp.serverTick(now))}  ` +
+      `unacked ${predictor.pendingCount}  draws ${renderer.drawCalls}`,
     );
   } else if (phase === "waiting") {
     hud.clock(null);
@@ -272,11 +276,18 @@ if (import.meta.env.DEV) {
     },
     move(x: number, y: number) { controls.botMove = { x, y }; },
     fire(on: boolean) { controls.botFire = on; },
+    jump(on: boolean) { controls.botJump = on; },
     peek() {
       return {
         phase,
-        me: predictor ? { x: predictor.me.x, z: predictor.me.z, alive: predictor.me.alive } : null,
+        me: predictor
+          ? {
+            x: predictor.me.x, y: predictor.me.y, z: predictor.me.z,
+            vy: predictor.me.vy, alive: predictor.me.alive,
+          }
+          : null,
         remotes: Object.fromEntries(remotes),
+        drawCalls: renderer?.drawCalls ?? 0,
         stats,
       };
     },
@@ -284,8 +295,14 @@ if (import.meta.env.DEV) {
       return {
         phase,
         slot,
-        me: predictor ? { x: predictor.me.x, z: predictor.me.z, alive: predictor.me.alive } : null,
+        me: predictor
+          ? {
+            x: predictor.me.x, y: predictor.me.y, z: predictor.me.z,
+            vy: predictor.me.vy, alive: predictor.me.alive,
+          }
+          : null,
         remotes: Object.fromEntries(remotes),
+        drawCalls: renderer?.drawCalls ?? 0,
         serverTick: interp.ready ? interp.serverTick(performance.now()) : null,
         board: document.getElementById("board")?.innerText,
         feed: document.getElementById("feed")?.innerText,
