@@ -152,6 +152,8 @@
       #over tr.me td { color: var(--gold); }
       #over .hash { margin-top: 14px; font: 12px/1.4 var(--mono); word-break: break-all; color: var(--dim); }
       #over .hash b { color: var(--ink); font-weight: 400; }
+      #over .spread { margin-top: 8px; font: 12px/1.4 var(--mono); color: #7fd68a; }
+      #over .spread.bad { color: var(--kill); }
       #over button { margin-top: 16px; font: inherit; padding: 8px 16px; border-radius: 6px; border: 0;
         background: var(--gold); color: #1a1c20; cursor: pointer; }
 
@@ -215,6 +217,7 @@
         <h1>Round over</h1>
         <table><thead><tr><th>#</th><th>Player</th><th>K</th><th>D</th></tr></thead><tbody></tbody></table>
         <div class="hash">Match log hash<br /><b></b></div>
+        <div class="spread"></div>
         <button type="button">Play again</button>
       </div>
     </div>

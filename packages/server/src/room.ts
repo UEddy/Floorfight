@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   MAP_ID,
   ROUND_TICKS,
@@ -19,6 +19,8 @@ import {
   type Standing,
 } from "../../shared/protocol";
 import { PITCH_LIMIT } from "../../shared/sim";
+import { FREE_SALT_BYTES, saltSeeds } from "../../shared/weapons";
+import { sha256Hex, toHex } from "../../shared/sha256";
 import { Bot } from "./bot";
 
 /**
@@ -72,6 +74,19 @@ export class Room {
   readonly roster: RosterEntry[];
   readonly world: WorldState;
 
+  /**
+   * Pellet spread salt, and the commitment to it.
+   *
+   * A staked room draws 32 random bytes at creation, before anybody has
+   * joined and so before anybody could have asked for a particular pattern.
+   * `spreadCommit` goes out in every accepted message; the bytes themselves
+   * stay here until the match ends, then go into the `over` message and the
+   * match log. A free room uses the fixed public salt, because there is
+   * nothing to win and nobody to convince.
+   */
+  readonly spreadSalt: Uint8Array;
+  readonly spreadCommit: string;
+
   private seats: (Seat | null)[];
   private bots: (Bot | null)[];
   /** Consecutive ticks each slot's queue has been above BUFFER_TARGET. */
@@ -106,7 +121,11 @@ export class Room {
     this.matchId = matchId;
     this.kind = kind;
     this.roster = roster;
-    this.world = createWorld(roster.length);
+    this.spreadSalt = kind === "staked"
+      ? new Uint8Array(randomBytes(32))
+      : FREE_SALT_BYTES;
+    this.spreadCommit = sha256Hex(this.spreadSalt);
+    this.world = createWorld(roster.length, saltSeeds(this.spreadSalt));
     this.seats = new Array(roster.length).fill(null);
     this.bots = new Array(roster.length).fill(null);
     this.overTarget = new Array(roster.length).fill(0);
@@ -114,9 +133,11 @@ export class Room {
     this.startWhenSeated = startWhenSeated;
     this.fillWithBots = fillWithBots && kind === "free";
     this.log = {
-      v: 3,
+      v: 4,
       matchId,
       map: MAP_ID,
+      // Filled in at finish: the salt is a secret until the round is over.
+      spreadSalt: "",
       roster,
       startedAt: 0,
       ticks: [],
@@ -409,11 +430,16 @@ export class Room {
 
     const standings = this.standings();
     this.log.standings = standings;
+    // The reveal. Hashed into the log, so the payout's log hash covers it.
+    const salt = toHex(this.spreadSalt);
+    this.log.spreadSalt = salt;
     const hash = createHash("sha256").update(canonicalise(this.log)).digest("hex");
 
     for (const seat of this.seats) {
       if (!seat) continue;
-      seat.send({ t: "over", tick: this.world.tick, standings, logHash: hash });
+      seat.send({
+        t: "over", tick: this.world.tick, standings, logHash: hash, spreadSalt: salt,
+      });
     }
     this.onFinish(this.log, hash);
   }

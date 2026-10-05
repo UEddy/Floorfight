@@ -128,3 +128,21 @@ export function toHex(bytes: Uint8Array): string {
 export function sha256Hex(bytes: Uint8Array): string {
   return toHex(sha256(bytes));
 }
+
+/** Parse hex back to bytes. Returns null on anything malformed. */
+export function fromHex(s: string): Uint8Array | null {
+  if (typeof s !== "string" || s.length === 0 || s.length % 2 !== 0) return null;
+  const out = new Uint8Array(s.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    const hi = HEX.indexOf(s[i * 2].toLowerCase());
+    const lo = HEX.indexOf(s[i * 2 + 1].toLowerCase());
+    if (hi < 0 || lo < 0) return null;
+    out[i] = (hi << 4) | lo;
+  }
+  return out;
+}
+
+/** UTF-8 bytes of a string, for hashing a label. */
+export function utf8(s: string): Uint8Array {
+  return new TextEncoder().encode(s);
+}

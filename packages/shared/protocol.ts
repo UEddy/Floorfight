@@ -121,12 +121,31 @@ export interface SnapshotPlayer {
 
 export type ServerMsg =
   | { t: "challenge"; v: number; nonce: string }
-  | { t: "accepted"; slot: number; tick: number; startsInMs: number; roster: RosterEntry[] }
+  | {
+      t: "accepted"; slot: number; tick: number; startsInMs: number;
+      roster: RosterEntry[];
+      /**
+       * sha256 of this match's pellet spread salt, as hex.
+       *
+       * The commit half of a commit and reveal. It arrives before the first
+       * shot, and the salt itself arrives in the `over` message and in the
+       * match log when the match is finished. Anyone who kept this value can
+       * check that the salt they were given hashes to it, which is what rules
+       * out a server picking a spread pattern after seeing the round.
+       *
+       * Keep it. The server will not send it again.
+       */
+      spreadCommit: string;
+    }
   | {
       t: "snap"; tick: number; ack: number; rtt: number;
       players: SnapshotPlayer[]; hits: HitEvent[];
     }
-  | { t: "over"; tick: number; standings: Standing[]; logHash: string }
+  | {
+      t: "over"; tick: number; standings: Standing[]; logHash: string;
+      /** The reveal: the salt committed to at join, as hex. */
+      spreadSalt: string;
+    }
   | { t: "ping"; id: number }
   | { t: "kick"; reason: string };
 
@@ -169,7 +188,9 @@ export interface Standing {
  *
  * sha256 of the canonical serialisation is written on chain alongside the
  * payout, so a loser can download the log, replay it, and check the winner
- * rather than taking the resolver's word for it.
+ * rather than taking the resolver's word for it. The salt is inside that
+ * hash, so a log cannot be re-salted after the fact without the payout's own
+ * commitment no longer matching.
  *
  * This does not make settlement trustless. It makes it auditable. That is the
  * honest claim and the achievable one, and it is the one that goes in the deck.
@@ -178,6 +199,12 @@ export interface MatchLog {
   v: number;
   matchId: string;
   map: string;
+  /**
+   * The pellet spread salt, as hex, written when the match ends. A replay
+   * needs it to reproduce the shots, and the hash of it was published to
+   * every player at join.
+   */
+  spreadSalt: string;
   roster: RosterEntry[];
   startedAt: number;
   ticks: { tick: number; inputs: (Input | null)[] }[];
@@ -199,5 +226,7 @@ export function canonicalise(log: MatchLog): string {
   ]);
   const roster = log.roster.map((r) => [r.slot, r.wallet, r.collection, r.mint]);
   const standings = log.standings.map((s) => [s.slot, s.wallet, s.kills, s.deaths, s.place]);
-  return JSON.stringify([log.v, log.matchId, log.map, roster, log.startedAt, ticks, standings]);
+  return JSON.stringify([
+    log.v, log.matchId, log.map, log.spreadSalt, roster, log.startedAt, ticks, standings,
+  ]);
 }

@@ -55,10 +55,18 @@ well short of the hall's longest sightline. Magazine, reload, fire interval,
 damage, head multiplier, spread, pellet count and range all live in that
 table, and the server is the only thing that acts on it.
 
-Pellet spread comes from hashing (tick, slot, pellet index), never
+Pellet spread comes from hashing (salt, tick, slot, pellet index), never
 `Math.random`. A replay has to be able to derive every random looking number
-the match used from values the log already contains, and those three are in
-it.
+the match used from values the log already contains, and all four are in it.
+
+The salt is commit and reveal. A staked room draws 32 random bytes when it is
+created, before anyone has joined, and sends sha256 of them in every accepted
+message. The bytes themselves go out in the `over` message and into the match
+log when the round ends, and the log hash on chain covers them. So nobody can
+know the pattern in advance, and the server cannot pick one afterwards to suit
+the result. The client checks the reveal against its own recorded commitment
+and says so on the end of round card. Free rooms use a fixed public salt:
+there is nothing to win and nobody to convince.
 
 ## Trust boundary
 

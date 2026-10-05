@@ -227,6 +227,9 @@ wss.on("connection", (ws: WebSocket) => {
       tick: target.world.tick,
       startsInMs: 0,
       roster: target.roster,
+      // The commit half of the spread salt. A staked room drew it at
+      // creation; the reveal arrives when the match ends.
+      spreadCommit: target.spreadCommit,
     }));
   }
 });

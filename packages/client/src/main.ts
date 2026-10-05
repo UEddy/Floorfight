@@ -15,6 +15,7 @@ import {
   type Input,
 } from "../../shared/sim";
 import { WEAPONS } from "../../shared/weapons";
+import { fromHex, sha256Hex } from "../../shared/sha256";
 import { quantAxis, quantPitch, quantYaw, type SnapshotPlayer } from "../../shared/protocol";
 import { DEV_MATCH_ID } from "../../shared/dev";
 import { devKeypair } from "./keys";
@@ -82,6 +83,14 @@ let rtt = 0;
 let deathTick: number | null = null;
 
 /**
+ * The spread salt commitment from the accepted message, kept until the end of
+ * the round so the reveal can be checked against it. The server only sends it
+ * once, which is the point: a commitment recorded after the fact proves
+ * nothing.
+ */
+let spreadCommit: string | null = null;
+
+/**
  * Remote players the server has killed but the interpolation buffer, 100 ms
  * behind, still shows alive. Keyed by slot, value is the hit's server tick.
  *
@@ -140,6 +149,7 @@ hud.message("Connecting...");
 const net = new Net(serverUrl, DEV_MATCH_ID, keys, {
   onAccepted(msg) {
     slot = msg.slot;
+    spreadCommit = msg.spreadCommit;
     hud.setRoster(msg.roster);
     predictor = new Predictor(msg.roster.length, slot);
     renderer = new Renderer(canvas, msg.roster.length);
@@ -210,7 +220,26 @@ const net = new Net(serverUrl, DEV_MATCH_ID, keys, {
     hud.message("");
     hud.clock(0);
     hud.death(null);
-    hud.showOver(msg.standings, msg.logHash, () => location.reload());
+
+    // Check the reveal against the commitment from join. The client can do
+    // this on its own, with no help from the server and nothing to trust: it
+    // kept the hash, and now it has the bytes.
+    const revealed = fromHex(msg.spreadSalt);
+    const spread = spreadCommit === null
+      ? "unknown"
+      : revealed !== null && sha256Hex(revealed) === spreadCommit
+        ? "ok"
+        : "bad";
+    if (spread === "bad") {
+      console.error(
+        `[arena] spread salt does not match the commitment: committed ` +
+        `${spreadCommit}, revealed ${msg.spreadSalt}`,
+      );
+    } else if (spread === "ok") {
+      console.log(`[arena] spread salt verified against ${spreadCommit}`);
+    }
+
+    hud.showOver(msg.standings, msg.logHash, spread, () => location.reload());
     net.close();
     console.log(`[arena] round over, log hash ${msg.logHash}`, msg.standings);
   },

@@ -18,7 +18,8 @@ import {
   type HitEvent,
   type Input,
 } from "../../shared/sim";
-import { WEAPON_COUNT } from "../../shared/weapons";
+import { FREE_SALT_BYTES, WEAPON_COUNT, saltSeeds } from "../../shared/weapons";
+import { toHex } from "../../shared/sha256";
 import { canonicalise, type MatchLog, type RosterEntry } from "../../shared/protocol";
 
 const SLOTS = 6;
@@ -29,7 +30,13 @@ const SLOTS = 6;
  * identical output, and a generator can cover more of the input space: every
  * player moves, looks around, jumps and fires throughout.
  */
-export function runMatch(seed: number, ticks: number): {
+/**
+ * `salt` is the match's spread salt: in a staked match it is the 32 bytes the
+ * server committed to at join and revealed in the log, and replaying with the
+ * revealed bytes is the whole reason for writing them down. Default is the
+ * public free room salt.
+ */
+export function runMatch(seed: number, ticks: number, salt: Uint8Array = FREE_SALT_BYTES): {
   logHash: string;
   stateHash: string;
   kills: number;
@@ -46,7 +53,7 @@ export function runMatch(seed: number, ticks: number): {
     roster.push({ slot: i, wallet: `w${i}`, collection: null, mint: null });
   }
 
-  const world = createWorld(SLOTS);
+  const world = createWorld(SLOTS, saltSeeds(salt));
   // Cluster the six of them in the open pocket on the stage, in each other's
   // line of sight. The real spawns are deliberately far apart behind cover,
   // which is right for a match and useless here: a determinism check that
@@ -60,9 +67,10 @@ export function runMatch(seed: number, ticks: number): {
     p.vy = 0;
   }
   const log: MatchLog = {
-    v: 3,
+    v: 4,
     matchId: "replay-test",
     map: MAP_ID,
+    spreadSalt: toHex(salt),
     roster,
     startedAt: 0,
     ticks: [],

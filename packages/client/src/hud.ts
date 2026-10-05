@@ -300,7 +300,18 @@ export class Hud {
     }
   }
 
-  showOver(standings: Standing[], logHash: string, onAgain: () => void): void {
+  /**
+   * The end of round card.
+   *
+   * `spread` is the result of checking the revealed salt against the
+   * commitment this client was given when it joined. It is shown because a
+   * verification nobody can see is not worth doing: if it ever says no, the
+   * player should know before the payout does.
+   */
+  showOver(
+    standings: Standing[], logHash: string, spread: "ok" | "bad" | "unknown",
+    onAgain: () => void,
+  ): void {
     const body = this.over.querySelector("tbody")!;
     body.innerHTML = standings
       .map((s) => {
@@ -310,6 +321,13 @@ export class Hud {
       })
       .join("");
     this.over.querySelector(".hash b")!.textContent = logHash;
+    const note = this.over.querySelector(".spread")!;
+    note.textContent = spread === "ok"
+      ? "Spread salt matches the commitment from join"
+      : spread === "bad"
+        ? "WARNING: revealed spread salt does not match the commitment"
+        : "Spread salt not checked: no commitment was recorded";
+    note.className = `spread${spread === "bad" ? " bad" : ""}`;
     this.over.querySelector("button")!.onclick = onAgain;
     this.over.classList.add("show");
   }

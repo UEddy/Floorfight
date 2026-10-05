@@ -41,13 +41,14 @@ import {
   type Input,
 } from "../../shared/sim";
 import {
-  SWITCH_TICKS, WEAPONS, WEAPON_COUNT, W_PISTOL, W_RIFLE, W_SHOTGUN, spreadHash,
+  FREE_SALT, FREE_SALT_BYTES, SWITCH_TICKS, WEAPONS, WEAPON_COUNT,
+  W_PISTOL, W_RIFLE, W_SHOTGUN, saltSeeds, spreadHash,
 } from "../../shared/weapons";
 import { GRID, MAP_ID, MAP_NAME } from "../../shared/map";
-import { sha256Hex } from "../../shared/sha256";
+import { fromHex, sha256Hex, toHex } from "../../shared/sha256";
 import { REPLAY_SEED, REPLAY_TICKS, runMatch } from "./replay";
 import { Room } from "../src/room";
-import type { RosterEntry } from "../../shared/protocol";
+import type { MatchLog, RosterEntry } from "../../shared/protocol";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -533,19 +534,41 @@ test("every weapon has a coherent spec", () => {
   assert.ok(WEAPONS[W_RIFLE].headDamage < MAX_HP);
 });
 
-test("spread comes from a hash of tick, slot and pellet, not from chance", () => {
+test("spread comes from a hash of salt, tick, slot and pellet, not from chance", () => {
   // Same inputs, same number, every time and in any order.
-  assert.equal(spreadHash(1234, 3, 5), spreadHash(1234, 3, 5));
+  assert.equal(spreadHash(FREE_SALT, 1234, 3, 5), spreadHash(FREE_SALT, 1234, 3, 5));
   const seen = new Set<number>();
   for (let t = 0; t < 40; t++) {
     for (let slot = 0; slot < 6; slot++) {
-      for (let pel = 0; pel < 8; pel++) seen.add(spreadHash(t, slot, pel));
+      for (let pel = 0; pel < 8; pel++) seen.add(spreadHash(FREE_SALT, t, slot, pel));
     }
   }
-  // 1920 draws from a 32 bit space: a generator that ignored one of its three
+  // 1920 draws from a 32 bit space: a generator that ignored one of its
   // arguments would collide heavily here.
   assert.ok(seen.size > 1900, `expected distinct values, got ${seen.size}`);
   for (const h of seen) assert.ok(h >= 0 && h <= 0xffffffff);
+
+  // And the salt matters: the same tick, slot and pellet under a different
+  // salt is a different number nearly every time.
+  const other = saltSeeds(new Uint8Array(32).fill(7));
+  let differ = 0;
+  for (let t = 0; t < 200; t++) {
+    if (spreadHash(FREE_SALT, t, 1, 0) !== spreadHash(other, t, 1, 0)) differ++;
+  }
+  assert.ok(differ > 195, `the salt should change the pattern, ${differ}/200 differed`);
+});
+
+test("folding the salt uses every byte of it", () => {
+  const base = new Uint8Array(32);
+  const seen = new Set<string>();
+  for (let i = 0; i < 32; i++) {
+    const edited = Uint8Array.from(base);
+    edited[i] = 1;
+    const s = saltSeeds(edited);
+    seen.add(`${s.a}:${s.b}`);
+  }
+  // A fold that dropped a byte would produce a repeat here.
+  assert.equal(seen.size, 32);
 });
 
 /** Put two players nose to nose in the open pocket on the stage. */
@@ -754,6 +777,73 @@ test("a hostile weapon index is ignored", () => {
 test("the round is three minutes and respawning takes three seconds", () => {
   assert.equal(ROUND_TICKS, 180 * TICK_HZ);
   assert.equal(RESPAWN_TICKS, 3 * TICK_HZ);
+});
+
+/* ------------------------------------------------- commit and reveal --- */
+
+test("a staked room commits to a random salt and reveals it at the end", () => {
+  let log: MatchLog | null = null;
+  const room = new Room("staked-salt", roster(6), (l) => { log = l; }, 0, "staked");
+
+  // 32 bytes, drawn at creation, and the commit is their hash.
+  assert.equal(room.spreadSalt.length, 32);
+  assert.equal(room.spreadCommit, sha256Hex(room.spreadSalt));
+  assert.notEqual(toHex(room.spreadSalt), toHex(FREE_SALT_BYTES));
+
+  // Two staked rooms do not share a salt.
+  const other = new Room("staked-salt-2", roster(6), () => {}, 0, "staked");
+  assert.notEqual(toHex(room.spreadSalt), toHex(other.spreadSalt));
+
+  // Nothing reveals it until the round is over.
+  const inner = room as unknown as { log: MatchLog; tick: () => void };
+  assert.equal(inner.log.spreadSalt, "");
+
+  room.start();
+  room.stop();
+  for (let i = 0; i < ROUND_TICKS; i++) inner.tick();
+
+  assert.ok(log, "the room should have finished");
+  const finished = log as unknown as MatchLog;
+  assert.equal(finished.spreadSalt, toHex(room.spreadSalt));
+  assert.equal(sha256Hex(fromHex(finished.spreadSalt)!), room.spreadCommit);
+});
+
+test("a free room uses the fixed public salt", () => {
+  const room = new Room("free-salt", roster(6), () => {}, 0, "free");
+  assert.equal(toHex(room.spreadSalt), toHex(FREE_SALT_BYTES));
+  assert.equal(room.spreadCommit, sha256Hex(FREE_SALT_BYTES));
+});
+
+test("a replay with the revealed salt reproduces the match, a wrong salt does not", () => {
+  // Stand in for a staked room's salt: 32 bytes nobody could have guessed.
+  const salt = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) salt[i] = (i * 37 + 11) & 0xff;
+  const commit = sha256Hex(salt);
+
+  const played = runMatch(REPLAY_SEED, 40 * TICK_HZ, salt);
+
+  // The reveal: hex in the log, which hashes to the commitment published at
+  // join. A verifier does these two checks before replaying anything.
+  const revealed = fromHex(toHex(salt))!;
+  assert.equal(sha256Hex(revealed), commit);
+
+  const replayed = runMatch(REPLAY_SEED, 40 * TICK_HZ, revealed);
+  assert.equal(replayed.stateHash, played.stateHash);
+  assert.equal(replayed.logHash, played.logHash);
+  assert.ok(played.hits > 5, `the match needs shots in it, had ${played.hits}`);
+
+  // The wrong salt replays into a different match. One byte is enough: this
+  // is what makes the salt worth committing to rather than just publishing.
+  const wrong = Uint8Array.from(salt);
+  wrong[31] ^= 1;
+  const bad = runMatch(REPLAY_SEED, 40 * TICK_HZ, wrong);
+  assert.notEqual(bad.stateHash, played.stateHash);
+  assert.notEqual(bad.logHash, played.logHash);
+
+  // And a replay under the free salt, which is what someone would reach for
+  // if they ignored the log, also fails to reproduce it.
+  const ignored = runMatch(REPLAY_SEED, 40 * TICK_HZ);
+  assert.notEqual(ignored.stateHash, played.stateHash);
 });
 
 /* -------------------------------------------------------------- rooms --- */

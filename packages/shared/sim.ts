@@ -41,7 +41,9 @@ import {
   SPAWNS,
   solidAt,
 } from "./map";
-import { SWITCH_TICKS, WEAPONS, WEAPON_COUNT, spreadHash } from "./weapons";
+import {
+  FREE_SALT, SWITCH_TICKS, WEAPONS, WEAPON_COUNT, spreadHash, type SpreadSalt,
+} from "./weapons";
 
 export {
   GRID_X, GRID_Y, GRID_Z, HALF_X, HALF_Z, MAP_ID, SPAWNS,
@@ -178,6 +180,12 @@ export interface WorldState {
   tick: number;
   players: PlayerState[];  // stable order, indexed by slot
   history: HistFrame[];    // ring of HISTORY_TICKS, indexed tick % HISTORY_TICKS
+  /**
+   * This match's pellet spread salt. Set once when the world is made and
+   * never touched again, so a replay that builds the world with the salt
+   * from the log gets the same pattern the match had.
+   */
+  spread: SpreadSalt;
 }
 
 export interface Input {
@@ -228,7 +236,16 @@ export function newPlayer(id: number, slot: number): PlayerState {
   };
 }
 
-export function createWorld(slots: number): WorldState {
+/**
+ * A fresh world.
+ *
+ * `salt` defaults to the public free room salt. A staked room passes the one
+ * it generated and committed to; the client's prediction passes nothing,
+ * because prediction strips the fire bit and so never computes a spread. That
+ * is what lets the salt stay secret until the match is over without the
+ * client needing it.
+ */
+export function createWorld(slots: number, salt: SpreadSalt = FREE_SALT): WorldState {
   const players: PlayerState[] = [];
   for (let i = 0; i < slots; i++) players.push(newPlayer(i, i));
 
@@ -242,7 +259,7 @@ export function createWorld(slots: number): WorldState {
       alive: new Uint8Array(slots),
     });
   }
-  return { tick: 0, players, history };
+  return { tick: 0, players, history, spread: salt };
 }
 
 /* ----------------------------------------------------------- collision --- */
@@ -675,7 +692,7 @@ export function step(
     const headed = new Array<boolean>(n).fill(false);
 
     for (let pel = 0; pel < spec.pellets; pel++) {
-      const h = spreadHash(tick, slot, pel);
+      const h = spreadHash(world.spread, tick, slot, pel);
       // Thirteen bits of angle, ten of radius, from the same hash. The square
       // root spreads the pattern evenly over the disc instead of bunching it
       // in the middle, and Math.sqrt is exact under IEEE-754.

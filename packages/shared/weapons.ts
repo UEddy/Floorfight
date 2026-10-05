@@ -1,3 +1,5 @@
+import { sha256, utf8 } from "./sha256";
+
 /**
  * Weapons, as data.
  *
@@ -75,22 +77,75 @@ export const WEAPONS: readonly WeaponSpec[] = [
   spec(W_SHOTGUN, "Shotgun", 6, 150, 45, 14, 1.5, 420, 8, false, 16),
 ];
 
+/* --------------------------------------------------------------- spread --- */
+
+/**
+ * A match's spread salt, folded into two 32 bit words.
+ *
+ * The salt itself is 32 bytes. Only 64 bits of it reach the hash, which is
+ * the honest limit of this: it is enough that nobody can work out where their
+ * pellets will go, and it is not a 256 bit security claim. What the full 32
+ * bytes buy is the commitment, because the commit is sha256 of all of them.
+ */
+export interface SpreadSalt {
+  readonly a: number;
+  readonly b: number;
+}
+
+/** Fold salt bytes into the two words the hash uses. Integer ops only. */
+export function saltSeeds(bytes: Uint8Array): SpreadSalt {
+  let a = 0x9e3779b9;
+  let b = 0x85ebca6b;
+  for (let i = 0; i < bytes.length; i++) {
+    a = Math.imul(a ^ bytes[i], 0x27d4eb2f);
+    a = ((a << 13) | (a >>> 19)) >>> 0;
+    b = Math.imul(b ^ (bytes[i] + i), 0x165667b1);
+    b = (b ^ (b >>> 11)) >>> 0;
+  }
+  return { a: a >>> 0, b: b >>> 0 };
+}
+
+/**
+ * The salt a free room uses: a fixed, public value derived from a label.
+ *
+ * Free rooms have nothing to win, so there is nobody to convince and no
+ * reason to make the client wait for a commitment. It also means a test, a
+ * bot and a dev tab all agree on the spread without a handshake. A staked
+ * room never uses this: it generates 32 random bytes, publishes the hash of
+ * them at join and reveals the bytes in the match log at the end.
+ */
+export const FREE_SALT_LABEL = "floorfight:free-spread:v1";
+export const FREE_SALT_BYTES: Uint8Array = sha256(utf8(FREE_SALT_LABEL));
+export const FREE_SALT: SpreadSalt = saltSeeds(FREE_SALT_BYTES);
+
 /**
  * Deterministic spread.
  *
- * Every pellet's deviation comes from hashing (tick, slot, pellet index).
- * Math.random would be the obvious choice and it would destroy the audit
- * story: the match log records inputs, so a replay has to be able to derive
- * every random looking number the match used from values the log contains. A
- * tick, a slot and a pellet index are all in the log, so they are.
+ * Every pellet's deviation comes from hashing the match salt with (tick,
+ * slot, pellet index). Math.random would be the obvious choice and it would
+ * destroy the audit story: the match log records inputs, so a replay has to
+ * be able to derive every random looking number the match used from values
+ * the log contains. The tick, the slot and the pellet index are in the log,
+ * and so is the salt, written there when the match ends.
+ *
+ * The salt is what stops the pattern being known in advance. Without it the
+ * sequence is a pure function of public numbers, so a player who worked out
+ * the hash could know exactly where every pellet of their next shot would go,
+ * and so could everyone else know where theirs went. With it, nobody knows
+ * until the server reveals it, and because the hash of the salt was published
+ * before the first shot, the server cannot choose it afterwards to suit the
+ * result.
  *
  * Integer mixing only: Math.imul, shifts and xor, which are exact on every
  * engine. The constants are the usual xxhash and murmur ones.
  */
-export function spreadHash(tick: number, slot: number, pellet: number): number {
-  let h = Math.imul((tick | 0) ^ 0x9e3779b9, 0x85ebca6b);
+export function spreadHash(
+  salt: SpreadSalt, tick: number, slot: number, pellet: number,
+): number {
+  let h = Math.imul((tick | 0) ^ salt.a, 0x85ebca6b);
   h = Math.imul(h ^ ((slot | 0) + 0x165667b1), 0xc2b2ae35);
   h = Math.imul(h ^ Math.imul(pellet | 0, 0x27d4eb2f), 0x9e3779b1);
+  h = Math.imul(h ^ salt.b, 0x7feb352d);
   h ^= h >>> 15;
   h = Math.imul(h, 0x85ebca6b);
   h ^= h >>> 13;
