@@ -9,3 +9,4 @@ resolver*.json
 target/
 .anchor/
 .expo/
+.test-logs/

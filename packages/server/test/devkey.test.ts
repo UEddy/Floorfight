@@ -10,55 +10,16 @@
 
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { spawn, type ChildProcess } from "node:child_process";
-import { fileURLToPath } from "node:url";
-import path from "node:path";
 import bs58 from "bs58";
 import nacl from "tweetnacl";
 import { WebSocket } from "ws";
 import { PROTOCOL_VERSION, joinMessage, type ServerMsg } from "../../shared/protocol";
 import { DEV_MATCH_ID, DEV_SEATS, devSeedLabel } from "../../shared/dev";
-
-const SERVER_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+import { startServer, type Server } from "./spawn";
 
 function devKeypair(seat: number): nacl.SignKeyPair {
   const seed = nacl.hash(new TextEncoder().encode(devSeedLabel(seat))).slice(0, 32);
   return nacl.sign.keyPair.fromSeed(seed);
-}
-
-interface Server {
-  port: number;
-  proc: ChildProcess;
-}
-
-async function startServer(dev: boolean): Promise<Server> {
-  const port = 20_000 + Math.floor(Math.random() * 20_000);
-  const env: NodeJS.ProcessEnv = { ...process.env, PORT: String(port) };
-  delete env.HOST;
-  delete env.ARENA_DEV;
-  delete env.NODE_ENV;
-  if (dev) env.ARENA_DEV = "1";
-
-  const proc = spawn(process.execPath, ["--import", "tsx", "src/index.ts"], {
-    cwd: SERVER_DIR,
-    env,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  await new Promise<void>((resolve, reject) => {
-    let out = "";
-    const timer = setTimeout(() => reject(new Error(`server did not start:\n${out}`)), 30_000);
-    const onData = (d: Buffer) => {
-      out += d.toString();
-      if (out.includes(`listening on 127.0.0.1:${port}`)) {
-        clearTimeout(timer);
-        resolve();
-      }
-    };
-    proc.stdout!.on("data", onData);
-    proc.stderr!.on("data", onData);
-    proc.on("exit", (code) => reject(new Error(`server exited with ${code}:\n${out}`)));
-  });
-  return { port, proc };
 }
 
 /**
@@ -107,7 +68,10 @@ let prod: Server;
 let dev: Server;
 
 before(async () => {
-  [prod, dev] = await Promise.all([startServer(false), startServer(true)]);
+  // One without dev mode, which is the droplet, and one with it, which is a
+  // laptop. Both without a resolver key: the server refuses to run dev mode
+  // alongside one.
+  [prod, dev] = await Promise.all([startServer({}), startServer({ ARENA_DEV: "1" })]);
 });
 
 after(() => {

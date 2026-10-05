@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import type { IncomingMessage } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import bs58 from "bs58";
 import nacl from "tweetnacl";
@@ -19,6 +20,16 @@ import { hasChainEnv, rosterFromMatch } from "./chain";
 import type { ChainConfig } from "./chainrpc";
 import { DEFAULT_LOG_DIR, finishMatch } from "./settlement";
 import { FREE_SEAT_OPEN, Room, type RoomKind, type Seat } from "./room";
+import {
+  ConnectionLimits,
+  JOIN_DEADLINE_MS,
+  MAX_CONNECTIONS,
+  MAX_FREE_ROOMS,
+  MAX_PER_IP,
+  MAX_ROOMS,
+  clientIp,
+  limitFromEnv,
+} from "./limits";
 
 /**
  * Loopback by default. In deployment Caddy terminates TLS and proxies /ws to
@@ -27,6 +38,20 @@ import { FREE_SEAT_OPEN, Room, type RoomKind, type Seat } from "./room";
  */
 const HOST = process.env.HOST || "127.0.0.1";
 const PORT = Number(process.env.PORT ?? 8080);
+
+/**
+ * Caps, read once. The defaults in limits.ts are the policy; the environment
+ * overrides exist so a test does not have to open two hundred sockets or wait
+ * ten seconds for a deadline.
+ */
+const LIMIT_PER_IP = limitFromEnv(process.env, "MAX_PER_IP", MAX_PER_IP);
+const LIMIT_TOTAL = limitFromEnv(process.env, "MAX_CONNECTIONS", MAX_CONNECTIONS);
+const LIMIT_ROOMS = limitFromEnv(process.env, "MAX_ROOMS", MAX_ROOMS);
+const LIMIT_FREE_ROOMS = Math.min(
+  LIMIT_ROOMS, limitFromEnv(process.env, "MAX_FREE_ROOMS", MAX_FREE_ROOMS),
+);
+const JOIN_DEADLINE = limitFromEnv(process.env, "JOIN_DEADLINE_MS", JOIN_DEADLINE_MS);
+const limits = new ConnectionLimits(LIMIT_PER_IP, LIMIT_TOTAL);
 
 let DEV = false;
 const LOG_DIR = process.env.LOG_DIR || DEFAULT_LOG_DIR;
@@ -176,6 +201,16 @@ async function ensureStakedRoom(matchId: string): Promise<Room | null> {
     const raced = rooms.get(matchId);
     if (raced) return raced;
 
+    if (rooms.size >= LIMIT_ROOMS) {
+      // Should not happen: free rooms are capped below the total so there is
+      // always headroom for a staked match. Loud if it ever does, because the
+      // people in that match have stakes in escrow.
+      console.error(
+        `[match ${matchId}] cannot open a staked room: ${rooms.size} rooms already open`,
+      );
+      return null;
+    }
+
     const roster = rosterFromMatch(account);
     console.log(
       `[match ${matchId}] opening staked room, ${roster.length} players, ` +
@@ -211,7 +246,15 @@ const BOOT = Date.now().toString(36);
 let freeCounter = 0;
 const freeRooms: Room[] = [];
 
-function openFreeRoom(): Room {
+function openFreeRoom(): Room | null {
+  // Free play gets a share of the room cap, never all of it: a staked match
+  // has money in escrow and must not be the thing that cannot open.
+  if (freeRooms.length >= LIMIT_FREE_ROOMS || rooms.size >= LIMIT_ROOMS) {
+    console.warn(
+      `[free] at capacity: ${freeRooms.length} free rooms, ${rooms.size} rooms in total`,
+    );
+    return null;
+  }
   const matchId = `free-${BOOT}-${++freeCounter}`;
   const roster: RosterEntry[] = [];
   for (let slot = 0; slot < FREE_SEATS; slot++) {
@@ -232,8 +275,14 @@ function openFreeRoom(): Room {
   return room;
 }
 
-/** The newest free room worth joining, opening one if there is none. */
-function matchmake(): Room {
+/**
+ * The newest free room worth joining, opening one if there is none.
+ *
+ * Null when the box is at its room cap and every room already open is full or
+ * nearly over. The challenge then offers no free room, and the client says so
+ * rather than joining something that cannot seat it.
+ */
+function matchmake(): Room | null {
   for (let i = freeRooms.length - 1; i >= 0; i--) {
     if (freeRooms[i].joinable()) return freeRooms[i];
   }
@@ -267,7 +316,37 @@ interface Pending {
 
 const wss = new WebSocketServer({ host: HOST, port: PORT, maxPayload: MAX_MSG_BYTES });
 
-wss.on("connection", (ws: WebSocket) => {
+wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
+  const kick = (reason: string) => {
+    try { ws.send(JSON.stringify({ t: "kick", reason })); } catch { /* closing */ }
+    ws.close();
+  };
+
+  /*
+   * Who is this, and are they allowed another socket?
+   *
+   * Behind Caddy the TCP peer is always the loopback, so the address that
+   * matters comes out of X-Forwarded-For, and only when the peer really is
+   * the loopback. See limits.ts for why the rightmost entry is the one used.
+   */
+  const ip = clientIp(req.socket.remoteAddress, req.headers["x-forwarded-for"]);
+  const verdict = limits.admit(ip);
+  if (verdict !== "ok") {
+    console.warn(
+      `[limits] refused ${ip}: ${verdict} ` +
+      `(${limits.countFor(ip)} from it, ${limits.total} live)`,
+    );
+    kick(verdict);
+    return;
+  }
+
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    limits.release(ip);
+  };
+
   const pending: Pending = {
     nonce: bs58.encode(randomBytes(24)),
     issuedAt: Date.now(),
@@ -280,19 +359,31 @@ wss.on("connection", (ws: WebSocket) => {
   let budget = MAX_MSGS_PER_SECOND;
   const refill = setInterval(() => { budget = MAX_MSGS_PER_SECOND; }, 1000);
 
-  const kick = (reason: string) => {
-    try { ws.send(JSON.stringify({ t: "kick", reason })); } catch { /* closing */ }
-    ws.close();
+  /*
+   * A socket that never joins is a socket holding a slot for nothing. Ten
+   * seconds is far longer than the handshake takes and short enough that a
+   * script opening connections and sitting on them gets nowhere.
+   */
+  let joinTimer: NodeJS.Timeout | null = setTimeout(() => {
+    joinTimer = null;
+    if (room) return;
+    console.warn(`[limits] ${ip} connected without joining, closing`);
+    kick("join timed out");
+  }, JOIN_DEADLINE);
+  const clearJoinTimer = () => {
+    if (joinTimer) clearTimeout(joinTimer);
+    joinTimer = null;
   };
 
   // The free room this connection would sit in, decided now so the guest can
-  // sign the id of the room it actually gets.
+  // sign the id of the room it actually gets. Null when every room is full
+  // and the box is at its cap.
   const offered = matchmake();
   ws.send(JSON.stringify({
     t: "challenge",
     v: PROTOCOL_VERSION,
     nonce: pending.nonce,
-    freeMatchId: offered.matchId,
+    freeMatchId: offered ? offered.matchId : null,
   }));
 
   ws.on("message", (raw) => {
@@ -337,6 +428,8 @@ wss.on("connection", (ws: WebSocket) => {
 
   ws.on("close", () => {
     clearInterval(refill);
+    clearJoinTimer();
+    release();
     if (room && mySeat) room.unseat(slot, mySeat);
   });
 
@@ -416,6 +509,7 @@ wss.on("connection", (ws: WebSocket) => {
       close: (reason) => kick(reason),
     };
     mySeat = seat;
+    clearJoinTimer();
     target.seat(seat);
 
     ws.send(JSON.stringify({
@@ -454,6 +548,11 @@ async function verifyCharacter(
 
 wss.on("listening", () => {
   console.log(`floorfight server listening on ${HOST}:${PORT}`);
+  console.log(
+    `caps: ${LIMIT_PER_IP} sockets per address, ${LIMIT_TOTAL} in total, ` +
+    `${LIMIT_ROOMS} rooms (${LIMIT_FREE_ROOMS} free), ` +
+    `${JOIN_DEADLINE} ms to join`,
+  );
   console.log(`match logs in ${LOG_DIR}`);
   if (CHAIN) {
     console.log(

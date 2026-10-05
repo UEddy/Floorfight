@@ -55,6 +55,32 @@ trust boundary gets exercised before there is money on it.
 both server and client. That sharing is the point: prediction, authority and
 replay must run identical code.
 
+## Caps
+
+Public deploy limits, in `packages/server/src/limits.ts`. The constants are
+the policy; each has an environment override so a limit can be moved on the
+droplet without a deploy, and so a test does not have to open two hundred
+sockets.
+
+- 8 live sockets per address, 200 in total.
+- 20 live rooms, of which free play may use 16. The reserve is so a staked
+  match, which has money in escrow, can always open.
+- 10 seconds to finish the join handshake, then the socket is closed.
+
+None of it stops a botnet. It stops the cheap things, and it makes the failure
+mode "that address is refused" rather than the kernel killing the process.
+
+The address a connection is charged to comes from `X-Forwarded-For` only when
+the TCP peer is `127.0.0.1`, which behind Caddy it always is. From anywhere
+else the header is ignored completely. When the header is a list the
+**rightmost** entry is used, because Caddy appends what it saw: reading the
+leftmost, which is the usual way this gets written, would let any client pick
+its own bucket by sending a header.
+
+Twenty rooms is a ceiling, not a capacity claim. Twenty full rooms is 120
+players at 60 Hz and about 8 MB of match log objects each, against a 256 MB
+heap on 1 vCPU. CPU or memory will complain first.
+
 ## Match logs
 
 The canonical log of every match is written to `/var/lib/floorfight/logs/<matchId>.json`
@@ -215,7 +241,11 @@ npm --prefix packages/server start
 `ARENA_DEV=1` adds the fixed seat dev room for two tabs with known keys, and
 refuses to coexist with a resolver key or with `NODE_ENV=production`.
 `FREE_FILL_MS` is how long a free room waits for company before taking bots,
-8000 by default.
+8000 by default. `MAX_PER_IP`, `MAX_CONNECTIONS`, `MAX_ROOMS`,
+`MAX_FREE_ROOMS` and `JOIN_DEADLINE_MS` override the caps above.
+
+Local play counts as one address: eight tabs on one machine is the per address
+cap, because the loopback peer with no forwarded header is the address.
 
 A free only server never imports `@solana/web3.js`: `chainrpc.ts` is loaded
 dynamically and only when a resolver is configured. On the droplet that is the

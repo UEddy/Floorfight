@@ -54,6 +54,14 @@ Environment=RESOLVER_KEYPAIR_PATH=/etc/floorfight/resolver.json
 # download a log and replay it.
 Environment=LOG_DIR=/var/lib/floorfight/logs
 
+# Connection caps are compiled defaults: 8 sockets per address, 200 in total,
+# 20 rooms of which free play may use 16, and 10 seconds to finish the join
+# handshake. MAX_PER_IP, MAX_CONNECTIONS, MAX_ROOMS, MAX_FREE_ROOMS and
+# JOIN_DEADLINE_MS override them here if one of them turns out to be wrong
+# under real traffic. The address a connection is charged to comes from
+# X-Forwarded-For, which is why Caddy must be the only thing that can reach
+# the port: the header is trusted from the loopback and nowhere else.
+
 Restart=always
 RestartSec=2
 
