@@ -224,6 +224,31 @@ S10 before trusting any of this. The S10 is the floor, not the S24.
   `@coral-xyz/anchor` import fails. LiteSVM is pinned at 0.8.0, the last
   release built on web3.js, which the Anchor TypeScript client needs.
 
+## Installing the server
+
+On the droplet, in `packages/server`:
+
+```
+npm ci --omit=dev --omit=optional
+```
+
+`--omit=optional` keeps `bufferutil` and `utf-8-validate` off the box. They are
+optional native speedups for `ws`, arriving as optional dependencies of
+`rpc-websockets` via `@solana/web3.js`, and `ws` has JavaScript fallbacks for
+both. The alternative is node-gyp and a compiler on a 512 MB box to make frame
+masking marginally faster for a couple of hundred sockets.
+
+That flag cannot live in an `.npmrc`: `omit` is an array config and a command
+line `--omit` replaces the file's value rather than adding to it, so
+`omit=optional` in a file silently stops applying the moment anyone passes
+`--omit=dev`. Tested, not assumed.
+
+Both lockfiles have to stay in sync with their package.json or `npm ci` refuses
+to run at all. After changing a dependency, regenerate with
+`npm install --package-lock-only` in that package and commit the result. A test
+checks the two optional natives are still in the server lock and still marked
+optional, because the way this broke was the lock quietly losing an entry.
+
 ## Running the server
 
 ```

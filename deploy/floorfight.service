@@ -2,7 +2,23 @@
 #
 # Install: copy the repo to /opt/floorfight (the server imports
 # packages/shared directly, so the whole tree is needed, not just
-# packages/server), run `npm ci --omit=dev` in packages/server, then
+# packages/server), then in packages/server run
+#
+#   npm ci --omit=dev --omit=optional
+#
+# Both flags matter. `--omit=optional` keeps bufferutil and utf-8-validate out
+# of the tree: they are optional native speedups for ws, pulled in as optional
+# dependencies of rpc-websockets by @solana/web3.js, and ws falls back to its
+# own JavaScript for both. Installing them means node-gyp and a compiler on a
+# box with 512 MB, to make WebSocket frame masking slightly faster for at most
+# a couple of hundred sockets. Not worth it.
+#
+# Do not try to move that flag into a .npmrc. `omit` is an array config, and
+# an `--omit` on the command line replaces the file's value instead of adding
+# to it, so an .npmrc saying omit=optional stops working the moment anyone
+# runs `npm ci --omit=dev`. It would look like protection and be none.
+#
+# Then
 #   cp deploy/floorfight.service /etc/systemd/system/
 #   systemctl daemon-reload && systemctl enable --now floorfight
 #
