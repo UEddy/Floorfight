@@ -1,0 +1,35 @@
+{
+  "name": "@floorfight/mobile",
+  "version": "0.0.0",
+  "private": true,
+  "main": "index.ts",
+  "scripts": {
+    "start": "expo start --dev-client",
+    "android": "expo run:android",
+    "check": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
+    "idl:sync": "node scripts/sync-idl.mjs",
+    "doctor": "npx expo-doctor",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "0.32.1",
+    "@solana-mobile/mobile-wallet-adapter-protocol": "2.3.0",
+    "@solana-mobile/mobile-wallet-adapter-protocol-web3js": "2.3.0",
+    "@solana/web3.js": "1.99.0",
+    "bs58": "6.0.0",
+    "buffer": "6.0.3",
+    "expo": "57.0.26",
+    "expo-dev-client": "57.0.19",
+    "expo-status-bar": "57.0.1",
+    "react": "19.2.3",
+    "react-native": "0.86.3",
+    "react-native-get-random-values": "1.11.0",
+    "react-native-webview": "13.16.1"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.3",
+    "@types/react": "19.2.18",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "//": "The bridge tests run under node, so they need node's types. Kept out of the app's own project so that node globals cannot leak into code that ships in the bundle, where setTimeout and Buffer are React Native's rather than node's.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["node"]
+  },
+  "include": ["test/**/*.ts", "src/**/*.ts"]
+}

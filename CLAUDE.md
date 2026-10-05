@@ -196,4 +196,11 @@ covering the attack cases and payout paths, 42 server tests covering replay
 determinism, weapon behaviour, the map id, the map's sightline and
 reachability rules, and the bot rules.
 
-Next: droplet deploy, then Expo shell and MWA.
+Scaffolded, unbuilt: `apps/mobile`, the Expo shell. Android only, Expo SDK 57,
+a WebView pointed at the production origin, and a native bridge that accepts
+exactly two requests from the page and refuses everything else. It type checks
+and its bridge tests pass, but no EAS project exists and nothing has run on a
+phone. `apps/mobile/README.md` lists what has to be set up by hand.
+
+Next: droplet deploy, then the EAS development build, then wiring the web
+client to the native bridge.

@@ -88,6 +88,22 @@ export function joinMessage(matchId: string, nonce: string): string {
   return `floorfight:join:v${PROTOCOL_VERSION}:${matchId}:${nonce}`;
 }
 
+/**
+ * The exact shape of a join message, as a pattern.
+ *
+ * This exists for anything that has to decide whether a string it was handed
+ * is a join message and nothing else. The mobile shell is the reason: it will
+ * sign a join message for the WebView, and the only thing standing between
+ * that and signing whatever the page asks for is a check this strict. It
+ * keeps its own copy of this pattern, deliberately, so a compromised bundle
+ * cannot widen it, and this is the copy that is tested.
+ *
+ * Nothing matching it can be a Solana transaction, which is the other thing
+ * an off-chain signing path has to be sure of.
+ */
+export const JOIN_MESSAGE_RE =
+  /^floorfight:join:v(\d{1,3}):([A-Za-z0-9_-]{1,64}):([1-9A-HJ-NP-Za-km-z]{16,64})$/;
+
 /* -------------------------------------------------------------- server --- */
 
 export interface SnapshotPlayer {

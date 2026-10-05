@@ -48,7 +48,11 @@ import { GRID, MAP_ID, MAP_NAME } from "../../shared/map";
 import { fromHex, sha256Hex, toHex } from "../../shared/sha256";
 import { REPLAY_SEED, REPLAY_TICKS, runMatch } from "./replay";
 import { Room } from "../src/room";
-import type { MatchLog, RosterEntry } from "../../shared/protocol";
+import {
+  JOIN_MESSAGE_RE, PROTOCOL_VERSION, joinMessage,
+  type MatchLog, type RosterEntry,
+} from "../../shared/protocol";
+import bs58 from "bs58";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -777,6 +781,46 @@ test("a hostile weapon index is ignored", () => {
 test("the round is three minutes and respawning takes three seconds", () => {
   assert.equal(ROUND_TICKS, 180 * TICK_HZ);
   assert.equal(RESPAWN_TICKS, 3 * TICK_HZ);
+});
+
+/* ------------------------------------------------------ join message --- */
+
+test("the join message pattern accepts real join messages and little else", () => {
+  const nonce = bs58.encode(Buffer.from(new Uint8Array(24).fill(9)));
+  const good = joinMessage("12345", nonce);
+  const m = JOIN_MESSAGE_RE.exec(good);
+  assert.ok(m, `${good} should match`);
+  assert.equal(m![1], String(PROTOCOL_VERSION));
+  assert.equal(m![2], "12345");
+  assert.equal(m![3], nonce);
+  assert.ok(JOIN_MESSAGE_RE.test(joinMessage("dev", nonce)));
+
+  // Everything the mobile shell must refuse to sign. The point of the
+  // pattern is that a page cannot talk the native side into signing anything
+  // but a join message for a match, so each of these has to fail.
+  const bad = [
+    "",
+    "floorfight:join",
+    `floorfight:join:v${PROTOCOL_VERSION}:12345:${nonce} `,
+    ` floorfight:join:v${PROTOCOL_VERSION}:12345:${nonce}`,
+    `floorfight:join:v${PROTOCOL_VERSION}:12345:${nonce}\nmore`,
+    `floorfight:join:v${PROTOCOL_VERSION}::${nonce}`,
+    `floorfight:join:v${PROTOCOL_VERSION}:12345:`,
+    `floorfight:join:v${PROTOCOL_VERSION}:12345:short`,
+    `floorfight:join:v:12345:${nonce}`,
+    `floorfight:join:v${PROTOCOL_VERSION}:match with spaces:${nonce}`,
+    `floorfight:join:v${PROTOCOL_VERSION}:12345:${nonce}:extra`,
+    `prefix floorfight:join:v${PROTOCOL_VERSION}:12345:${nonce}`,
+    `floorfight:settle:v${PROTOCOL_VERSION}:12345:${nonce}`,
+    // A base64 blob, which is what a transaction handed over as text would
+    // look like.
+    "AQABAzfDRg+8zSGKAgMxSe/aUlvYPhLJ6yFKFBtQdwGfEhUB",
+    // Arbitrary bytes rendered as a string.
+    "\u0001\u0002\u0003",
+  ];
+  for (const s of bad) {
+    assert.equal(JOIN_MESSAGE_RE.test(s), false, `should have been refused: ${JSON.stringify(s)}`);
+  }
 });
 
 /* ------------------------------------------------- commit and reveal --- */
