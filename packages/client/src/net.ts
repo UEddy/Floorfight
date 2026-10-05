@@ -16,6 +16,17 @@ export interface NetHandlers {
 }
 
 /**
+ * Which match to join, and with which key, decided when the challenge lands.
+ *
+ * The challenge carries the free room this connection would be seated in, so
+ * a guest cannot know which match it is joining until then. Returning null
+ * means there is nothing to join.
+ */
+export type ResolveJoin = (challenge: {
+  freeMatchId: string | null;
+}) => { matchId: string; keys: nacl.SignKeyPair } | null;
+
+/**
  * Socket plus join handshake. The client never picks its slot or asserts
  * anything about itself beyond the wallet: it signs the server's nonce, and the
  * server decides whether that wallet has a seat.
@@ -26,8 +37,7 @@ export class Net {
 
   constructor(
     url: string,
-    matchId: string,
-    keys: nacl.SignKeyPair,
+    resolve: ResolveJoin,
     handlers: NetHandlers,
   ) {
     this.ws = new WebSocket(url);
@@ -45,13 +55,21 @@ export class Net {
             this.close();
             return;
           }
-          const text = new TextEncoder().encode(joinMessage(matchId, msg.nonce));
-          const sig = nacl.sign.detached(text, keys.secretKey);
+          const choice = resolve({ freeMatchId: msg.freeMatchId });
+          if (!choice) {
+            handlers.onKick("no room available right now");
+            this.close();
+            return;
+          }
+          // The match id is inside the signed message, so this signature is
+          // good for this match and no other.
+          const text = new TextEncoder().encode(joinMessage(choice.matchId, msg.nonce));
+          const sig = nacl.sign.detached(text, choice.keys.secretKey);
           this.send({
             t: "join",
             v: PROTOCOL_VERSION,
-            matchId,
-            wallet: bs58.encode(keys.publicKey),
+            matchId: choice.matchId,
+            wallet: bs58.encode(choice.keys.publicKey),
             sig: bs58.encode(sig),
           });
           return;

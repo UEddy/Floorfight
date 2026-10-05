@@ -17,6 +17,21 @@ floorfight.duckdns.org {
 		reverse_proxy 127.0.0.1:8080
 	}
 
+	# Match logs, read only. These are the canonical logs the server hashed
+	# and settled with, so anyone can download one and replay it:
+	#
+	#   npm run replay -- https://floorfight.duckdns.org/logs/12345.json
+	#
+	# There is nothing private in them. They are inputs, a roster of public
+	# keys, the spread salt the server committed to before the round, and the
+	# result. Browse is on so a match id is not needed to find one.
+	handle_path /logs/* {
+		root * /var/lib/floorfight/logs
+		file_server browse
+		header Content-Type application/json
+		header Cache-Control "public, max-age=31536000, immutable"
+	}
+
 	handle {
 		root * /var/www/floorfight
 		file_server

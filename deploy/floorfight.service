@@ -6,6 +6,10 @@
 #   cp deploy/floorfight.service /etc/systemd/system/
 #   systemctl daemon-reload && systemctl enable --now floorfight
 #
+# Before enabling: put the resolver keypair at /etc/floorfight/resolver.json,
+# owned by the service user and chmod 600. The server will not start if group
+# or others can read it.
+#
 # Node must be installed system wide (for example /usr/bin/node). tsx starts
 # through `#!/usr/bin/env node`, and a per-user nvm install is not on the
 # service's PATH.
@@ -22,16 +26,33 @@ Group=floorfight
 WorkingDirectory=/opt/floorfight/packages/server
 ExecStart=/opt/floorfight/packages/server/node_modules/.bin/tsx src/index.ts
 
-# Remove before the resolver key is installed, per CLAUDE.md. Dev mode opens a
-# room anyone holding the public dev keys can join. NODE_ENV is deliberately
-# not set to production while this line is here: the server refuses to start
-# with both.
-Environment=ARENA_DEV=1
+# No ARENA_DEV. The dev roster keys are public, so a dev room is open to
+# anyone who can reach the port, and this box holds the resolver key: the
+# server refuses to start with both, which is the rule in CLAUDE.md enforced
+# rather than remembered. Free play needs no dev mode, because a free room
+# accepts any key that signs the nonce.
+Environment=NODE_ENV=production
+
 # Loopback only. Caddy terminates TLS and proxies /ws to this port.
 Environment=HOST=127.0.0.1
 Environment=PORT=8080
 # The droplet has 512 MB. Cap the heap well below that.
 Environment=NODE_OPTIONS=--max-old-space-size=256
+
+# Staked rooms. All three together or none: the server refuses to start half
+# configured, because a server that takes stakes with no way to settle them is
+# worse than one that will not start.
+#
+# The key file is read at startup and must be mode 600 and owned by the
+# service user. The server checks and refuses to start if group or others can
+# read it. It is never in the repo and never in the APK.
+Environment=RPC_URL=https://api.devnet.solana.com
+Environment=PROGRAM_ID=HoktNWjdhuts9nzV76UyqUn6FCqJ57LwAizFYbjD4TCe
+Environment=RESOLVER_KEYPAIR_PATH=/etc/floorfight/resolver.json
+
+# Match logs. Caddy serves this directory read only at /logs/, so anyone can
+# download a log and replay it.
+Environment=LOG_DIR=/var/lib/floorfight/logs
 
 Restart=always
 RestartSec=2
@@ -42,6 +63,12 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+# The one directory it writes to. systemd creates it as the service user and
+# the match logs go in it.
+StateDirectory=floorfight
+ReadWritePaths=/var/lib/floorfight
+# The resolver key is the only thing it reads outside the install.
+ReadOnlyPaths=/etc/floorfight
 
 [Install]
 WantedBy=multi-user.target

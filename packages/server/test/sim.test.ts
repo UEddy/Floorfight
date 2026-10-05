@@ -47,7 +47,7 @@ import {
 import { GRID, MAP_ID, MAP_NAME } from "../../shared/map";
 import { fromHex, sha256Hex, toHex } from "../../shared/sha256";
 import { REPLAY_SEED, REPLAY_TICKS, runMatch } from "./replay";
-import { Room } from "../src/room";
+import { FREE_SEAT_BOT, FREE_SEAT_OPEN, Room } from "../src/room";
 import {
   JOIN_MESSAGE_RE, PROTOCOL_VERSION, joinMessage,
   type MatchLog, type RosterEntry,
@@ -891,6 +891,125 @@ test("a replay with the revealed salt reproduces the match, a wrong salt does no
 });
 
 /* -------------------------------------------------------------- rooms --- */
+
+/* --------------------------------------------------------- free seats --- */
+
+/** A free room's roster starts as open seats nobody can sign for. */
+function openRoster(n: number): RosterEntry[] {
+  const out: RosterEntry[] = [];
+  for (let i = 0; i < n; i++) {
+    out.push({ slot: i, wallet: FREE_SEAT_OPEN, collection: null, mint: null });
+  }
+  return out;
+}
+
+test("a free room seats any key, in join order", () => {
+  const room = new Room("free-join", openRoster(6), () => {}, 0, "free");
+  assert.equal(room.freeSeats(), 6);
+  assert.equal(room.claimFreeSeat("guest-a"), 0);
+  assert.equal(room.claimFreeSeat("guest-b"), 1);
+  assert.equal(room.claimFreeSeat("guest-c"), 2);
+  assert.equal(room.roster[0].wallet, "guest-a");
+  assert.equal(room.roster[2].wallet, "guest-c");
+
+  // The same key back again gets its own slot, which is what makes a
+  // reconnect land on the same player rather than a new one.
+  assert.equal(room.claimFreeSeat("guest-b"), 1);
+  assert.equal(room.claimFreeSeat("guest-a"), 0);
+});
+
+test("a free room fills up and then turns people away", () => {
+  const room = new Room("free-full", openRoster(6), () => {}, 0, "free");
+  for (let i = 0; i < 6; i++) {
+    assert.equal(room.claimFreeSeat(`g${i}`), i);
+  }
+  assert.equal(room.claimFreeSeat("one-too-many"), null);
+  // Nobody connected, so every seat is still one a guest could take over.
+  assert.equal(room.freeSeats(), 6);
+});
+
+test("a staked room never hands out a seat to just anybody", () => {
+  const room = new Room("staked-seats", roster(6), () => {});
+  assert.equal(room.claimFreeSeat("stranger"), null);
+  assert.equal(room.freeSeats(), 0);
+});
+
+test("a bot holds a seat but does not keep a guest out of it", () => {
+  const room = new Room("free-bots", openRoster(6), () => {}, 0, "free");
+  room.fillBots();
+  assert.equal(room.botCount(), 6);
+  // The roster says which slots are bots, so the match log does too.
+  assert.ok(room.roster.every((r) => r.wallet.startsWith(FREE_SEAT_BOT)));
+  // And a guest arriving later can still sit down, displacing one.
+  assert.equal(room.freeSeats(), 6);
+  const slot = room.claimFreeSeat("latecomer");
+  assert.equal(typeof slot, "number");
+  assert.equal(room.roster[slot!].wallet, "latecomer");
+});
+
+test("a free room is joinable until it is full of people or nearly over", () => {
+  const room = new Room("free-joinable", openRoster(2), () => {}, 0, "free");
+  assert.equal(room.joinable(), true);
+
+  // Two connected players and there is nowhere to sit.
+  for (const slot of [0, 1]) {
+    const wallet = `g${slot}`;
+    room.claimFreeSeat(wallet);
+    room.seat({
+      slot, wallet, queue: [], ack: -1, lastSeenTick: 0,
+      send: () => {}, close: () => {}, pingId: 0, pingSentAt: 0, rtt: 0,
+    });
+  }
+  assert.equal(room.freeSeats(), 0);
+  assert.equal(room.joinable(), false);
+
+  // A room with almost no round left is not worth sending anyone to, even
+  // with a seat going.
+  const late = new Room("free-late", openRoster(2), () => {}, 0, "free");
+  late.start();
+  late.stop();
+  const tick = (late as unknown as { tick: () => void }).tick.bind(late);
+  for (let i = 0; i < ROUND_TICKS - 5; i++) tick();
+  assert.ok(late.secondsLeft() < 1);
+  assert.equal(late.freeSeats(), 2);
+  assert.equal(late.joinable(), false);
+});
+
+test("a free room waits a moment, then starts with bots", async () => {
+  const room = new Room("free-wait", openRoster(6), () => {}, 0, "free", true, 60);
+  assert.equal(room.isStarted, false);
+
+  // Nobody has sat down, so nothing is scheduled: an empty room costs
+  // nothing and never becomes a match on its own.
+  await new Promise((r) => setTimeout(r, 120));
+  assert.equal(room.isStarted, false);
+
+  room.claimFreeSeat("first");
+  room.seat({
+    slot: 0, wallet: "first", queue: [], ack: -1, lastSeenTick: 0,
+    send: () => {}, close: () => {}, pingId: 0, pingSentAt: 0, rtt: 0,
+  });
+  assert.equal(room.isStarted, false, "it should wait for company first");
+  await new Promise((r) => setTimeout(r, 160));
+  assert.equal(room.isStarted, true, "and then start anyway");
+  assert.equal(room.botCount(), 5, "with bots in the empty seats");
+  room.stop();
+});
+
+test("a full house starts at once rather than waiting", () => {
+  const room = new Room("free-rush", openRoster(2), () => {}, 0, "free", true, 60_000);
+  for (const slot of [0, 1]) {
+    const wallet = `g${slot}`;
+    room.claimFreeSeat(wallet);
+    room.seat({
+      slot, wallet, queue: [], ack: -1, lastSeenTick: 0,
+      send: () => {}, close: () => {}, pingId: 0, pingSentAt: 0, rtt: 0,
+    });
+  }
+  assert.equal(room.isStarted, true);
+  assert.equal(room.botCount(), 0);
+  room.stop();
+});
 
 test("a staked room refuses to create a bot", () => {
   const room = new Room("staked-1", roster(6), () => {}, 0, "staked");

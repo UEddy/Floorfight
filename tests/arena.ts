@@ -23,6 +23,18 @@ import { expect } from "chai";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Clock, FailedTransactionMetadata, LiteSVM, TransactionMetadata } from "litesvm";
+import { createHash } from "node:crypto";
+import {
+  decodeMatch,
+  placementsFrom,
+  rosterFromMatch,
+  settleData,
+  NO_PLACE as SERVER_NO_PLACE,
+} from "../packages/server/src/chain";
+import { canonicalise, standingsFrom, type MatchLog } from "../packages/shared/protocol";
+import { MAP_ID } from "../packages/shared/map";
+import { FREE_SALT_BYTES } from "../packages/shared/weapons";
+import { toHex } from "../packages/shared/sha256";
 
 const ROOT = path.join(__dirname, "..");
 const IDL_PATH = path.join(ROOT, "target/idl/arena.json");
@@ -410,4 +422,168 @@ describe("arena escrow: paths that must work", () => {
       }
     });
   }
+});
+
+/*
+ * The server's own encoder and decoder, against the real program.
+ *
+ * packages/server/src/chain.ts writes the settle instruction and reads the
+ * match account by hand rather than through @coral-xyz/anchor, because the
+ * droplet has 512 MB and anchor is a large thing to load on it. These are the
+ * tests that make that safe: if the program's layout or discriminator ever
+ * moves, the hand written version stops matching here rather than in
+ * production. Run against LiteSVM, never devnet.
+ */
+describe("the server's settlement path", () => {
+  /** A real log hash, so the value on chain is one a replay could produce. */
+  function logHashFor(matchId: string, roster: { slot: number; wallet: string }[]): {
+    log: MatchLog;
+    hash: Buffer;
+  } {
+    const log: MatchLog = {
+      v: 4,
+      matchId,
+      map: MAP_ID,
+      spreadSalt: toHex(FREE_SALT_BYTES),
+      roster: roster.map((r) => ({ ...r, collection: null, mint: null })),
+      startedAt: 0,
+      ticks: [],
+      standings: [],
+    };
+    log.standings = standingsFrom(
+      roster.map((_, i) => ({ kills: roster.length - i, deaths: i })),
+      log.roster,
+    );
+    return { log, hash: createHash("sha256").update(canonicalise(log)).digest() };
+  }
+
+  it("decodes a locked match account the way the program wrote it", async () => {
+    const h = await setup();
+    const { m, players } = await h.lockedMatch(4, 2n * SOL);
+
+    const acc = h.svm.getAccount(m);
+    if (!acc) throw new Error("match account missing");
+    const decoded = decodeMatch(Buffer.from(acc.data));
+
+    expect(decoded.state).to.equal("Locked");
+    expect(decoded.count).to.equal(4);
+    expect(decoded.maxPlayers).to.equal(4);
+    expect(decoded.stake.toString()).to.equal((2n * SOL).toString());
+    expect(decoded.settleDeadline).to.be.greaterThan(0);
+    expect(Buffer.from(decoded.logHash).every((b) => b === 0)).to.equal(true);
+
+    // Slot is the index in the account's players array, which is join order.
+    // The roster has to preserve it: the placements the resolver submits are
+    // indices into this, so a reordering here would pay the wrong people.
+    const roster = rosterFromMatch(decoded);
+    expect(roster.map((r) => r.slot)).to.deep.equal([0, 1, 2, 3]);
+    expect(roster.map((r) => r.wallet)).to.deep.equal(
+      players.map((p) => p.publicKey.toBase58()),
+    );
+  });
+
+  it("decoding refuses anything that is not a match account", async () => {
+    const h = await setup();
+    const config = h.svm.getAccount(CONFIG);
+    if (!config) throw new Error("config account missing");
+    // The config account is a different size, so it fails on length.
+    expect(() => decodeMatch(Buffer.from(config.data))).to.throw(/expected/);
+    expect(() => decodeMatch(Buffer.alloc(16))).to.throw(/expected/);
+
+    // Right size, wrong discriminator: a match sized account belonging to
+    // some other program would otherwise decode into plausible nonsense.
+    const { m } = await h.lockedMatch(3);
+    const real = Buffer.from(h.svm.getAccount(m)!.data);
+    const forged = Buffer.from(real);
+    forged[0] ^= 0xff;
+    expect(() => decodeMatch(forged)).to.throw(/not a Match/);
+    // Untouched, it still decodes, so the test above detected the edit.
+    expect(decodeMatch(real).count).to.equal(3);
+  });
+
+  it("settles with instruction data the server built by hand", async () => {
+    const h = await setup();
+    const { m, players } = await h.lockedMatch(5);
+    const decoded = decodeMatch(Buffer.from(h.svm.getAccount(m)!.data));
+    const roster = rosterFromMatch(decoded);
+    const { log, hash } = logHashFor("1", roster);
+
+    const placements = placementsFrom(log.standings, decoded.count);
+    expect(placements).to.deep.equal([0, 1, 2]);
+
+    // The same instruction the server sends, built the same way: the
+    // discriminator out of the IDL and the two fixed size arguments after it.
+    const ix = new TransactionInstruction({
+      programId: PROGRAM_ID,
+      keys: [
+        { pubkey: h.resolver.publicKey, isSigner: true, isWritable: false },
+        { pubkey: CONFIG, isSigner: false, isWritable: false },
+        { pubkey: m, isSigner: false, isWritable: true },
+      ],
+      data: settleData(placements, hash),
+    });
+    h.ok([ix], [h.resolver]);
+
+    const after = h.matchState(m);
+    expect(after.state).to.have.property("settled");
+    expect(Array.from(after.placements as number[])).to.deep.equal(placements);
+    expect(Buffer.from(after.logHash as number[]).toString("hex"))
+      .to.equal(hash.toString("hex"));
+
+    // And the winner can take the money, which is the only proof that the
+    // placements meant what the program thought they meant.
+    const first = players[placements[0]];
+    const paid = await h.claim(m, first);
+    expect(paid > 0n).to.equal(true);
+  });
+
+  it("pays everything to first in a two player match, as the server builds it", async () => {
+    const h = await setup();
+    const { m, players } = await h.lockedMatch(2);
+    const decoded = decodeMatch(Buffer.from(h.svm.getAccount(m)!.data));
+    const roster = rosterFromMatch(decoded);
+    const { log, hash } = logHashFor("2", roster);
+
+    // Two players: the program pays one place and wants the rest unused.
+    const placements = placementsFrom(log.standings, 2);
+    expect(placements).to.deep.equal([0, SERVER_NO_PLACE, SERVER_NO_PLACE]);
+
+    const ix = new TransactionInstruction({
+      programId: PROGRAM_ID,
+      keys: [
+        { pubkey: h.resolver.publicKey, isSigner: true, isWritable: false },
+        { pubkey: CONFIG, isSigner: false, isWritable: false },
+        { pubkey: m, isSigner: false, isWritable: true },
+      ],
+      data: settleData(placements, hash),
+    });
+    h.ok([ix], [h.resolver]);
+
+    const pot = 2n * SOL;
+    const paid = await h.claim(m, players[0]);
+    expect(paid).to.equal(pot);
+  });
+
+  it("refuses to build placements the program would reject", () => {
+    const roster = [0, 1, 2].map((slot) => ({
+      slot, wallet: `w${slot}`, collection: null, mint: null,
+    }));
+    const standings = standingsFrom(
+      [{ kills: 3, deaths: 0 }, { kills: 2, deaths: 1 }, { kills: 1, deaths: 2 }],
+      roster,
+    );
+    // A slot the match does not have.
+    expect(() => placementsFrom(
+      [{ slot: 9, wallet: "x", kills: 1, deaths: 0, place: 1 }, ...standings.slice(1)],
+      3,
+    )).to.throw(/not in a 3 player match/);
+    // The same slot twice.
+    expect(() => placementsFrom(
+      [standings[0], standings[0], standings[2]], 3,
+    )).to.throw(/placed twice/);
+    // Not enough places to fill.
+    expect(() => placementsFrom(standings.slice(0, 2), 3)).to.throw(/no place 3/);
+    // And the data builder refuses a hash of the wrong size.
+    expect(() => settleData([0, 1, 2], new Uint8Array(31))).to.throw(/32 bytes/);
+  });
 });

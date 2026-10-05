@@ -41,11 +41,33 @@ Frankfurt. Simulates at 60 Hz, ships snapshots at 20 Hz.
 **Chain.** Anchor program. One escrow PDA per match. Resolver signs the result.
 Timeout refund path if it never does.
 
+**Two kinds of room.** Free and staked. A free room accepts any key that signs
+the server's nonce, fills what is left with bots after a few seconds and opens
+a fresh one behind it when it fills; the client makes up a guest key per page
+load and never stores it. A staked room opens only for a match the chain says
+is Locked, takes its roster from that account in slot order, and settles to it.
+Free play is the product that works without a wallet, and it is also where the
+trust boundary gets exercised before there is money on it.
+
 **Match format.** Six player free-for-all, 3 minute rounds, pot split 50/30/20.
 
 **Packages.** `packages/shared` holds `sim.ts` and `protocol.ts`, imported by
 both server and client. That sharing is the point: prediction, authority and
 replay must run identical code.
+
+## Match logs
+
+The canonical log of every match is written to `/var/lib/floorfight/logs/<matchId>.json`
+and served read only by Caddy at `/logs/`. It is the exact bytes that were
+hashed, so the sha256 of the file is the hash written on chain with the payout.
+About 2.5 MB for a three minute six player round.
+
+`npm run replay -- <url or path>` downloads one, checks the file is in
+canonical form, checks the map id matches this build, re-runs the simulation
+over the recorded inputs and compares the standings it produces with the ones
+recorded. With `--rpc` and `--program` it also checks the hash against the
+settled match account. It takes no key and writes nothing, which is the point:
+anyone can run it against somebody else's match.
 
 ## Weapons
 
@@ -111,12 +133,20 @@ The repo is public from the first commit.
 - If a secret ever lands in a commit, rotating it is the fix. Deleting the file
   in a later commit does not remove it from history.
 - The program upgrade authority is a separate key from the resolver.
-- Dev mode (`ARENA_DEV=1`) may run on the droplet for play-testing only until
-  the resolver key is installed there, and never on any machine that holds the
-  resolver key. The dev roster keys are public, so a dev room is open to anyone
-  who can reach the port. The server refuses to start with `ARENA_DEV` set and
-  `NODE_ENV=production`, so a play-testing droplet runs without
-  `NODE_ENV=production`.
+- Dev mode (`ARENA_DEV=1`) is for a laptop. It never runs on a machine that
+  holds the resolver key: the dev roster keys are public, so a dev room is
+  open to anyone who can reach the port. The server refuses to start with
+  `ARENA_DEV` set alongside either `NODE_ENV=production` or a resolver key, so
+  that rule is enforced rather than remembered. The droplet now runs without
+  it, because free play needs no dev mode.
+- The resolver key is a file on the droplet at `/etc/floorfight/resolver.json`,
+  named by `RESOLVER_KEYPAIR_PATH`. The server reads its mode at startup and
+  refuses to start if group or others can read it. Never in the repo, never in
+  the APK, never in a fixture.
+- Staked rooms need `RPC_URL`, `PROGRAM_ID` and `RESOLVER_KEYPAIR_PATH`
+  together. One or two of the three is a configuration error and the server
+  refuses to start: a server that takes stakes with no way to settle them is
+  worse than one that will not come up.
 
 ## Performance budget
 
@@ -168,6 +198,30 @@ S10 before trusting any of this. The S10 is the floor, not the S24.
   `@coral-xyz/anchor` import fails. LiteSVM is pinned at 0.8.0, the last
   release built on web3.js, which the Anchor TypeScript client needs.
 
+## Running the server
+
+```
+# free play only, which is a laptop or a play-testing box
+npm --prefix packages/server start
+
+# plus staked rooms, which needs all three
+RPC_URL=https://api.devnet.solana.com \
+PROGRAM_ID=HoktNWjdhuts9nzV76UyqUn6FCqJ57LwAizFYbjD4TCe \
+RESOLVER_KEYPAIR_PATH=/etc/floorfight/resolver.json \
+LOG_DIR=/var/lib/floorfight/logs \
+npm --prefix packages/server start
+```
+
+`ARENA_DEV=1` adds the fixed seat dev room for two tabs with known keys, and
+refuses to coexist with a resolver key or with `NODE_ENV=production`.
+`FREE_FILL_MS` is how long a free room waits for company before taking bots,
+8000 by default.
+
+A free only server never imports `@solana/web3.js`: `chainrpc.ts` is loaded
+dynamically and only when a resolver is configured. On the droplet that is the
+difference between a two second start and a twelve second one, on a box with
+512 MB.
+
 ## Style
 
 Plain, direct prose in comments and copy. No em dashes or en dashes anywhere in
@@ -196,11 +250,17 @@ covering the attack cases and payout paths, 42 server tests covering replay
 determinism, weapon behaviour, the map id, the map's sightline and
 reachability rules, and the bot rules.
 
+Wired, untested on devnet: free rooms with guest keys and bot fill, staked
+rooms opening from a Locked match account, settlement with backoff, match logs
+on disk and the replay script. The chain half is covered by LiteSVM tests, not
+by anything that has talked to devnet.
+
 Scaffolded, unbuilt: `apps/mobile`, the Expo shell. Android only, Expo SDK 57,
 a WebView pointed at the production origin, and a native bridge that accepts
 exactly two requests from the page and refuses everything else. It type checks
 and its bridge tests pass, but no EAS project exists and nothing has run on a
 phone. `apps/mobile/README.md` lists what has to be set up by hand.
 
-Next: droplet deploy, then the EAS development build, then wiring the web
-client to the native bridge.
+Next: droplet deploy, deploy the program to devnet and run `initialize_config`,
+then the EAS development build, then wiring the web client to the native
+bridge.

@@ -7,9 +7,11 @@
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
     "check": "tsc --noEmit",
-    "test": "tsx --test test/*.test.ts"
+    "test": "tsx --test test/*.test.ts",
+    "replay": "tsx src/replay.ts"
   },
   "dependencies": {
+    "@solana/web3.js": "1.99.0",
     "bs58": "6.0.0",
     "tsx": "4.23.15",
     "tweetnacl": "1.0.3",

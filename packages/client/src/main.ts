@@ -18,7 +18,7 @@ import { WEAPONS } from "../../shared/weapons";
 import { fromHex, sha256Hex } from "../../shared/sha256";
 import { quantAxis, quantPitch, quantYaw, type SnapshotPlayer } from "../../shared/protocol";
 import { DEV_MATCH_ID } from "../../shared/dev";
-import { devKeypair } from "./keys";
+import { devKeypair, guestKeypair } from "./keys";
 import { Net } from "./net";
 import { BATCH_TICKS, Interpolator, Predictor, type RemoteView } from "./netcode";
 import { Controls } from "./input";
@@ -35,6 +35,12 @@ import { Sfx } from "./audio";
  */
 const params = new URLSearchParams(location.search);
 const seat = Number(params.get("seat") ?? "0");
+/**
+ * Dev builds with ?seat=N take a dev seat in the dev room, which is what
+ * makes two tabs with known keys useful. Everything else is a guest: a key
+ * made up on page load, joining whichever free room the server offers.
+ */
+const devSeat = import.meta.env.DEV && params.has("seat");
 const DEBUG = params.get("debug") === "1";
 const serverUrl = import.meta.env.DEV
   ? params.get("server") ?? `ws://${location.hostname || "localhost"}:8080`
@@ -138,7 +144,7 @@ function recordFrame(now: number, dtMs: number): void {
 
 let keys;
 try {
-  keys = devKeypair(seat);
+  keys = devSeat ? devKeypair(seat) : guestKeypair();
 } catch (e) {
   hud.message((e as Error).message);
   throw e;
@@ -146,7 +152,13 @@ try {
 
 hud.message("Connecting...");
 
-const net = new Net(serverUrl, DEV_MATCH_ID, keys, {
+const net = new Net(serverUrl, (challenge) => {
+  // A dev seat asks for the dev room by name. A guest takes the room the
+  // server offered with the challenge, so the signature covers the id of the
+  // match it actually gets rather than a matchmaking alias.
+  const matchId = devSeat ? DEV_MATCH_ID : challenge.freeMatchId;
+  return matchId ? { matchId, keys } : null;
+}, {
   onAccepted(msg) {
     slot = msg.slot;
     spreadCommit = msg.spreadCommit;

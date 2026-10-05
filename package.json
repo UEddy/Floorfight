@@ -3,7 +3,8 @@
   "private": true,
   "license": "ISC",
   "scripts": {
-    "test": "NODE_OPTIONS=--no-experimental-strip-types ts-mocha -p ./tsconfig.json -t 1000000 \"tests/**/*.ts\""
+    "test": "NODE_OPTIONS=--no-experimental-strip-types ts-mocha -p ./tsconfig.json -t 1000000 \"tests/**/*.ts\"",
+    "idl:sync": "node scripts/sync-idl.mjs"
   },
   "dependencies": {
     "@coral-xyz/anchor": "0.32.1",

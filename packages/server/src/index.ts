@@ -15,7 +15,10 @@ import {
 } from "../../shared/protocol";
 import { DEV_MATCH_ID, DEV_MIN_SEATED } from "../../shared/dev";
 import { devModeFromEnv, devRoster, devWarning } from "./dev";
-import { Room, type RoomKind, type Seat } from "./room";
+import { hasChainEnv, rosterFromMatch } from "./chain";
+import type { ChainConfig } from "./chainrpc";
+import { DEFAULT_LOG_DIR, finishMatch } from "./settlement";
+import { FREE_SEAT_OPEN, Room, type RoomKind, type Seat } from "./room";
 
 /**
  * Loopback by default. In deployment Caddy terminates TLS and proxies /ws to
@@ -26,8 +29,32 @@ const HOST = process.env.HOST || "127.0.0.1";
 const PORT = Number(process.env.PORT ?? 8080);
 
 let DEV = false;
+const LOG_DIR = process.env.LOG_DIR || DEFAULT_LOG_DIR;
 try {
   DEV = devModeFromEnv(process.env);
+} catch (e) {
+  console.error((e as Error).message);
+  process.exit(1);
+}
+
+/**
+ * The chain, if this server has one.
+ *
+ * Loaded dynamically, so a free only server never imports @solana/web3.js.
+ * That is seconds of startup and a good chunk of heap on a 512 MB droplet
+ * that would buy nothing: with no resolver key there is no staked room to
+ * open and nothing to settle.
+ */
+let CHAIN: ChainConfig | null = null;
+let rpc: typeof import("./chainrpc") | null = null;
+try {
+  if (hasChainEnv(process.env)) {
+    const loaded = await import("./chainrpc");
+    // Throws rather than warns on a half configured chain, on a resolver key
+    // anyone can read, and on dev mode sharing a box with that key.
+    CHAIN = loaded.chainFromEnv(process.env, DEV);
+    rpc = loaded;
+  }
 } catch (e) {
   console.error((e as Error).message);
   process.exit(1);
@@ -47,31 +74,170 @@ const rooms = new Map<string, Room>();
 /** Public keys of the six dev seats. Refused at join unless DEV is on. */
 const DEV_WALLETS = new Set(devRoster().map((r) => r.wallet));
 
+export interface RoomOptions {
+  startWhenSeated?: number;
+  kind?: RoomKind;
+  fillWithBots?: boolean;
+  fillAfterMs?: number;
+  /** Start the clock as soon as the room opens. */
+  startNow?: boolean;
+  /** Set for a staked match: what to settle, and how many players. */
+  staked?: { matchId: bigint; count: number };
+  onDone?: () => void;
+}
+
 /**
  * Open a room.
  *
  * `kind` defaults to staked, which is the safe default: a caller that forgets
  * to say gets a room that refuses to seat bots rather than one that allows
- * them. `fillWithBots` only does anything in a free room.
+ * them. `fillWithBots` and `fillAfterMs` only do anything in a free room.
  */
 export function openRoom(
   matchId: string,
   roster: RosterEntry[],
-  startWhenSeated = 0,
-  onDone?: () => void,
-  kind: RoomKind = "staked",
-  fillWithBots = false,
+  opts: RoomOptions = {},
 ): Room {
-  const room = new Room(matchId, roster, (_log, hash) => {
-    // Settlement goes here. The resolver signs (matchId, hash, standings) and
-    // submits the payout instruction. Until the Anchor program exists, the log
-    // is written to disk so replays can be tested against a real match.
+  const room = new Room(matchId, roster, (log, hash) => {
     console.log(`[match ${matchId}] finished, log hash ${hash}`);
-    onDone?.();
-  }, startWhenSeated, kind, fillWithBots);
+    void finishMatch(log, hash, {
+      logDir: LOG_DIR,
+      staked: opts.staked ?? null,
+      settle: CHAIN && rpc
+        ? (id, placements, logHash) => rpc!.settleWithRetry(CHAIN!, id, placements, logHash)
+        : undefined,
+    }).catch((e: unknown) => {
+      // Logged loudly and left there. A staked match that cannot be settled
+      // refunds on its deadline, which is the outcome the program is built to
+      // guarantee without anyone having to intervene.
+      console.error(`[match ${matchId}] finishing failed: ${(e as Error).message}`);
+    });
+    opts.onDone?.();
+  }, opts.startWhenSeated ?? 0, opts.kind ?? "staked",
+    opts.fillWithBots ?? false, opts.fillAfterMs ?? 0);
   rooms.set(matchId, room);
-  if (startWhenSeated === 0) room.start();
+  if (opts.startNow) room.start();
   return room;
+}
+
+/* --------------------------------------------------------- staked rooms --- */
+
+/** Match ids that could be an on-chain u64. Nothing else is looked up. */
+const U64_RE = /^(0|[1-9][0-9]{0,19})$/;
+
+/**
+ * Ids recently looked up and not found, so that a stream of joins naming
+ * random numbers cannot turn into a stream of RPC calls. Short lived, because
+ * a match that is not Locked yet may be a moment later.
+ */
+const missed = new Map<string, number>();
+const MISS_TTL_MS = 10_000;
+/** Bounded, so a stream of made up ids cannot grow this forever. */
+const MISS_MAX = 1000;
+const opening = new Set<string>();
+
+/**
+ * Open a staked room for a match that is already Locked on chain.
+ *
+ * Locked is the only state that can become a room. Open means people are
+ * still joining and the roster is not final; Settled and Refunding mean the
+ * money has already moved. Taking the roster from the account in slot order
+ * is what makes the placements the resolver submits mean the same thing as
+ * the slots the simulation used.
+ *
+ * Rooms open on demand, when the first participant asks to join one, so there
+ * is no admin endpoint to secure and no list to keep in step with the chain.
+ * The chain is the list.
+ */
+async function ensureStakedRoom(matchId: string): Promise<Room | null> {
+  if (!CHAIN || !rpc || !U64_RE.test(matchId)) return null;
+  const existing = rooms.get(matchId);
+  if (existing) return existing;
+
+  const missedAt = missed.get(matchId);
+  if (missedAt !== undefined && Date.now() - missedAt < MISS_TTL_MS) return null;
+  if (opening.has(matchId)) return null;
+
+  opening.add(matchId);
+  try {
+    const account = await rpc.fetchMatch(CHAIN, BigInt(matchId));
+    if (!account) {
+      if (missed.size >= MISS_MAX) missed.clear();
+      missed.set(matchId, Date.now());
+      return null;
+    }
+    if (account.state !== "Locked") {
+      console.warn(`[match ${matchId}] is ${account.state}, not Locked: no room`);
+      if (missed.size >= MISS_MAX) missed.clear();
+      missed.set(matchId, Date.now());
+      return null;
+    }
+    // A second connection may have opened it while this one was on the RPC.
+    const raced = rooms.get(matchId);
+    if (raced) return raced;
+
+    const roster = rosterFromMatch(account);
+    console.log(
+      `[match ${matchId}] opening staked room, ${roster.length} players, ` +
+      `stake ${account.stake} lamports each`,
+    );
+    return openRoom(matchId, roster, {
+      kind: "staked",
+      startWhenSeated: roster.length,
+      staked: { matchId: BigInt(matchId), count: account.count },
+      onDone: () => { rooms.delete(matchId); },
+    });
+  } finally {
+    opening.delete(matchId);
+  }
+}
+
+/* ---------------------------------------------------------- free rooms --- */
+
+/**
+ * Free play.
+ *
+ * One room is always open and offered to anyone connecting. It waits a few
+ * seconds for other people, fills whatever is left with bots and starts, so a
+ * single player never sits in an empty hall. When a room has all six seats
+ * taken by real players, the next one opens behind it.
+ *
+ * Match ids carry the boot time so that a restart cannot reuse an id and
+ * overwrite the match log of a round that already happened.
+ */
+const FREE_SEATS = 6;
+const FREE_FILL_MS = Number(process.env.FREE_FILL_MS ?? 8000);
+const BOOT = Date.now().toString(36);
+let freeCounter = 0;
+const freeRooms: Room[] = [];
+
+function openFreeRoom(): Room {
+  const matchId = `free-${BOOT}-${++freeCounter}`;
+  const roster: RosterEntry[] = [];
+  for (let slot = 0; slot < FREE_SEATS; slot++) {
+    roster.push({ slot, wallet: FREE_SEAT_OPEN, collection: null, mint: null });
+  }
+  const room = openRoom(matchId, roster, {
+    kind: "free",
+    fillWithBots: true,
+    fillAfterMs: FREE_FILL_MS,
+    onDone: () => {
+      rooms.delete(matchId);
+      const i = freeRooms.indexOf(room);
+      if (i >= 0) freeRooms.splice(i, 1);
+    },
+  });
+  freeRooms.push(room);
+  console.log(`[free] opened ${matchId}`);
+  return room;
+}
+
+/** The newest free room worth joining, opening one if there is none. */
+function matchmake(): Room {
+  for (let i = freeRooms.length - 1; i >= 0; i--) {
+    if (freeRooms[i].joinable()) return freeRooms[i];
+  }
+  return openFreeRoom();
 }
 
 /**
@@ -80,12 +246,15 @@ export function openRoom(
  * reload and play again without restarting the server.
  */
 function openDevRoom(): void {
-  // Free, and bots fill whatever seats are still empty when the round starts,
-  // so one or two tabs is a full six player match to play against.
-  openRoom(DEV_MATCH_ID, devRoster(), DEV_MIN_SEATED, () => {
-    setTimeout(openDevRoom, 3000);
-  }, "free", true);
-  console.warn(`[dev] free room "${DEV_MATCH_ID}" open, starts when ${DEV_MIN_SEATED} players join, bots fill the rest`);
+  // Fixed seats and known keys, which is what makes two tabs side by side
+  // useful. Bots fill the rest when it starts.
+  openRoom(DEV_MATCH_ID, devRoster(), {
+    kind: "free",
+    fillWithBots: true,
+    startWhenSeated: DEV_MIN_SEATED,
+    onDone: () => { setTimeout(openDevRoom, 3000); },
+  });
+  console.warn(`[dev] room "${DEV_MATCH_ID}" open, starts when ${DEV_MIN_SEATED} players join, bots fill the rest`);
 }
 
 /* ------------------------------------------------------------- socket --- */
@@ -116,7 +285,15 @@ wss.on("connection", (ws: WebSocket) => {
     ws.close();
   };
 
-  ws.send(JSON.stringify({ t: "challenge", v: PROTOCOL_VERSION, nonce: pending.nonce }));
+  // The free room this connection would sit in, decided now so the guest can
+  // sign the id of the room it actually gets.
+  const offered = matchmake();
+  ws.send(JSON.stringify({
+    t: "challenge",
+    v: PROTOCOL_VERSION,
+    nonce: pending.nonce,
+    freeMatchId: offered.matchId,
+  }));
 
   ws.on("message", (raw) => {
     if (budget-- <= 0) return kick("too many messages");
@@ -174,14 +351,16 @@ wss.on("connection", (ws: WebSocket) => {
     // depend on which rooms happen to exist.
     if (!DEV && DEV_WALLETS.has(msg.wallet)) return kick("dev key");
 
-    const target = rooms.get(msg.matchId);
-    if (!target) return kick("no such match");
-
-    // The roster is the allow list. A wallet that did not stake has no seat,
-    // whatever it signs.
-    const entry = target.roster.find((r) => r.wallet === msg.wallet);
-    if (!entry) return kick("not a participant in this match");
-
+    /*
+     * The signature comes first, before any seat is allocated and before any
+     * RPC call.
+     *
+     * It has to: in a free room the signature is the whole of the admission
+     * test, and checking it afterwards would let an unsigned connection
+     * consume a slot. It also proves the wallet string is a real 32 byte
+     * public key, which is what stops anyone claiming the placeholder names a
+     * free roster uses for empty and bot seats.
+     */
     let ok = false;
     try {
       const pubkey = bs58.decode(msg.wallet);
@@ -197,6 +376,24 @@ wss.on("connection", (ws: WebSocket) => {
     // Burn the nonce before anything slow happens, so two joins racing on one
     // challenge cannot both get through.
     pending.used = true;
+
+    // A staked room opens the first time one of its participants asks for it,
+    // and only if the chain says the match is Locked.
+    const target = rooms.get(msg.matchId) ?? await ensureStakedRoom(msg.matchId);
+    if (!target) return kick("no such match");
+
+    let entry: RosterEntry | undefined;
+    if (target.kind === "free") {
+      // Any key that signed the nonce gets a seat, in join order.
+      const claimed = target.claimFreeSeat(msg.wallet);
+      if (claimed === null) return kick("that room filled up, reconnect for another");
+      entry = target.roster[claimed];
+    } else {
+      // The roster is the allow list. A wallet that did not stake has no
+      // seat, whatever it signs, and its slot is the one the chain gave it.
+      entry = target.roster.find((r) => r.wallet === msg.wallet);
+      if (!entry) return kick("not a participant in this match");
+    }
 
     // Cosmetic only, and deliberately non-fatal. A wallet that no longer holds
     // the mint it registered plays as the default character rather than being
@@ -231,6 +428,10 @@ wss.on("connection", (ws: WebSocket) => {
       // creation; the reveal arrives when the match ends.
       spreadCommit: target.spreadCommit,
     }));
+
+    // A room with every seat taken by a real player is a room nobody else can
+    // join, so the next one opens behind it.
+    if (target.kind === "free" && target.freeSeats() === 0) openFreeRoom();
   }
 });
 
@@ -251,9 +452,23 @@ async function verifyCharacter(
   return null;
 }
 
-wss.on("listening", () => console.log(`floorfight server listening on ${HOST}:${PORT}`));
+wss.on("listening", () => {
+  console.log(`floorfight server listening on ${HOST}:${PORT}`);
+  console.log(`match logs in ${LOG_DIR}`);
+  if (CHAIN) {
+    console.log(
+      `staked rooms on ${CHAIN.rpcUrl}, program ${CHAIN.programId.toBase58()}, ` +
+      `resolver ${CHAIN.resolver.publicKey.toBase58()}`,
+    );
+  } else {
+    console.log("no chain configuration: free rooms only");
+  }
+});
 
 if (DEV) {
   console.warn(devWarning());
   openDevRoom();
 }
+
+// One free room always open, so the first connection has somewhere to go.
+openFreeRoom();

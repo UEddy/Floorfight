@@ -3,6 +3,7 @@ import {
   MAP_ID,
   ROUND_TICKS,
   SNAPSHOT_EVERY,
+  TICK_HZ,
   TICK_MS,
   createWorld,
   step,
@@ -13,6 +14,7 @@ import {
 import {
   canonicalise,
   quantPitch,
+  standingsFrom,
   type MatchLog,
   type RosterEntry,
   type SnapshotPlayer,
@@ -52,6 +54,20 @@ const TIMEOUT_TICKS = 600;
 /** How often each seat is pinged, for the debug overlay's ping readout. */
 const PING_EVERY = 60;
 
+/**
+ * Roster wallet for a free seat nobody has claimed yet, and for one a bot
+ * took. Neither is a base58 public key, so neither can be signed for: a guest
+ * claims a slot by producing a signature, and "open" cannot produce one.
+ *
+ * A bot's slot is relabelled when the bot is seated, which means the match
+ * log says which slots were bots rather than leaving it to be guessed at.
+ */
+export const FREE_SEAT_OPEN = "open";
+export const FREE_SEAT_BOT = "bot";
+
+/** Seconds of round left below which matchmaking stops offering a room. */
+export const MIN_JOINABLE_SECONDS = 30;
+
 export interface Seat {
   slot: number;
   wallet: string;
@@ -89,6 +105,17 @@ export class Room {
 
   private seats: (Seat | null)[];
   private bots: (Bot | null)[];
+  /**
+   * Free rooms: which slots a guest has claimed.
+   *
+   * Tracked separately rather than read back off the roster wallet. The
+   * roster is also where a bot's slot gets labelled, and a guest's wallet is
+   * base58, which can begin with any letters at all including the ones a bot
+   * label uses. Deciding who may take a seat from a string comparison would
+   * mean a guest whose key happened to start the right way could be turned
+   * out of their own slot.
+   */
+  private claimedSeat: boolean[];
   /** Consecutive ticks each slot's queue has been above BUFFER_TARGET. */
   private overTarget: number[];
   private log: MatchLog;
@@ -101,6 +128,8 @@ export class Room {
   private onFinish: (log: MatchLog, hash: string) => void;
   private startWhenSeated: number;
   private fillWithBots: boolean;
+  private fillTimer: NodeJS.Timeout | null = null;
+  private fillAfterMs: number;
 
   /**
    * `startWhenSeated` of 0 means the caller starts the clock. Anything higher
@@ -109,6 +138,11 @@ export class Room {
    *
    * `fillWithBots` seats a bot in every empty slot at the moment the round
    * starts. Free rooms only.
+   *
+   * `fillAfterMs` is the short wait a free room gives real players before it
+   * fills what is left with bots and starts. It begins when the first player
+   * sits down, so an empty room costs nothing and a room with somebody in it
+   * always becomes a game.
    */
   constructor(
     matchId: string,
@@ -117,6 +151,7 @@ export class Room {
     startWhenSeated = 0,
     kind: RoomKind = "staked",
     fillWithBots = false,
+    fillAfterMs = 0,
   ) {
     this.matchId = matchId;
     this.kind = kind;
@@ -128,10 +163,12 @@ export class Room {
     this.world = createWorld(roster.length, saltSeeds(this.spreadSalt));
     this.seats = new Array(roster.length).fill(null);
     this.bots = new Array(roster.length).fill(null);
+    this.claimedSeat = new Array(roster.length).fill(false);
     this.overTarget = new Array(roster.length).fill(0);
     this.onFinish = onFinish;
     this.startWhenSeated = startWhenSeated;
     this.fillWithBots = fillWithBots && kind === "free";
+    this.fillAfterMs = kind === "free" ? fillAfterMs : 0;
     this.log = {
       v: 4,
       matchId,
@@ -168,6 +205,22 @@ export class Room {
 
     if (!this.started && this.startWhenSeated > 0 && this.seatedCount() >= this.startWhenSeated) {
       this.start();
+      return;
+    }
+
+    if (this.started || this.fillAfterMs <= 0) return;
+
+    // A full house starts at once. Anything less waits a little for company,
+    // then takes bots.
+    if (this.seatedCount() >= this.roster.length) {
+      this.start();
+      return;
+    }
+    if (!this.fillTimer) {
+      this.fillTimer = setTimeout(() => {
+        this.fillTimer = null;
+        if (!this.started) this.start();
+      }, this.fillAfterMs);
     }
   }
 
@@ -211,6 +264,12 @@ export class Room {
     }
     if (this.seats[slot] && !this.seats[slot]!.bot) return;
     this.bots[slot] = new Bot(slot, slot + 1);
+    // Say so on the roster, so the match log records which slots were bots.
+    // Not over a guest's wallet: a slot somebody claimed and then dropped out
+    // of stays theirs to come back to, and the log should say who it was.
+    if (!this.claimedSeat[slot] && this.roster[slot].wallet === FREE_SEAT_OPEN) {
+      this.roster[slot].wallet = `${FREE_SEAT_BOT}-${slot}`;
+    }
     // A bot gets a seat like anyone else. Its inputs then travel the queue,
     // the backlog drain and the match log by exactly the same route a phone's
     // do, which is the only way to be sure a bot cannot do something a player
@@ -235,6 +294,69 @@ export class Room {
     for (let slot = 0; slot < this.roster.length; slot++) {
       if (!this.seats[slot]) this.addBot(slot);
     }
+  }
+
+  /* ------------------------------------------------------- free seats --- */
+
+  /**
+   * Take a seat in a free room for `wallet`.
+   *
+   * Returns the slot, or null if there is nowhere to sit. A wallet already on
+   * the roster gets its own slot back, which is what makes a reconnect work:
+   * the guest key lives for the page's session, so a dropped socket can come
+   * back to the same player rather than to a new one.
+   *
+   * A bot holding a slot does not count as occupied. Displacing one is the
+   * point: it means somebody arriving late gets a game immediately instead of
+   * an empty room, and seat() drops the bot when the human sits down.
+   */
+  claimFreeSeat(wallet: string): number | null {
+    if (this.kind !== "free") return null;
+    for (let slot = 0; slot < this.roster.length; slot++) {
+      if (this.claimedSeat[slot] && this.roster[slot].wallet === wallet) return slot;
+    }
+    for (let slot = 0; slot < this.roster.length; slot++) {
+      if (this.claimedSeat[slot]) continue;
+      const live = this.seats[slot];
+      if (live && !live.bot) continue;
+      this.claimedSeat[slot] = true;
+      this.roster[slot].wallet = wallet;
+      return slot;
+    }
+    return null;
+  }
+
+  /** Slots a guest could take: empty, or held by a bot. */
+  freeSeats(): number {
+    if (this.kind !== "free") return 0;
+    let n = 0;
+    for (let slot = 0; slot < this.roster.length; slot++) {
+      const live = this.seats[slot];
+      if (!live || live.bot) n++;
+    }
+    return n;
+  }
+
+  get isFinished(): boolean {
+    return this.finished;
+  }
+
+  /** Seconds of round left, or the whole round if it has not started. */
+  secondsLeft(): number {
+    if (!this.started) return ROUND_TICKS / TICK_HZ;
+    return Math.max(0, (ROUND_TICKS - this.world.tick) / TICK_HZ);
+  }
+
+  /**
+   * Is this room worth sending a new player to?
+   *
+   * Not finished, somewhere to sit, and enough round left to be worth
+   * joining. Walking into the last ten seconds of a match is worse than
+   * waiting a moment for a fresh one.
+   */
+  joinable(): boolean {
+    return !this.finished && this.freeSeats() > 0 &&
+      (!this.started || this.secondsLeft() >= MIN_JOINABLE_SECONDS);
   }
 
   get isStarted(): boolean {
@@ -288,6 +410,8 @@ export class Room {
   stop(): void {
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
+    if (this.fillTimer) clearTimeout(this.fillTimer);
+    this.fillTimer = null;
   }
 
   private schedule(): void {
@@ -445,24 +569,12 @@ export class Room {
   }
 
   /**
-   * Ordering must be total and deterministic, because it decides who gets paid.
-   * Kills descending, then fewer deaths, then lower slot. Slot is the final
-   * tiebreak precisely because it can never tie, which means there is no case
-   * where the standings depend on iteration order or timing.
+   * The finishing order, from the shared rule in protocol.ts. Shared so that
+   * a replay orders the match with the same code rather than its own reading
+   * of it.
    */
   private standings(): Standing[] {
-    const rows = this.world.players.map((p, slot) => ({
-      slot,
-      wallet: this.roster[slot].wallet,
-      kills: p.kills,
-      deaths: p.deaths,
-      place: 0,
-    }));
-    rows.sort((a, b) =>
-      b.kills - a.kills || a.deaths - b.deaths || a.slot - b.slot,
-    );
-    rows.forEach((r, i) => { r.place = i + 1; });
-    return rows;
+    return standingsFrom(this.world.players, this.roster);
   }
 }
 

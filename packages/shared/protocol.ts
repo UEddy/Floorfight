@@ -14,7 +14,7 @@
 import type { HitEvent, Input } from "./sim";
 import { PITCH_LIMIT, YAW_UNITS } from "./sim";
 
-export const PROTOCOL_VERSION = 5;
+export const PROTOCOL_VERSION = 6;
 
 /** Abuse limits. Exceed any of these and the connection is closed. */
 export const MAX_MSG_BYTES = 4096;
@@ -75,9 +75,17 @@ export type ClientMsg =
  * cannot be replayed into another. The nonce is single use and expires after
  * NONCE_TTL_MS.
  *
- * The server checks the wallet is actually a participant in matchId before it
- * allocates a slot. Slot index comes from the on-chain roster order, never from
- * connection order, so a replay assigns the same slots every time.
+ * In a staked match the server checks the wallet is actually a participant in
+ * matchId before it allocates a slot, and the slot index comes from the
+ * on-chain roster order, never from connection order, so a replay assigns the
+ * same slots every time.
+ *
+ * A free room has no roster to check against: it accepts any key that signs
+ * the nonce, and slots go in join order. That is not a weakening of the above,
+ * it is the absence of the thing the above protects. Nothing is staked, there
+ * is no payout to misdirect, and the slot order a free match ended up with is
+ * recorded in its log, so it still replays. The only identity a guest has is
+ * the key it made up on page load.
  *
  * Character ownership is resolved here too, server side, by RPC against the
  * holder's account. A client claiming a mint it does not own is quietly given
@@ -136,7 +144,20 @@ export interface SnapshotPlayer {
  */
 
 export type ServerMsg =
-  | { t: "challenge"; v: number; nonce: string }
+  | {
+      t: "challenge"; v: number; nonce: string;
+      /**
+       * The free room this connection would be seated in, or null if none is
+       * open. Sent with the challenge rather than looked up at join time so
+       * that a guest signs the id of the room it actually gets: the match id
+       * is inside the signed message, and a signature over a matchmaking
+       * alias would bind nothing in particular.
+       *
+       * A staked client ignores this and signs the match id it read off the
+       * chain.
+       */
+      freeMatchId: string | null;
+    }
   | {
       t: "accepted"; slot: number; tick: number; startsInMs: number;
       roster: RosterEntry[];
@@ -193,6 +214,34 @@ export interface Standing {
  * number on its own screen and changes nothing else.
  */
 
+/**
+ * The finishing order.
+ *
+ * Total and deterministic, because it decides who gets paid: kills
+ * descending, then fewer deaths, then lower slot. Slot is the final tiebreak
+ * precisely because it can never tie, which means there is no case where the
+ * standings depend on iteration order or timing.
+ *
+ * Here rather than in the server so that a replay computes the order with the
+ * same code that produced it. A verifier that re-implemented this would be
+ * checking its own opinion of the rules.
+ */
+export function standingsFrom(
+  players: readonly { kills: number; deaths: number }[],
+  roster: readonly RosterEntry[],
+): Standing[] {
+  const rows: Standing[] = players.map((p, slot) => ({
+    slot,
+    wallet: roster[slot]?.wallet ?? "",
+    kills: p.kills,
+    deaths: p.deaths,
+    place: 0,
+  }));
+  rows.sort((a, b) => b.kills - a.kills || a.deaths - b.deaths || a.slot - b.slot);
+  rows.forEach((r, i) => { r.place = i + 1; });
+  return rows;
+}
+
 /* ----------------------------------------------------------- match log --- */
 
 /**
@@ -225,6 +274,72 @@ export interface MatchLog {
   startedAt: number;
   ticks: { tick: number; inputs: (Input | null)[] }[];
   standings: Standing[];
+}
+
+/**
+ * Read a canonical log back.
+ *
+ * The file written to disk is the canonical form itself, byte for byte, so
+ * that the hash on chain is the hash of the file a verifier downloads. That
+ * form is positional, so this is the only thing that knows how to turn it
+ * back into a MatchLog for the replay to run over.
+ *
+ * Returns null on anything that is not the shape canonicalise produces.
+ * canonicalise(decanonicalise(s)) has to equal s, and there is a test for it:
+ * if that ever stops being true, a verifier would rehash to a different value
+ * and conclude the server lied.
+ */
+export function decanonicalise(text: string): MatchLog | null {
+  let a: unknown;
+  try {
+    a = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(a) || a.length !== 8) return null;
+  const [v, matchId, map, spreadSalt, roster, startedAt, ticks, standings] = a as unknown[];
+  if (typeof v !== "number" || typeof matchId !== "string" || typeof map !== "string") return null;
+  if (typeof spreadSalt !== "string" || typeof startedAt !== "number") return null;
+  if (!Array.isArray(roster) || !Array.isArray(ticks) || !Array.isArray(standings)) return null;
+
+  const log: MatchLog = {
+    v, matchId, map, spreadSalt, startedAt,
+    roster: roster.map((r) => {
+      const [slot, wallet, collection, mint] = r as unknown[];
+      return {
+        slot: slot as number,
+        wallet: wallet as string,
+        collection: (collection ?? null) as string | null,
+        mint: (mint ?? null) as string | null,
+      };
+    }),
+    ticks: ticks.map((t) => {
+      const [tick, inputs] = t as unknown[];
+      return {
+        tick: tick as number,
+        inputs: (inputs as unknown[]).map((i) => {
+          if (i === null) return null;
+          const [itick, view, moveX, moveY, yaw, pitch, fire, jump, reload, weapon] =
+            i as number[];
+          return {
+            tick: itick, view, moveX, moveY, yaw, pitch,
+            fire: fire as 0 | 1, jump: jump as 0 | 1, reload: reload as 0 | 1, weapon,
+          };
+        }),
+      };
+    }),
+    standings: standings.map((s) => {
+      const [slot, wallet, kills, deaths, place] = s as unknown[];
+      return {
+        slot: slot as number,
+        wallet: wallet as string,
+        kills: kills as number,
+        deaths: deaths as number,
+        place: place as number,
+      };
+    }),
+  };
+  return log;
 }
 
 export function canonicalise(log: MatchLog): string {
