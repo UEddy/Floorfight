@@ -41,11 +41,24 @@ Frankfurt. Simulates at 60 Hz, ships snapshots at 20 Hz.
 **Chain.** Anchor program. One escrow PDA per match. Resolver signs the result.
 Timeout refund path if it never does.
 
-**Match format.** Six player free-for-all, 90 second rounds, pot split 50/30/20.
+**Match format.** Six player free-for-all, 3 minute rounds, pot split 50/30/20.
 
 **Packages.** `packages/shared` holds `sim.ts` and `protocol.ts`, imported by
 both server and client. That sharing is the point: prediction, authority and
 replay must run identical code.
+
+## Weapons
+
+Three, in `shared/weapons.ts`: an automatic rifle, a semi-automatic pistol
+that kills with one head shot, and an eight pellet shotgun whose range stops
+well short of the hall's longest sightline. Magazine, reload, fire interval,
+damage, head multiplier, spread, pellet count and range all live in that
+table, and the server is the only thing that acts on it.
+
+Pellet spread comes from hashing (tick, slot, pellet index), never
+`Math.random`. A replay has to be able to derive every random looking number
+the match used from values the log already contains, and those three are in
+it.
 
 ## Trust boundary
 
@@ -66,6 +79,10 @@ Everything else follows from that:
   join frame cannot be replayed by a third party.
 - Any aim assist is computed server side and applied identically to every
   player. Client-side aim assist in a staked match is a cheat vector.
+- Firing, reloading and swapping weapons are intent bits. The magazine, the
+  interval, the spread, what the shot hit and how much it hurt are all decided
+  server side, and the damage numbers on screen are the server's own, read off
+  its hit events.
 - The full accepted input log hashes to a value committed on chain with the
   payout. Anyone can re-run the simulation over the log and verify the winner.
   This does not make settlement trustless. It makes it auditable. Say the
@@ -101,9 +118,14 @@ headroom was real but unearned.
 
 The Hall replaces it and is counted, not measured: 16485 solid blocks reduce to
 36668 triangles once hidden faces are dropped, in 9 merged meshes, one per
-material. With the sign strip, the three instanced player meshes, the gun and
-the flash that is 15 draw calls, and it does not grow with the map. Frame rate
-on device is still unmeasured, on either phone.
+material. With the sign strip, the three instanced player meshes, the gun, the
+flash, the death chunks, the tracers and the remote muzzle flashes, that is
+around 19 draw calls, and it does not grow with the map.
+
+Frame rate on device is still unmeasured, on either phone. `?debug=1` puts fps,
+the 1% low, draw calls, triangles and the server measured ping on screen, so
+measuring it is now a matter of loading the page on the S10 and reading them
+off. Do that before trusting any number in this section.
 
 Hold to: 60 fps floor, under 150 draw calls, instanced geometry for players, no
 dynamic shadows, fixed polygon ceiling per character. Re-measure on the Galaxy
@@ -156,11 +178,14 @@ Flag these rather than deciding alone.
 
 ## Status
 
-Done: deterministic sim core with height, gravity and jumping, block grid
-collision and grid hitscan, wire protocol v4, The Hall as authored map data,
-merged block renderer, server tick loop and join handshake, free and staked
-room types with server side bots, Anchor escrow program with 17 LiteSVM tests
-covering the attack cases and payout paths, 29 server tests covering replay
-determinism, the map's sightline and reachability rules, and the bot rules.
+Done: deterministic sim core with height, gravity, jumping and three weapons,
+block grid collision and grid hitscan, wire protocol v5, The Hall as authored
+map data identified by the hash of its own blocks, merged block renderer with
+hit feedback, damage numbers, death chunks, tracers and synthesized sound,
+touch controls, server tick loop and join handshake, free and staked room
+types with server side bots, Anchor escrow program with 17 LiteSVM tests
+covering the attack cases and payout paths, 42 server tests covering replay
+determinism, weapon behaviour, the map id, the map's sightline and
+reachability rules, and the bot rules.
 
 Next: droplet deploy, then Expo shell and MWA.

@@ -149,7 +149,12 @@ wss.on("connection", (ws: WebSocket) => {
       return;
     }
 
-    if (msg.t === "pong") return;
+    if (msg.t === "pong") {
+      if (typeof msg.id === "number" && Number.isFinite(msg.id)) {
+        room.pong(slot, msg.id);
+      }
+      return;
+    }
     return kick("unknown message");
   });
 
@@ -207,6 +212,9 @@ wss.on("connection", (ws: WebSocket) => {
       queue: [],
       ack: -1,
       lastSeenTick: 0,
+      pingId: 0,
+      pingSentAt: 0,
+      rtt: 0,
       send: (m) => { if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(m)); },
       close: (reason) => kick(reason),
     };

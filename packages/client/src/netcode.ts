@@ -94,6 +94,12 @@ export class Predictor {
     // mid-jump would restart the arc from rest. See SnapshotPlayer.w.
     p.vy = me.w;
     p.hp = me.h;
+    // Weapon state is the server's too. Prediction strips the fire bit, so
+    // without this the predicted magazine would never go down and the two
+    // would drift apart within a second of holding the trigger.
+    p.weapon = me.g;
+    p.ammo[me.g] = me.m;
+    p.reloadUntil = me.r > 0 ? this.world.tick + me.r : 0;
     p.kills = me.k;
     p.deaths = me.d;
     p.alive = me.a === 1;

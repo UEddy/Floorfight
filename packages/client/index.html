@@ -11,7 +11,15 @@
         --panel: rgba(18, 20, 24, 0.62);
         --hit: #ffffff;
         --kill: #ff4b3a;
+        --gold: #ffc426;
         --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        /* Touch controls sit this far in from the glass, plus whatever the
+           notch or the gesture bar claims. */
+        --padx: 28px;
+        --pady: 26px;
+        --safel: env(safe-area-inset-left, 0px);
+        --safer: env(safe-area-inset-right, 0px);
+        --safeb: env(safe-area-inset-bottom, 0px);
       }
       html, body { margin: 0; height: 100%; overflow: hidden; background: #1a1c20; color: var(--ink);
         font: 14px/1.35 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; user-select: none;
@@ -35,34 +43,103 @@
       #hitmarker i:nth-child(3) { transform: rotate(225deg) translateY(-12px); }
       #hitmarker i:nth-child(4) { transform: rotate(315deg) translateY(-12px); }
       #hitmarker.head i { background: #ffd23a; }
-      #hitmarker.kill i { background: var(--kill); height: 14px; }
+      /* A kill is a red X: the four arms double in length and square up. */
+      #hitmarker.kill { width: 54px; height: 54px; margin: -27px 0 0 -27px; }
+      #hitmarker.kill i { background: var(--kill); width: 5px; height: 26px; left: 24px; top: 14px;
+        box-shadow: 0 0 4px #000; }
+      #hitmarker.kill i:nth-child(1) { transform: rotate(45deg); }
+      #hitmarker.kill i:nth-child(2) { transform: rotate(135deg); }
+      #hitmarker.kill i:nth-child(3), #hitmarker.kill i:nth-child(4) { display: none; }
 
       #timer { top: 12px; left: 50%; transform: translateX(-50%); font: 700 26px/1 var(--mono);
         background: var(--panel); padding: 8px 14px; border-radius: 6px; letter-spacing: 1px; }
       #timer.low { color: var(--kill); }
 
+      #top3 { top: 54px; left: 50%; transform: translateX(-50%); display: flex; gap: 8px;
+        font: 700 13px/1 var(--mono); }
+      #top3 div { background: var(--panel); padding: 5px 9px; border-radius: 5px; display: flex; gap: 6px; }
+      #top3 .n { color: var(--dim); }
+      #top3 .k { color: var(--gold); }
+
       #board { top: 12px; left: 12px; background: var(--panel); border-radius: 6px; padding: 8px 10px;
         font: 13px/1.5 var(--mono); min-width: 170px; }
       #board .row { display: flex; gap: 10px; }
-      #board .row.me { color: #ffd23a; }
+      #board .row.me { color: var(--gold); }
       #board .row.empty { color: var(--dim); }
       #board .name { flex: 1; }
       #board .head { color: var(--dim); font-size: 11px; }
       #board .sw { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 6px; }
 
       #feed { top: 12px; right: 12px; display: flex; flex-direction: column; align-items: flex-end; gap: 4px;
-        font: 13px/1.3 var(--mono); }
-      #feed div { background: var(--panel); padding: 4px 8px; border-radius: 4px; animation: fade 5s forwards; }
-      #feed .me { outline: 1px solid #ffd23a; }
+        font: 13px/1.3 var(--mono); max-width: 46vw; }
+      #feed div { background: var(--panel); padding: 4px 8px; border-radius: 4px; animation: fade 6s forwards;
+        white-space: nowrap; }
+      #feed .me { outline: 1px solid var(--gold); }
+      #feed .w { color: var(--dim); }
       @keyframes fade { 0%, 80% { opacity: 1; } 100% { opacity: 0; } }
 
-      #hp { bottom: 16px; left: 16px; font: 700 28px/1 var(--mono); background: var(--panel);
-        padding: 8px 14px; border-radius: 6px; }
-      #net { bottom: 16px; right: 16px; font: 11px/1.4 var(--mono); color: var(--dim); text-align: right; }
+      #hp { bottom: calc(16px + var(--safeb)); left: calc(16px + var(--safel)); font: 700 28px/1 var(--mono);
+        background: var(--panel); padding: 8px 14px; border-radius: 6px; }
+      #hp.hurt { color: var(--kill); }
+      #net { bottom: calc(16px + var(--safeb)); right: calc(16px + var(--safer)); font: 11px/1.4 var(--mono);
+        color: var(--dim); text-align: right; }
 
-      #center { left: 50%; top: 36%; transform: translate(-50%, -50%); text-align: center; font-size: 18px;
+      #ammo { bottom: calc(52px + var(--safeb)); right: calc(16px + var(--safer)); text-align: right;
+        font: 700 34px/1 var(--mono); text-shadow: 0 2px 6px #000; }
+      #ammo .mag { color: var(--dim); font-size: 18px; }
+      #ammo .wname { display: block; font: 600 12px/1.6 var(--mono); color: var(--dim); letter-spacing: 1px; }
+      #ammo.reloading { color: var(--gold); }
+      #ammo.empty { color: var(--kill); }
+
+      #weapons { bottom: calc(16px + var(--safeb)); left: 50%; transform: translateX(-50%); display: flex; gap: 6px; }
+      #weapons div { background: var(--panel); border-radius: 5px; padding: 5px 9px; font: 12px/1.3 var(--mono);
+        color: var(--dim); border: 1px solid transparent; min-width: 58px; text-align: center; }
+      #weapons div.on { color: var(--ink); border-color: var(--gold); background: rgba(40, 34, 18, 0.8); }
+      #weapons div .key { color: var(--gold); margin-right: 5px; }
+      #weapons div .a { display: block; font-size: 11px; }
+
+      #center { left: 50%; top: 34%; transform: translate(-50%, -50%); text-align: center; font-size: 18px;
         background: var(--panel); padding: 12px 18px; border-radius: 8px; max-width: 80vw; }
       #center:empty { display: none; }
+
+      #elim { left: 50%; top: 44%; transform: translate(-50%, -50%); text-align: center;
+        font: 700 22px/1.3 var(--mono); letter-spacing: 1px; text-shadow: 0 2px 8px #000; opacity: 0; }
+      #elim.show { animation: pop 1.6s forwards; }
+      @keyframes pop { 0% { opacity: 0; transform: translate(-50%, -50%) scale(0.86); }
+        12% { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+        70% { opacity: 1; } 100% { opacity: 0; } }
+
+      #killedby { left: 50%; top: 56%; transform: translate(-50%, -50%); text-align: center;
+        font: 14px/1.5 var(--mono); background: var(--panel); padding: 8px 14px; border-radius: 6px; }
+      #killedby:empty { display: none; }
+      #killedby b { color: var(--kill); }
+
+      /* Death: the edges of the screen go red and a countdown sits in it. */
+      #tint { inset: 0; opacity: 0; transition: opacity 220ms ease-out;
+        background: radial-gradient(ellipse at center, rgba(120, 0, 0, 0) 35%, rgba(150, 10, 10, 0.72) 100%); }
+      #tint.show { opacity: 1; }
+      #respawn { left: 50%; top: 50%; transform: translate(-50%, -50%); font: 700 72px/1 var(--mono);
+        color: rgba(255, 255, 255, 0.92); text-shadow: 0 4px 18px #000; }
+      #respawn:empty { display: none; }
+
+      #dmg div { position: absolute; font: 700 20px/1 var(--mono); color: #fff; text-shadow: 0 2px 6px #000;
+        animation: rise 900ms ease-out forwards; }
+      #dmg div.head { color: #ffd23a; font-size: 26px; }
+      @keyframes rise { 0% { opacity: 0; transform: translate(-50%, 0) scale(0.8); }
+        15% { opacity: 1; transform: translate(-50%, -8px) scale(1.1); }
+        100% { opacity: 0; transform: translate(-50%, -52px) scale(1); } }
+
+      #plates div { position: absolute; transform: translate(-50%, -100%); text-align: center;
+        font: 600 12px/1.4 var(--mono); text-shadow: 0 1px 3px #000; }
+      #plates .bar { width: 54px; height: 5px; margin: 2px auto 0; border-radius: 3px;
+        background: rgba(0, 0, 0, 0.55); overflow: hidden; }
+      #plates .bar i { display: block; height: 100%; background: #4fe08a; }
+      #plates .bar i.low { background: var(--kill); }
+
+      #debug { top: 12px; left: 50%; transform: translateX(-50%); margin-top: 92px;
+        background: rgba(0, 0, 0, 0.72); border-radius: 6px; padding: 8px 10px;
+        font: 12px/1.6 var(--mono); color: #9fe8a0; display: none; white-space: pre; }
+      #debug.show { display: block; }
 
       #over { inset: 0; display: none; align-items: center; justify-content: center; background: rgba(10, 11, 13, 0.78);
         pointer-events: auto; }
@@ -72,35 +149,67 @@
       #over table { width: 100%; border-collapse: collapse; font: 14px/1.6 var(--mono); }
       #over th { text-align: left; color: var(--dim); font-weight: 400; }
       #over td, #over th { padding: 2px 6px; }
-      #over tr.me td { color: #ffd23a; }
+      #over tr.me td { color: var(--gold); }
       #over .hash { margin-top: 14px; font: 12px/1.4 var(--mono); word-break: break-all; color: var(--dim); }
       #over .hash b { color: var(--ink); font-weight: 400; }
       #over button { margin-top: 16px; font: inherit; padding: 8px 16px; border-radius: 6px; border: 0;
-        background: #ffd23a; color: #1a1c20; cursor: pointer; }
+        background: var(--gold); color: #1a1c20; cursor: pointer; }
 
-      #fire { right: 28px; bottom: 90px; width: 84px; height: 84px; border-radius: 50%; display: none;
-        background: rgba(255, 75, 58, 0.45); border: 2px solid rgba(255, 255, 255, 0.6); pointer-events: auto; }
-      #jump { right: 124px; bottom: 38px; width: 68px; height: 68px; border-radius: 50%; display: none;
-        background: rgba(47, 109, 223, 0.45); border: 2px solid rgba(255, 255, 255, 0.6); pointer-events: auto;
-        color: var(--ink); font: 700 13px/68px var(--mono); text-align: center; letter-spacing: 1px; }
-      #stick { width: 90px; height: 90px; margin: -45px 0 0 -45px; border-radius: 50%; display: none;
-        border: 2px solid rgba(255, 255, 255, 0.4); }
-      @media (pointer: coarse) { #fire, #jump { display: block; } #board { font-size: 11px; min-width: 140px; } }
+      /* Touch controls. Thumb sized, held off the edges of the glass, and
+         clear of each other so a stray thumb cannot press two at once. */
+      .btn { position: fixed; display: none; border-radius: 50%; pointer-events: auto; touch-action: none;
+        border: 2px solid rgba(255, 255, 255, 0.55); color: var(--ink); text-align: center;
+        font: 700 12px/1 var(--mono); letter-spacing: 1px; align-items: center; justify-content: center; }
+      #fire { width: 104px; height: 104px;
+        right: calc(var(--padx) + var(--safer)); bottom: calc(118px + var(--pady) + var(--safeb));
+        background: rgba(255, 75, 58, 0.42); }
+      #reload { width: 82px; height: 82px;
+        right: calc(var(--padx) + 10px + var(--safer)); bottom: calc(var(--pady) + var(--safeb));
+        background: rgba(255, 196, 38, 0.34); }
+      #swap { width: 82px; height: 82px;
+        right: calc(var(--padx) + 118px + var(--safer)); bottom: calc(132px + var(--pady) + var(--safeb));
+        background: rgba(47, 109, 223, 0.34); }
+      #jump { width: 82px; height: 82px;
+        right: calc(var(--padx) + 112px + var(--safer)); bottom: calc(26px + var(--pady) + var(--safeb));
+        background: rgba(79, 224, 138, 0.3); }
+      #stick { width: 104px; height: 104px; margin: -52px 0 0 -52px; border-radius: 50%; display: none;
+        border: 2px solid rgba(255, 255, 255, 0.35); }
+      #stick i { position: absolute; left: 50%; top: 50%; width: 44px; height: 44px; margin: -22px 0 0 -22px;
+        border-radius: 50%; background: rgba(255, 255, 255, 0.22); }
+
+      @media (pointer: coarse) {
+        .btn { display: flex; }
+        #board { font-size: 11px; min-width: 140px; }
+        #ammo { font-size: 28px; }
+        #weapons { bottom: calc(10px + var(--safeb)); left: calc(16px + var(--safel)); transform: none; }
+        #hp { bottom: calc(96px + var(--safeb)); }
+      }
     </style>
   </head>
   <body>
     <canvas id="view"></canvas>
+    <div id="tint" class="hud"><div id="respawn" class="hud"></div></div>
     <div id="crosshair" class="hud"></div>
     <div id="hitmarker" class="hud"><i></i><i></i><i></i><i></i></div>
-    <div id="timer" class="hud">1:30</div>
+    <div id="timer" class="hud">3:00</div>
+    <div id="top3" class="hud"></div>
     <div id="board" class="hud"></div>
     <div id="feed" class="hud"></div>
+    <div id="debug" class="hud"></div>
     <div id="hp" class="hud">100</div>
+    <div id="ammo" class="hud"><span class="wname">RIFLE</span><span class="now">30</span><span class="mag"> / 30</span></div>
+    <div id="weapons" class="hud"></div>
     <div id="net" class="hud"></div>
     <div id="center" class="hud"></div>
-    <div id="stick" class="hud"></div>
-    <div id="fire" class="hud"></div>
-    <div id="jump" class="hud">JUMP</div>
+    <div id="elim" class="hud"></div>
+    <div id="killedby" class="hud"></div>
+    <div id="dmg" class="hud"></div>
+    <div id="plates" class="hud"></div>
+    <div id="stick" class="hud"><i></i></div>
+    <div id="fire" class="btn">FIRE</div>
+    <div id="reload" class="btn">RELOAD</div>
+    <div id="swap" class="btn">SWAP</div>
+    <div id="jump" class="btn">JUMP</div>
     <div id="over" class="hud">
       <div class="card">
         <h1>Round over</h1>

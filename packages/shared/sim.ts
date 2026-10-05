@@ -41,6 +41,7 @@ import {
   SPAWNS,
   solidAt,
 } from "./map";
+import { SWITCH_TICKS, WEAPONS, WEAPON_COUNT, spreadHash } from "./weapons";
 
 export {
   GRID_X, GRID_Y, GRID_Z, HALF_X, HALF_Z, MAP_ID, SPAWNS,
@@ -95,19 +96,24 @@ export const STEP_HEIGHT = 1;
  */
 export const GROUND_EPS = 1 / 64;
 
+/** Longest shot any weapon can take. Per weapon ranges are in weapons.ts. */
 export const WEAPON_RANGE = 90;
-export const FIRE_COOLDOWN = 8; // ticks, about 133 ms
 export const MAX_HP = 100;
-export const DAMAGE_BODY = 34;
-export const DAMAGE_HEAD = 100;
-export const RESPAWN_TICKS = 90;
-export const ROUND_TICKS = 90 * TICK_HZ;
+
+/** Three seconds, which is also the length of the client's death countdown. */
+export const RESPAWN_TICKS = 3 * TICK_HZ;
+
+/** Three minutes. */
+export const ROUND_TICKS = 180 * TICK_HZ;
 
 export const MAX_REWIND = 15;     // ticks, 250 ms
 export const HISTORY_TICKS = 20;  // ring size, must exceed MAX_REWIND
 
 export const YAW_UNITS = 8192;
 export const PITCH_LIMIT = 1.45;
+
+/** Radians in one yaw unit. Used to apply spread to pitch. */
+const RAD_PER_UNIT = (Math.PI * 2) / YAW_UNITS;
 
 /* ---------------------------------------------------------------- trig --- */
 
@@ -143,6 +149,20 @@ export interface PlayerState {
   respawnAt: number;
   lastFireTick: number;
   lastInputTick: number;
+
+  /** Index into WEAPONS. */
+  weapon: number;
+  /** Rounds in each weapon's magazine, indexed by weapon. */
+  ammo: number[];
+  /** Tick a reload completes, or 0 if not reloading. */
+  reloadUntil: number;
+  /** Tick the current weapon becomes usable after a swap. */
+  switchUntil: number;
+  /**
+   * Whether the fire bit was set last tick. A semi automatic weapon needs the
+   * trigger released between shots, and that is the only state it takes.
+   */
+  triggerHeld: boolean;
 }
 
 /** Positions as they stood at the end of one tick. Used only for rewind. */
@@ -169,6 +189,9 @@ export interface Input {
   pitch: number; // -32767..32767 mapped to +/- PITCH_LIMIT
   fire: 0 | 1;
   jump: 0 | 1;
+  reload: 0 | 1;
+  /** 0 to keep the current weapon, or 1 to WEAPON_COUNT to select one. */
+  weapon: number;
 }
 
 export interface HitEvent {
@@ -178,6 +201,20 @@ export interface HitEvent {
   head: boolean;
   lethal: boolean;
   rewind: number; // ticks the server rewound, after clamping
+  weapon: number; // index into WEAPONS, so the kill feed can name it
+  /**
+   * Total damage this shot did to this victim, summed over its pellets. The
+   * client draws this number over the victim's head, which is the only place
+   * a damage number can honestly come from: the client cannot compute its own
+   * without being told what the server decided.
+   */
+  damage: number;
+}
+
+export function fullMags(): number[] {
+  const out: number[] = [];
+  for (let i = 0; i < WEAPON_COUNT; i++) out.push(WEAPONS[i].mag);
+  return out;
 }
 
 export function newPlayer(id: number, slot: number): PlayerState {
@@ -186,6 +223,8 @@ export function newPlayer(id: number, slot: number): PlayerState {
     id, x: s.x, y: s.y, z: s.z, vy: 0, yaw: 0, pitch: 0,
     hp: MAX_HP, kills: 0, deaths: 0, alive: true,
     respawnAt: 0, lastFireTick: -999, lastInputTick: -1,
+    weapon: 0, ammo: fullMags(), reloadUntil: 0, switchUntil: 0,
+    triggerHeld: false,
   };
 }
 
@@ -355,9 +394,10 @@ function rayBox(
   dx: number, dy: number, dz: number,
   minX: number, minY: number, minZ: number,
   maxX: number, maxY: number, maxZ: number,
+  range: number,
 ): number {
   let tmin = 0;
-  let tmax = WEAPON_RANGE;
+  let tmax = range;
 
   if (dx === 0) { if (ox < minX || ox > maxX) return -1; }
   else {
@@ -409,6 +449,7 @@ export function hitscanFrame(
   oz: number,
   yaw: number,
   pitch: number,
+  range: number,
 ): { victimSlot: number; head: boolean; dist: number } | null {
   const cp = Math.cos(pitch);
   const dx = -sinU(yaw) * cp;
@@ -416,7 +457,7 @@ export function hitscanFrame(
   const dz = -cosU(yaw) * cp;
 
   // World geometry is static, so cover is checked against the live grid.
-  const wall = rayGrid(ox, oy, oz, dx, dy, dz, WEAPON_RANGE);
+  const wall = rayGrid(ox, oy, oz, dx, dy, dz, range);
 
   let best: { victimSlot: number; head: boolean; dist: number } | null = null;
   for (let i = 0; i < frame.alive.length; i++) {
@@ -427,10 +468,10 @@ export function hitscanFrame(
 
     const dHead = rayBox(ox, oy, oz, dx, dy, dz,
       px - HEAD_HALF, py + HEAD_BOTTOM, pz - HEAD_HALF,
-      px + HEAD_HALF, py + HEAD_TOP, pz + HEAD_HALF);
+      px + HEAD_HALF, py + HEAD_TOP, pz + HEAD_HALF, range);
     const dBody = rayBox(ox, oy, oz, dx, dy, dz,
       px - BODY_HALF_X, py, pz - BODY_HALF_Z,
-      px + BODY_HALF_X, py + BODY_TOP, pz + BODY_HALF_Z);
+      px + BODY_HALF_X, py + BODY_TOP, pz + BODY_HALF_Z, range);
 
     let d = -1;
     let head = false;
@@ -491,6 +532,11 @@ export function step(
         const s = SPAWNS[(slot + p.deaths) % SPAWNS.length];
         p.x = s.x; p.y = s.y; p.z = s.z; p.vy = 0;
         p.hp = MAX_HP; p.alive = true;
+        // Fresh magazines, and whatever weapon they died holding.
+        p.ammo = fullMags();
+        p.reloadUntil = 0;
+        p.switchUntil = 0;
+        p.triggerHeld = false;
       }
       continue;
     }
@@ -556,40 +602,122 @@ export function step(
   // shot that rewinds zero ticks sees the state the shooter is looking at.
   record(world);
 
-  // Firing resolves in a second pass, so slot order cannot buy an advantage.
+  /*
+   * Weapons, reloads and shots, in a second pass so slot order cannot buy an
+   * advantage.
+   *
+   * Everything here is driven by intent bits. A client can ask to fire, to
+   * reload and to hold a different weapon, and that is the whole of its
+   * authority: the magazine, the interval, the spread pattern, what the shot
+   * hit and how much it hurt are all decided here.
+   */
   for (let slot = 0; slot < world.players.length; slot++) {
     const p = world.players[slot];
+    if (!p) continue;
     const inp = inputs[slot];
-    if (!p || !p.alive || !inp || !inp.fire) continue;
-    if (tick - p.lastFireTick < FIRE_COOLDOWN) continue;
+
+    if (!p.alive) {
+      p.triggerHeld = false;
+      continue;
+    }
+
+    // A swap request. Out of range values are ignored rather than trusted,
+    // and swapping abandons a reload in progress.
+    if (inp) {
+      const want = (inp.weapon | 0) - 1;
+      if (want >= 0 && want < WEAPON_COUNT && want !== p.weapon) {
+        p.weapon = want;
+        p.switchUntil = tick + SWITCH_TICKS;
+        p.reloadUntil = 0;
+      }
+    }
+
+    const spec = WEAPONS[p.weapon];
+
+    if (p.reloadUntil > 0 && tick >= p.reloadUntil) {
+      p.ammo[p.weapon] = spec.mag;
+      p.reloadUntil = 0;
+    }
+
+    const ready = tick >= p.switchUntil && p.reloadUntil === 0;
+    if (inp && inp.reload === 1 && ready && p.ammo[p.weapon] < spec.mag) {
+      p.reloadUntil = tick + spec.reloadTicks;
+    }
+
+    const pulling = inp !== null && inp !== undefined && inp.fire === 1;
+    // A semi automatic weapon needs the trigger released between shots. The
+    // edge is read before the new state is stored, so a client that simply
+    // holds the bit down gets one shot per pull, like the trigger it is.
+    const edge = spec.auto || !p.triggerHeld;
+    p.triggerHeld = pulling;
+
+    if (!pulling || !ready || !edge) continue;
+    if (tick - p.lastFireTick < spec.fireInterval) continue;
+    if (p.ammo[p.weapon] <= 0) {
+      // Dry. Start the reload rather than making the player ask again: a
+      // phone has enough buttons on it already.
+      p.reloadUntil = tick + spec.reloadTicks;
+      continue;
+    }
+
+    p.ammo[p.weapon]--;
     p.lastFireTick = tick;
 
-    const view = clamp(inp.view | 0, tick - MAX_REWIND, tick);
+    const view = clamp(inp!.view | 0, tick - MAX_REWIND, tick);
     const rewind = tick - view;
-    const hit = hitscanFrame(
-      frameAt(world, view), slot, p.x, p.y + EYE_HEIGHT, p.z, p.yaw, p.pitch,
-    );
-    if (!hit) continue;
+    const frame = frameAt(world, view);
 
-    const victim = world.players[hit.victimSlot];
-    // The victim may have died between the rewound frame and now. A shot into
-    // the past does not kill someone twice.
-    if (!victim.alive) continue;
+    // Damage is summed per victim before any of it is applied, so a shotgun
+    // blast is one hit event carrying one number rather than eight. The
+    // client draws that number, and the kill feed names the weapon.
+    const n = world.players.length;
+    const dealt = new Array<number>(n).fill(0);
+    const headed = new Array<boolean>(n).fill(false);
 
-    victim.hp -= hit.head ? DAMAGE_HEAD : DAMAGE_BODY;
+    for (let pel = 0; pel < spec.pellets; pel++) {
+      const h = spreadHash(tick, slot, pel);
+      // Thirteen bits of angle, ten of radius, from the same hash. The square
+      // root spreads the pattern evenly over the disc instead of bunching it
+      // in the middle, and Math.sqrt is exact under IEEE-754.
+      const ang = h & (YAW_UNITS - 1);
+      const off = Math.sqrt(((h >>> 13) & 1023) / 1023) * spec.spread;
+      const yaw = (p.yaw + Math.round(off * cosU(ang)) + YAW_UNITS) % YAW_UNITS;
+      // Clamped because the pitch limit sits below a quarter turn: without
+      // this a pellet fired at full elevation could tip past vertical and
+      // come back down facing the other way.
+      const pitch = clamp(
+        p.pitch + off * sinU(ang) * RAD_PER_UNIT, -PITCH_LIMIT, PITCH_LIMIT,
+      );
 
-    const lethal = victim.hp <= 0;
-    if (lethal) {
-      victim.alive = false;
-      victim.hp = 0;
-      victim.deaths++;
-      victim.respawnAt = tick + RESPAWN_TICKS;
-      p.kills++;
+      const hit = hitscanFrame(
+        frame, slot, p.x, p.y + EYE_HEIGHT, p.z, yaw, pitch, spec.range,
+      );
+      if (!hit) continue;
+      dealt[hit.victimSlot] += hit.head ? spec.headDamage : spec.damage;
+      if (hit.head) headed[hit.victimSlot] = true;
     }
-    hits.push({
-      tick, shooter: slot, victim: hit.victimSlot,
-      head: hit.head, lethal, rewind,
-    });
+
+    for (let v = 0; v < n; v++) {
+      if (dealt[v] <= 0) continue;
+      const victim = world.players[v];
+      // The victim may have died between the rewound frame and now. A shot
+      // into the past does not kill someone twice.
+      if (!victim.alive) continue;
+
+      victim.hp -= dealt[v];
+      const lethal = victim.hp <= 0;
+      if (lethal) {
+        victim.alive = false;
+        victim.hp = 0;
+        victim.deaths++;
+        victim.respawnAt = tick + RESPAWN_TICKS;
+        p.kills++;
+      }
+      hits.push({
+        tick, shooter: slot, victim: v, head: headed[v], lethal, rewind,
+        weapon: p.weapon, damage: dealt[v],
+      });
+    }
   }
 
   world.tick = tick + 1;

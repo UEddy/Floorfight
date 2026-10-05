@@ -5,15 +5,16 @@
  * The server reads intents from it and nothing else. There is deliberately no
  * message a client can send that asserts a position, a hit, a kill or a score.
  *
- * Transport is JSON over WebSocket for v1. At 20 Hz with six players that is
- * roughly 12 KB/s down per client, which is fine. Move to a binary encoding
- * only when debugging JSON stops being worth the bytes.
+ * Transport is JSON over WebSocket for v1. At 20 Hz with six players and the
+ * fields a snapshot now carries, that is roughly 20 KB/s down per client,
+ * which is still fine on a phone. Move to a binary encoding only when
+ * debugging JSON stops being worth the bytes.
  */
 
 import type { HitEvent, Input } from "./sim";
 import { PITCH_LIMIT, YAW_UNITS } from "./sim";
 
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
 
 /** Abuse limits. Exceed any of these and the connection is closed. */
 export const MAX_MSG_BYTES = 4096;
@@ -47,13 +48,14 @@ export function quantAxis(v: number): number {
 export function isWellFormedInput(v: unknown): v is Input {
   if (typeof v !== "object" || v === null) return false;
   const o = v as Record<string, unknown>;
-  const nums = ["tick", "view", "moveX", "moveY", "yaw", "pitch"];
+  const nums = ["tick", "view", "moveX", "moveY", "yaw", "pitch", "weapon"];
   for (const k of nums) {
     const n = o[k];
     if (typeof n !== "number" || !Number.isFinite(n)) return false;
   }
   if (o.fire !== 0 && o.fire !== 1) return false;
-  return o.jump === 0 || o.jump === 1;
+  if (o.jump !== 0 && o.jump !== 1) return false;
+  return o.reload === 0 || o.reload === 1;
 }
 
 /* -------------------------------------------------------------- client --- */
@@ -102,6 +104,10 @@ export interface SnapshotPlayer {
   k: number; // kills
   d: number; // deaths, shown on the scoreboard and the standings tiebreak
   a: 0 | 1;  // alive
+  g: number; // weapon held, an index into WEAPONS
+  m: number; // rounds left in that weapon's magazine
+  r: number; // ticks of reload still to run, 0 if not reloading
+  f: 0 | 1;  // fired at least once since the previous snapshot
 }
 
 /**
@@ -116,7 +122,10 @@ export interface SnapshotPlayer {
 export type ServerMsg =
   | { t: "challenge"; v: number; nonce: string }
   | { t: "accepted"; slot: number; tick: number; startsInMs: number; roster: RosterEntry[] }
-  | { t: "snap"; tick: number; ack: number; players: SnapshotPlayer[]; hits: HitEvent[] }
+  | {
+      t: "snap"; tick: number; ack: number; rtt: number;
+      players: SnapshotPlayer[]; hits: HitEvent[];
+    }
   | { t: "over"; tick: number; standings: Standing[]; logHash: string }
   | { t: "ping"; id: number }
   | { t: "kick"; reason: string };
@@ -140,6 +149,13 @@ export interface Standing {
  * `ack` is the highest client input tick the server has consumed on this
  * connection. The client keeps everything after it and replays those inputs on
  * top of the authoritative snapshot to reconcile its prediction.
+ *
+ * `rtt` is the round trip time the server measured on this connection, in
+ * milliseconds, from its own ping and the client's pong. It exists so the
+ * debug overlay can show a ping on a phone, and it is display only: lag
+ * compensation never reads it, because the rewind target travels inside each
+ * input instead. A client that answers pings late or not at all gets a wrong
+ * number on its own screen and changes nothing else.
  */
 
 /* ----------------------------------------------------------- match log --- */
@@ -175,7 +191,10 @@ export function canonicalise(log: MatchLog): string {
   const ticks = log.ticks.map((t) => [
     t.tick,
     t.inputs.map((i) =>
-      i ? [i.tick, i.view, i.moveX, i.moveY, i.yaw, i.pitch, i.fire, i.jump] : null,
+      i
+        ? [i.tick, i.view, i.moveX, i.moveY, i.yaw, i.pitch, i.fire, i.jump,
+          i.reload, i.weapon]
+        : null,
     ),
   ]);
   const roster = log.roster.map((r) => [r.slot, r.wallet, r.collection, r.mint]);

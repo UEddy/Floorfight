@@ -18,6 +18,7 @@ import {
   type HitEvent,
   type Input,
 } from "../../shared/sim";
+import { WEAPON_COUNT } from "../../shared/weapons";
 import { canonicalise, type MatchLog, type RosterEntry } from "../../shared/protocol";
 
 const SLOTS = 6;
@@ -59,7 +60,7 @@ export function runMatch(seed: number, ticks: number): {
     p.vy = 0;
   }
   const log: MatchLog = {
-    v: 2,
+    v: 3,
     matchId: "replay-test",
     map: MAP_ID,
     roster,
@@ -91,6 +92,11 @@ export function runMatch(seed: number, ticks: number): {
         pitch: Math.floor(rnd() * 20000) - 10000,
         fire: rnd() < 0.25 ? 1 : 0,
         jump: rnd() < 0.08 ? 1 : 0,
+        reload: rnd() < 0.02 ? 1 : 0,
+        // Swap now and then, so magazines, reloads, swap delays, the semi
+        // automatic trigger edge and all three spread patterns are all inside
+        // the hash this test compares.
+        weapon: rnd() < 0.01 ? 1 + Math.floor(rnd() * WEAPON_COUNT) : 0,
       };
     }
     const hits: HitEvent[] = [];
@@ -116,9 +122,11 @@ export function runMatch(seed: number, ticks: number): {
   // disagrees, and the whole point of the audit story is that it cannot.
   const state = JSON.stringify(world.players.map((p) => [
     p.x, p.y, p.z, p.vy, p.yaw, p.pitch, p.hp, p.kills, p.deaths, p.alive ? 1 : 0,
+    p.weapon, p.ammo.slice(), p.reloadUntil, p.switchUntil, p.triggerHeld ? 1 : 0,
   ]));
   const events = JSON.stringify(allHits.map((h) => [
     h.tick, h.shooter, h.victim, h.head ? 1 : 0, h.lethal ? 1 : 0, h.rewind,
+    h.weapon, h.damage,
   ]));
 
   return {

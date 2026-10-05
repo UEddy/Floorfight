@@ -25,6 +25,8 @@
  * the log so a verifier can tell which arena a log belongs to.
  */
 
+import { sha256Hex } from "./sha256";
+
 /* ---------------------------------------------------------------- size --- */
 
 export const GRID_X = 48;
@@ -47,8 +49,8 @@ export const LEVEL_STAGE = 3;
 export const LEVEL_GALLERY = 7;
 export const LEVEL_GIRDER = 11;
 
-/** Identifies this arena in a match log. Bump the suffix on any layout edit. */
-export const MAP_ID = "the-hall-48:1";
+/** Human readable name. Only ever shown to people. */
+export const MAP_NAME = "The Hall";
 
 /* ----------------------------------------------------------- materials --- */
 
@@ -551,6 +553,18 @@ export function index(ix: number, iy: number, iz: number): number {
 }
 
 export const GRID: Uint8Array = build();
+
+/**
+ * The map id: sha256 of the grid bytes, as hex.
+ *
+ * Derived rather than written down on purpose. A hand maintained version
+ * string is a promise that someone remembers to bump it, and the one time it
+ * is forgotten is the time two builds disagree about the world a match was
+ * played in while claiming to be the same map. This cannot be forgotten:
+ * change one block and the id changes, which is what the match log needs,
+ * because the log plus the map is the whole replay.
+ */
+export const MAP_ID: string = sha256Hex(GRID);
 
 /* ---------------------------------------------------------- accessors --- */
 

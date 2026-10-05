@@ -1,4 +1,5 @@
-import type { HitEvent } from "../../shared/sim";
+import { MAX_HP, TICK_HZ, type HitEvent } from "../../shared/sim";
+import { WEAPONS, weaponName } from "../../shared/weapons";
 import type { RosterEntry, SnapshotPlayer, Standing } from "../../shared/protocol";
 import { SLOT_COLORS } from "./render";
 
@@ -12,10 +13,19 @@ export function shortWallet(w: string): string {
   return w.length > 10 ? `${w.slice(0, 4)}...${w.slice(-4)}` : w;
 }
 
+/** Where a nameplate should be drawn, worked out by the renderer. */
+export interface Plate {
+  slot: number;
+  hp: number;
+  sx: number;
+  sy: number;
+}
+
 /**
  * Everything drawn here comes from server messages: scores and deaths from
- * snapshots, hits and kills from the server's hit events. The client never
- * scores anything itself.
+ * snapshots, hits, kills, damage numbers and the weapon that did it from the
+ * server's hit events. The client never scores anything itself and never
+ * invents a damage number: if the server did not say it, it is not on screen.
  */
 export class Hud {
   private hit = $("hitmarker");
@@ -23,63 +33,149 @@ export class Hud {
   private feed = $("feed");
   private board = $("board");
   private timer = $("timer");
+  private top3El = $("top3");
   private hp = $("hp");
   private net = $("net");
   private center = $("center");
+  private elim = $("elim");
+  private killedByEl = $("killedby");
+  private tint = $("tint");
+  private respawnEl = $("respawn");
+  private ammoEl = $("ammo");
+  private weaponsEl = $("weapons");
+  private dmg = $("dmg");
+  private plates = $("plates");
+  private debugEl = $("debug");
   private over = $("over");
   private stick = $("stick");
   private boardKey = "";
+  private top3Key = "";
+  private weaponKey = "";
+  private ammoKey = "";
+  private plateEls: HTMLElement[] = [];
   names: string[] = [];
 
-  constructor(private localSlot: number) {}
+  constructor(private localSlot: number) {
+    this.buildWeaponBar();
+  }
 
   setRoster(roster: RosterEntry[]): void {
     this.names = roster.map((r) => `P${r.slot + 1} ${shortWallet(r.wallet)}`);
+  }
+
+  /** Short name for a slot, as used in the feed and the banners. */
+  who(slot: number): string {
+    return slot === this.localSlot ? "You" : `P${slot + 1}`;
   }
 
   message(text: string): void {
     this.center.textContent = text;
   }
 
+  /* ------------------------------------------------------------ combat --- */
+
   hitMarker(e: HitEvent): void {
     this.hit.className = `hud show${e.head ? " head" : ""}${e.lethal ? " kill" : ""}`;
     clearTimeout(this.hitTimer);
     this.hitTimer = window.setTimeout(() => {
       this.hit.className = "hud";
-    }, e.lethal ? 260 : 120);
+    }, e.lethal ? 420 : 140);
+  }
+
+  /** A damage number over the victim, at the screen position given. */
+  damageNumber(amount: number, head: boolean, sx: number, sy: number): void {
+    const el = document.createElement("div");
+    el.textContent = String(Math.round(amount));
+    if (head) el.className = "head";
+    el.style.left = `${Math.round(sx)}px`;
+    el.style.top = `${Math.round(sy)}px`;
+    this.dmg.append(el);
+    // The rise animation is 900 ms; give it a little slack then drop the node.
+    window.setTimeout(() => el.remove(), 1000);
+    while (this.dmg.children.length > 24) this.dmg.firstElementChild?.remove();
+  }
+
+  /** We killed someone. */
+  eliminated(slot: number): void {
+    this.elim.textContent = `Eliminated ${this.who(slot)}`;
+    this.elim.classList.remove("show");
+    // Restart the animation: without the reflow the class goes back on in the
+    // same frame and nothing replays.
+    void this.elim.offsetWidth;
+    this.elim.classList.add("show");
+  }
+
+  /** We died. Shows who did it and what with, until the respawn clears it. */
+  killedBy(slot: number, weapon: number): void {
+    this.killedByEl.innerHTML =
+      `Killed by <b>${this.who(slot)}</b> &middot; ${weaponName(weapon)}`;
+  }
+
+  /**
+   * Death tint and countdown. `secondsLeft` null means alive: everything
+   * comes off.
+   */
+  death(secondsLeft: number | null): void {
+    if (secondsLeft === null) {
+      this.tint.classList.remove("show");
+      this.respawnEl.textContent = "";
+      this.killedByEl.innerHTML = "";
+      return;
+    }
+    this.tint.classList.add("show");
+    const s = Math.max(0, Math.ceil(secondsLeft));
+    this.respawnEl.textContent = s > 0 ? String(s) : "";
   }
 
   kill(e: HitEvent): void {
     const row = document.createElement("div");
-    const who = (s: number) => (s === this.localSlot ? "you" : `P${s + 1}`);
     const tag = (s: number) =>
-      `<span style="color:${hex(SLOT_COLORS[s % SLOT_COLORS.length])}">${who(s)}</span>`;
-    row.innerHTML = `${tag(e.shooter)} ${e.head ? "headshot" : "killed"} ${tag(e.victim)}`;
+      `<span style="color:${hex(SLOT_COLORS[s % SLOT_COLORS.length])}">${this.who(s)}</span>`;
+    row.innerHTML = `${tag(e.shooter)} ${e.head ? "headshot" : "killed"} ${tag(e.victim)}` +
+      ` <span class="w">${weaponName(e.weapon)}</span>`;
     if (e.shooter === this.localSlot || e.victim === this.localSlot) row.className = "me";
     this.feed.prepend(row);
     while (this.feed.children.length > 6) this.feed.lastElementChild?.remove();
   }
 
+  /* --------------------------------------------------------- scoreboard --- */
+
   scoreboard(players: SnapshotPlayer[], seated: Set<number>): void {
     const rows = [...players].sort((a, b) => b.k - a.k || a.d - b.d || a.s - b.s);
     const key = rows.map((p) => `${p.s}:${p.k}:${p.d}:${seated.has(p.s) ? 1 : 0}`).join(",");
-    if (key === this.boardKey) return;
-    this.boardKey = key;
-    this.board.innerHTML =
-      `<div class="row head"><span class="name">player</span><span>K</span><span>D</span></div>` +
-      rows
-        .map((p) => {
-          const cls = p.s === this.localSlot ? "me" : seated.has(p.s) ? "" : "empty";
-          const sw = `<span class="sw" style="background:${hex(SLOT_COLORS[p.s % SLOT_COLORS.length])}"></span>`;
-          const name = p.s === this.localSlot ? `P${p.s + 1} (you)` : `P${p.s + 1}`;
-          return `<div class="row ${cls}"><span class="name">${sw}${name}</span><span>${p.k}</span><span>${p.d}</span></div>`;
+    if (key !== this.boardKey) {
+      this.boardKey = key;
+      this.board.innerHTML =
+        `<div class="row head"><span class="name">player</span><span>K</span><span>D</span></div>` +
+        rows
+          .map((p) => {
+            const cls = p.s === this.localSlot ? "me" : seated.has(p.s) ? "" : "empty";
+            const sw = `<span class="sw" style="background:${hex(SLOT_COLORS[p.s % SLOT_COLORS.length])}"></span>`;
+            const name = p.s === this.localSlot ? `P${p.s + 1} (you)` : `P${p.s + 1}`;
+            return `<div class="row ${cls}"><span class="name">${sw}${name}</span><span>${p.k}</span><span>${p.d}</span></div>`;
+          })
+          .join("");
+    }
+
+    // Top three, which is also who gets paid: the pot splits 50/30/20.
+    const top = rows.slice(0, 3);
+    const tkey = top.map((p) => `${p.s}:${p.k}`).join(",");
+    if (tkey !== this.top3Key) {
+      this.top3Key = tkey;
+      this.top3El.innerHTML = top
+        .map((p, i) => {
+          const c = hex(SLOT_COLORS[p.s % SLOT_COLORS.length]);
+          return `<div><span class="n">${i + 1}</span>` +
+            `<span style="color:${c}">${this.who(p.s)}</span>` +
+            `<span class="k">${p.k}</span></div>`;
         })
         .join("");
+    }
   }
 
   clock(secondsLeft: number | null): void {
     if (secondsLeft === null) {
-      this.timer.textContent = "1:30";
+      this.timer.textContent = "3:00";
       this.timer.classList.remove("low");
       return;
     }
@@ -90,13 +186,102 @@ export class Hud {
 
   health(hp: number, alive: boolean): void {
     this.hp.textContent = alive ? String(hp) : "dead";
+    this.hp.classList.toggle("hurt", alive && hp <= MAX_HP * 0.34);
+  }
+
+  /* ------------------------------------------------------------ weapons --- */
+
+  private buildWeaponBar(): void {
+    this.weaponsEl.innerHTML = WEAPONS
+      .map((w, i) => `<div data-w="${i}"><span class="key">${i + 1}</span>${w.name.toUpperCase()}` +
+        `<span class="a">-</span></div>`)
+      .join("");
+  }
+
+  /**
+   * The weapon bar and the ammo counter.
+   *
+   * `mags` is this player's magazines as the server last reported them, so
+   * the number on screen is the number the server will fire from.
+   */
+  weapons(current: number, mag: number, reloadTicks: number): void {
+    const key = `${current}:${mag}:${reloadTicks > 0 ? 1 : 0}`;
+    if (key === this.weaponKey) return;
+    this.weaponKey = key;
+    const slots = this.weaponsEl.children;
+    for (let i = 0; i < slots.length; i++) {
+      const el = slots[i] as HTMLElement;
+      el.classList.toggle("on", i === current);
+      const a = el.querySelector(".a");
+      if (a) a.textContent = i === current ? `${mag}/${WEAPONS[i].mag}` : `${WEAPONS[i].mag}`;
+    }
+  }
+
+  ammo(current: number, mag: number, reloadTicks: number): void {
+    const spec = WEAPONS[current];
+    const key = `${current}:${mag}:${reloadTicks > 0 ? Math.ceil(reloadTicks / 6) : 0}`;
+    if (key === this.ammoKey) return;
+    this.ammoKey = key;
+    const reloading = reloadTicks > 0;
+    this.ammoEl.className = `hud${reloading ? " reloading" : mag === 0 ? " empty" : ""}`;
+    this.ammoEl.innerHTML = reloading
+      ? `<span class="wname">${spec.name.toUpperCase()}</span>` +
+        `<span class="now">RELOADING</span>`
+      : `<span class="wname">${spec.name.toUpperCase()}</span>` +
+        `<span class="now">${mag}</span><span class="mag"> / ${spec.mag}</span>`;
+  }
+
+  /* ------------------------------------------------------------- plates --- */
+
+  /** Names and health bars floating over the heads the renderer could see. */
+  showPlates(list: Plate[]): void {
+    while (this.plateEls.length < list.length) {
+      const el = document.createElement("div");
+      el.innerHTML = `<span class="nm"></span><div class="bar"><i></i></div>`;
+      this.plates.append(el);
+      this.plateEls.push(el);
+    }
+    for (let i = 0; i < this.plateEls.length; i++) {
+      const el = this.plateEls[i];
+      const p = list[i];
+      if (!p) {
+        el.style.display = "none";
+        continue;
+      }
+      el.style.display = "block";
+      el.style.left = `${Math.round(p.sx)}px`;
+      el.style.top = `${Math.round(p.sy)}px`;
+      const nm = el.querySelector(".nm") as HTMLElement;
+      nm.textContent = this.who(p.slot);
+      nm.style.color = hex(SLOT_COLORS[p.slot % SLOT_COLORS.length]);
+      const bar = el.querySelector(".bar i") as HTMLElement;
+      const frac = Math.max(0, Math.min(1, p.hp / MAX_HP));
+      bar.style.width = `${(frac * 100).toFixed(0)}%`;
+      bar.className = frac <= 0.34 ? "low" : "";
+    }
+  }
+
+  /* -------------------------------------------------------------- debug --- */
+
+  /**
+   * The ?debug=1 overlay. Frame rate, the one per cent low, draw calls and
+   * the ping the server measured, which is the set of numbers needed to say
+   * anything honest about performance on a given phone.
+   */
+  debug(lines: string[] | null): void {
+    if (!lines) {
+      this.debugEl.classList.remove("show");
+      return;
+    }
+    this.debugEl.classList.add("show");
+    this.debugEl.textContent = lines.join("\n");
   }
 
   netStats(text: string): void {
     this.net.textContent = text;
   }
 
-  stickAt(s: { ox: number; oy: number } | null): void {
+  stickAt(s: { ox: number; oy: number; x: number; y: number } | null): void {
     if (!s) {
       this.stick.style.display = "none";
       return;
@@ -104,6 +289,15 @@ export class Hud {
     this.stick.style.display = "block";
     this.stick.style.left = `${s.ox}px`;
     this.stick.style.top = `${s.oy}px`;
+    const knob = this.stick.firstElementChild as HTMLElement | null;
+    if (knob) {
+      // Clamp the knob to the ring so a long drag does not pull it outside.
+      const dx = s.x - s.ox;
+      const dy = s.y - s.oy;
+      const len = Math.hypot(dx, dy);
+      const k = len > 40 ? 40 / len : 1;
+      knob.style.transform = `translate(${(dx * k).toFixed(0)}px, ${(dy * k).toFixed(0)}px)`;
+    }
   }
 
   showOver(standings: Standing[], logHash: string, onAgain: () => void): void {
@@ -119,4 +313,9 @@ export class Hud {
     this.over.querySelector("button")!.onclick = onAgain;
     this.over.classList.add("show");
   }
+}
+
+/** Seconds a tick count represents, for the respawn countdown. */
+export function ticksToSeconds(ticks: number): number {
+  return ticks / TICK_HZ;
 }

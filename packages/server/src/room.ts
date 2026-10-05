@@ -47,6 +47,9 @@ const OVER_TARGET_TICKS = 30;
 /** Ticks of silence before a seat is considered gone. Ten seconds. */
 const TIMEOUT_TICKS = 600;
 
+/** How often each seat is pinged, for the debug overlay's ping readout. */
+const PING_EVERY = 60;
+
 export interface Seat {
   slot: number;
   wallet: string;
@@ -57,6 +60,10 @@ export interface Seat {
   close: (reason: string) => void;
   /** Set on a bot's seat. Everything below the queue ignores it. */
   bot?: true;
+  /** Outstanding ping id, when it was sent, and the last measured round trip. */
+  pingId: number;
+  pingSentAt: number;
+  rtt: number;
 }
 
 export class Room {
@@ -72,6 +79,7 @@ export class Room {
   private log: MatchLog;
   private timer: NodeJS.Timeout | null = null;
   private nextTickAt = 0;
+  private lastSnapTick = 0;
   private startedAt = 0;
   private started = false;
   private finished = false;
@@ -106,7 +114,7 @@ export class Room {
     this.startWhenSeated = startWhenSeated;
     this.fillWithBots = fillWithBots && kind === "free";
     this.log = {
-      v: 2,
+      v: 3,
       matchId,
       map: MAP_ID,
       roster,
@@ -195,6 +203,9 @@ export class Room {
       send: () => { /* nobody is listening */ },
       close: () => { /* nothing to close */ },
       bot: true,
+      pingId: 0,
+      pingSentAt: 0,
+      rtt: 0,
     };
   }
 
@@ -227,6 +238,18 @@ export class Room {
       seat.queue.push(inp);
     }
     seat.queue.sort((a, b) => a.tick - b.tick);
+  }
+
+  /**
+   * Answer to a ping. Nothing depends on it but the number on the sender's
+   * own debug overlay, so an unanswered or dishonest pong costs its own
+   * client an accurate readout and nobody else anything.
+   */
+  pong(slot: number, id: number): void {
+    const seat = this.seats[slot];
+    if (!seat || seat.pingId === 0 || id !== seat.pingId) return;
+    seat.rtt = Date.now() - seat.pingSentAt;
+    seat.pingId = 0;
   }
 
   /* ------------------------------------------------------------- loop --- */
@@ -315,6 +338,15 @@ export class Room {
     step(this.world, inputs, hits);
     this.log.ticks.push({ tick, inputs });
 
+    if (tick % PING_EVERY === 0) {
+      for (const seat of this.seats) {
+        if (!seat || seat.bot) continue;
+        seat.pingId = tick + 1;
+        seat.pingSentAt = Date.now();
+        seat.send({ t: "ping", id: seat.pingId });
+      }
+    }
+
     if (tick % SNAPSHOT_EVERY === 0 || hits.length > 0) {
       this.broadcast(hits);
     }
@@ -326,6 +358,7 @@ export class Room {
   /* -------------------------------------------------------- broadcast --- */
 
   private broadcast(hits: HitEvent[]): void {
+    const tick = this.world.tick;
     const players: SnapshotPlayer[] = this.world.players.map((p, slot) => ({
       s: slot,
       x: round3(p.x),
@@ -338,18 +371,33 @@ export class Room {
       k: p.kills,
       d: p.deaths,
       a: p.alive ? 1 : 0,
+      g: p.weapon,
+      m: p.ammo[p.weapon],
+      r: p.reloadUntil > 0 ? p.reloadUntil - tick : 0,
+      // Whether this player fired during the window this snapshot covers, so
+      // every client can show a muzzle flash and a tracer for someone else's
+      // shot and not only for the ones that hit.
+      f: tick - p.lastFireTick <= this.sinceLastSnap ? 1 : 0,
     }));
 
     for (const seat of this.seats) {
       if (!seat) continue;
       seat.send({
         t: "snap",
-        tick: this.world.tick,
+        tick,
         ack: seat.ack,
+        rtt: Math.round(seat.rtt),
         players,
         hits,
       });
     }
+    this.lastSnapTick = tick;
+  }
+
+  /** Ticks since the previous snapshot, for the fired flag above. */
+  private get sinceLastSnap(): number {
+    const d = this.world.tick - this.lastSnapTick;
+    return d < 1 ? 1 : d;
   }
 
   /* ----------------------------------------------------------- finish --- */

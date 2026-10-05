@@ -8,6 +8,7 @@ import {
   HEAD_HALF,
   HEAD_TOP,
   YAW_UNITS,
+  rayGrid,
 } from "../../shared/sim";
 import {
   AIR,
@@ -26,11 +27,36 @@ import {
   M_TRIM,
   SIGNS,
   blockAt,
+  blockIX,
+  blockIZ,
   blockMinX,
   blockMinZ,
   solidAt,
 } from "../../shared/map";
 import type { RemoteView } from "./netcode";
+
+/** Chunks a body bursts into, and how many the pool holds. */
+const CHUNKS_PER_DEATH = 26;
+const CHUNK_POOL = CHUNKS_PER_DEATH * 6;
+const CHUNK_LIFE = 1.6;
+
+/** Tracers alive at once, and how long one lasts. */
+const TRACER_POOL = 24;
+const TRACER_LIFE = 0.07;
+
+interface Chunk {
+  x: number; y: number; z: number;
+  vx: number; vy: number; vz: number;
+  rx: number; ry: number;
+  life: number;
+  colour: THREE.Color;
+}
+
+interface Tracer {
+  x0: number; y0: number; z0: number;
+  x1: number; y1: number; z1: number;
+  life: number;
+}
 
 export const SLOT_COLORS = [0xff4d3d, 0x3da5ff, 0x4fe08a, 0xffd23a, 0xc46bff, 0x2fe0d6];
 
@@ -269,11 +295,20 @@ export class Renderer {
   private visors: THREE.InstancedMesh;
   private flash: THREE.Mesh;
   private flashUntil = 0;
+  private chunks: THREE.InstancedMesh;
+  private chunkState: Chunk[] = [];
+  private tracers: THREE.LineSegments;
+  private tracerState: Tracer[] = [];
+  private tracerPos: Float32Array;
+  private muzzles: THREE.InstancedMesh;
+  private muzzleUntil: number[] = [];
+  private lastDraw = 0;
   private m = new THREE.Matrix4();
   private q = new THREE.Quaternion();
   private e = new THREE.Euler();
   private v = new THREE.Vector3();
   private one = new THREE.Vector3(1, 1, 1);
+  private scratch = new THREE.Vector3(1, 1, 1);
   private hidden = new THREE.Matrix4().makeScale(0, 0, 0);
 
   constructor(canvas: HTMLCanvasElement, private slots: number) {
@@ -322,6 +357,44 @@ export class Renderer {
       this.scene.add(mesh);
     }
 
+    // Death chunks: one instanced mesh for every body that has ever burst.
+    // Purely cosmetic, so this is the one place in the client that may use
+    // Math.random freely. Nothing here is sent anywhere or predicted.
+    this.chunks = new THREE.InstancedMesh(
+      new THREE.BoxGeometry(0.17, 0.17, 0.17),
+      new THREE.MeshLambertMaterial(),
+      CHUNK_POOL,
+    );
+    this.chunks.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.chunks.frustumCulled = false;
+    for (let i = 0; i < CHUNK_POOL; i++) this.chunks.setMatrixAt(i, this.hidden);
+    this.scene.add(this.chunks);
+
+    // Tracers: one line list with a fixed buffer, redrawn each frame.
+    this.tracerPos = new Float32Array(TRACER_POOL * 6);
+    const tg = new THREE.BufferGeometry();
+    tg.setAttribute("position", new THREE.BufferAttribute(this.tracerPos, 3));
+    tg.setDrawRange(0, 0);
+    this.tracers = new THREE.LineSegments(
+      tg, new THREE.LineBasicMaterial({ color: 0xffe9a8, transparent: true, opacity: 0.75 }),
+    );
+    this.tracers.frustumCulled = false;
+    this.scene.add(this.tracers);
+
+    // Other players' muzzle flashes, one slot each.
+    this.muzzles = new THREE.InstancedMesh(
+      new THREE.BoxGeometry(0.22, 0.22, 0.22),
+      new THREE.MeshBasicMaterial({ color: 0xffe9a8 }),
+      slots,
+    );
+    this.muzzles.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.muzzles.frustumCulled = false;
+    for (let i = 0; i < slots; i++) {
+      this.muzzles.setMatrixAt(i, this.hidden);
+      this.muzzleUntil.push(0);
+    }
+    this.scene.add(this.muzzles);
+
     // First person gun and muzzle flash, parented to the camera.
     const gun = new THREE.Mesh(
       new THREE.BoxGeometry(0.045, 0.06, 0.3),
@@ -353,9 +426,159 @@ export class Renderer {
     this.flashUntil = nowMs + 50;
   }
 
+  /** Somebody else fired: show a flash at their hands for a moment. */
+  remoteFlash(slot: number, nowMs: number): void {
+    if (slot < 0 || slot >= this.muzzleUntil.length) return;
+    this.muzzleUntil[slot] = nowMs + 60;
+  }
+
+  /**
+   * A body comes apart into blocks.
+   *
+   * The velocities are random because they are decoration: the server has
+   * already decided who died, and nothing about where a chunk lands is ever
+   * told to anyone.
+   */
+  burst(x: number, y: number, z: number, slot: number): void {
+    const colour = new THREE.Color(SLOT_COLORS[slot % SLOT_COLORS.length]);
+    for (let i = 0; i < CHUNKS_PER_DEATH; i++) {
+      if (this.chunkState.length >= CHUNK_POOL) this.chunkState.shift();
+      const up = 2.5 + Math.random() * 4.5;
+      this.chunkState.push({
+        x: x + (Math.random() - 0.5) * 0.5,
+        y: y + 0.2 + Math.random() * 1.5,
+        z: z + (Math.random() - 0.5) * 0.5,
+        vx: (Math.random() - 0.5) * 6,
+        vy: up,
+        vz: (Math.random() - 0.5) * 6,
+        rx: Math.random() * 6,
+        ry: Math.random() * 6,
+        life: CHUNK_LIFE,
+        // Carried on the chunk rather than written straight into the
+        // instance: chunks expire out of the middle of the pool, so the
+        // instance a chunk occupies changes during its life.
+        colour: colour.clone().multiplyScalar(0.7 + Math.random() * 0.5),
+      });
+    }
+  }
+
+  /** A shot's path, drawn for a few frames. */
+  tracer(
+    x0: number, y0: number, z0: number, x1: number, y1: number, z1: number,
+  ): void {
+    if (this.tracerState.length >= TRACER_POOL) this.tracerState.shift();
+    this.tracerState.push({ x0, y0, z0, x1, y1, z1, life: TRACER_LIFE });
+  }
+
+  /**
+   * Where a world point lands on screen, for the HUD's nameplates and damage
+   * numbers.
+   *
+   * `clear` is a line of sight test against the block grid, using the same
+   * ray the server uses for shots, so a nameplate behind a booth is hidden
+   * rather than floating in front of it.
+   */
+  project(x: number, y: number, z: number): {
+    sx: number; sy: number; dist: number; onScreen: boolean; clear: boolean;
+  } {
+    const cam = this.camera;
+    this.v.set(x, y, z);
+    const dx = x - cam.position.x;
+    const dy = y - cam.position.y;
+    const dz = z - cam.position.z;
+    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    this.v.project(cam);
+    const sx = (this.v.x * 0.5 + 0.5) * innerWidth;
+    const sy = (-this.v.y * 0.5 + 0.5) * innerHeight;
+    const onScreen = this.v.z < 1 && this.v.x > -1.1 && this.v.x < 1.1 &&
+      this.v.y > -1.1 && this.v.y < 1.1;
+    let clear = false;
+    if (dist > 0.001) {
+      const hit = rayGrid(
+        cam.position.x, cam.position.y, cam.position.z,
+        dx / dist, dy / dist, dz / dist, dist,
+      );
+      clear = hit >= dist;
+    }
+    return { sx, sy, dist, onScreen, clear };
+  }
+
+  /** Advance the cosmetic simulation: chunks fall, tracers fade. */
+  private advance(dt: number, nowMs: number): void {
+    for (let i = this.chunkState.length - 1; i >= 0; i--) {
+      const c = this.chunkState[i];
+      c.life -= dt;
+      if (c.life <= 0) {
+        this.chunkState.splice(i, 1);
+        continue;
+      }
+      c.vy -= 22 * dt;
+      c.x += c.vx * dt;
+      c.y += c.vy * dt;
+      c.z += c.vz * dt;
+      // Bounce off whatever they land on, losing most of the energy. The grid
+      // is right here, so a chunk resting on a booth roof is free.
+      if (c.vy < 0 && solidAt(blockIX(c.x), Math.floor(c.y), blockIZ(c.z))) {
+        c.y = Math.floor(c.y) + 1;
+        c.vy = -c.vy * 0.28;
+        c.vx *= 0.6;
+        c.vz *= 0.6;
+        if (c.vy < 0.6) c.vy = 0;
+      }
+    }
+    for (let i = 0; i < CHUNK_POOL; i++) {
+      const c = this.chunkState[i];
+      if (!c) {
+        this.chunks.setMatrixAt(i, this.hidden);
+        continue;
+      }
+      this.chunks.setColorAt(i, c.colour);
+      const spin = (CHUNK_LIFE - c.life) * 3;
+      this.e.set(c.rx + spin, c.ry + spin, 0);
+      const fade = c.life < 0.35 ? c.life / 0.35 : 1;
+      this.m.compose(
+        this.v.set(c.x, c.y, c.z),
+        this.q.setFromEuler(this.e),
+        this.scratch.set(fade, fade, fade),
+      );
+      this.chunks.setMatrixAt(i, this.m);
+    }
+    this.chunks.instanceMatrix.needsUpdate = true;
+    if (this.chunks.instanceColor) this.chunks.instanceColor.needsUpdate = true;
+
+    let n = 0;
+    for (let i = this.tracerState.length - 1; i >= 0; i--) {
+      const t = this.tracerState[i];
+      t.life -= dt;
+      if (t.life <= 0) this.tracerState.splice(i, 1);
+    }
+    for (const t of this.tracerState) {
+      this.tracerPos[n * 6] = t.x0;
+      this.tracerPos[n * 6 + 1] = t.y0;
+      this.tracerPos[n * 6 + 2] = t.z0;
+      this.tracerPos[n * 6 + 3] = t.x1;
+      this.tracerPos[n * 6 + 4] = t.y1;
+      this.tracerPos[n * 6 + 5] = t.z1;
+      n++;
+    }
+    this.tracers.geometry.setDrawRange(0, n * 2);
+    (this.tracers.geometry.getAttribute("position") as THREE.BufferAttribute).needsUpdate = true;
+    this.tracers.visible = n > 0;
+
+    for (let i = 0; i < this.muzzleUntil.length; i++) {
+      if (nowMs >= this.muzzleUntil[i]) this.muzzles.setMatrixAt(i, this.hidden);
+    }
+    this.muzzles.instanceMatrix.needsUpdate = true;
+  }
+
   /** Draw calls this frame, for the HUD's budget readout. */
   get drawCalls(): number {
     return this.renderer.info.render.calls;
+  }
+
+  /** Triangles submitted this frame. The other half of the budget. */
+  get triangles(): number {
+    return this.renderer.info.render.triangles;
   }
 
   draw(
@@ -367,6 +590,9 @@ export class Renderer {
     this.camera.position.set(eye.x, eye.y + EYE_HEIGHT, eye.z);
     this.camera.rotation.set(eye.pitch, eye.yaw, 0);
     this.flash.visible = nowMs < this.flashUntil;
+
+    const dt = this.lastDraw === 0 ? 0 : Math.min(0.1, (nowMs - this.lastDraw) / 1000);
+    this.lastDraw = nowMs;
 
     for (let i = 0; i < this.slots; i++) {
       const r = remotes.get(i);
@@ -385,11 +611,25 @@ export class Renderer {
       this.e.set(0, (r.yaw / YAW_UNITS) * Math.PI * 2, 0);
       this.m.compose(this.v.set(r.x, r.y, r.z), this.q.setFromEuler(this.e), this.one);
       this.visors.setMatrixAt(i, this.m);
+
+      // Muzzle flash in front of the chest, on the side their gun is on.
+      if (nowMs < this.muzzleUntil[i]) {
+        const yaw = (r.yaw / YAW_UNITS) * Math.PI * 2;
+        const fx = -Math.sin(yaw);
+        const fz = -Math.cos(yaw);
+        this.m.makeTranslation(
+          r.x + fx * 0.55 - fz * 0.2,
+          r.y + 1.25,
+          r.z + fz * 0.55 + fx * 0.2,
+        );
+        this.muzzles.setMatrixAt(i, this.m);
+      }
     }
     this.bodies.instanceMatrix.needsUpdate = true;
     this.heads.instanceMatrix.needsUpdate = true;
     this.visors.instanceMatrix.needsUpdate = true;
 
+    this.advance(dt, nowMs);
     this.renderer.render(this.scene, this.camera);
   }
 }

@@ -1,11 +1,11 @@
 import {
   EYE_HEIGHT,
-  WEAPON_RANGE,
   YAW_UNITS,
   rayGrid,
   type Input,
   type WorldState,
 } from "../../shared/sim";
+import { WEAPONS, WEAPON_COUNT } from "../../shared/weapons";
 import { quantAxis, quantPitch, quantYaw } from "../../shared/protocol";
 
 /**
@@ -57,6 +57,9 @@ const TURN_RATE = 240;
 /** Ticks of being stuck before picking a new heading and hopping. */
 const STUCK_TICKS = 20;
 
+/** Ticks between a bot changing its mind about which weapon to carry. */
+const SWAP_EVERY = 20 * 60;
+
 export class Bot {
   private seq = 0;
   private rng: number;
@@ -70,11 +73,17 @@ export class Bot {
   private stuck = 0;
   private lastX = 0;
   private lastZ = 0;
+  private weapon: number;
+  private swapAt = SWAP_EVERY;
+  private lastPull = -999;
 
   constructor(readonly slot: number, seed: number) {
     this.rng = (seed * 2654435761) >>> 0;
     this.yaw = this.rand(YAW_UNITS);
     this.aim = this.yaw;
+    // One of each to start with, so a dev room shows all three weapons and
+    // all three firing patterns without anyone having to pick them.
+    this.weapon = slot % WEAPON_COUNT;
   }
 
   private rand(n: number): number {
@@ -98,7 +107,7 @@ export class Bot {
     if (!me.alive) {
       this.target = -1;
       this.fireAt = Number.POSITIVE_INFINITY;
-      return this.input(tick, 0, 0, false, false);
+      return this.input(tick, 0, 0, false, false, false, 0);
     }
 
     // Wander: hold a heading for a while, then pick another.
@@ -158,9 +167,40 @@ export class Bot {
     // Reaction delay served, and actually pointing at them.
     const onTarget = this.target >= 0 && tick >= this.fireAt &&
       off <= AIM_TOLERANCE && off >= -AIM_TOLERANCE;
+
+    // Change weapon now and then, so the swap path gets exercised in a dev
+    // room and in the match log rather than only in a test.
+    let swapTo = 0;
+    if (tick >= this.swapAt) {
+      this.swapAt = tick + SWAP_EVERY;
+      this.weapon = this.rand(WEAPON_COUNT);
+      swapTo = this.weapon + 1;
+    }
+
+    const spec = WEAPONS[me.weapon];
+    const mag = me.ammo[me.weapon];
+    // Reload when dry, or while there is nothing to shoot at and the
+    // magazine is low. The sim reloads a dry weapon on its own, but asking
+    // first means a bot is not caught mid reload the moment it sees someone.
+    const reload = me.reloadUntil === 0 &&
+      (mag === 0 || (this.target < 0 && mag < spec.mag / 3));
+
+    // A semi automatic weapon has to have its trigger released between
+    // shots, so pull for a single tick and wait out the interval. An
+    // automatic one just holds.
+    let fire = false;
+    if (onTarget && mag > 0) {
+      if (spec.auto) {
+        fire = true;
+      } else if (tick - this.lastPull >= spec.fireInterval + 2) {
+        fire = true;
+        this.lastPull = tick;
+      }
+    }
+
     // Walk forward unless we are shooting at someone close by.
     const forward = this.target >= 0 && this.closeTo(world, this.target) ? 0 : 1;
-    return this.input(tick, this.strafe, forward, onTarget, jump);
+    return this.input(tick, this.strafe, forward, fire, jump, reload, swapTo);
   }
 
   private closeTo(world: WorldState, slot: number): boolean {
@@ -183,7 +223,10 @@ export class Bot {
     const oy = me.y + EYE_HEIGHT;
     const oz = me.z;
     let best = -1;
-    let bestDist = WEAPON_RANGE;
+    // Only as far as the weapon in hand can actually shoot, so a bot holding
+    // a shotgun closes the distance instead of standing in the open
+    // pretending it can hit something thirty blocks away.
+    let bestDist = WEAPONS[me.weapon].range;
 
     for (let i = 0; i < world.players.length; i++) {
       if (i === this.slot) continue;
@@ -204,6 +247,7 @@ export class Bot {
 
   private input(
     tick: number, strafe: number, forward: number, fire: boolean, jump: boolean,
+    reload: boolean, weapon: number,
   ): Input {
     return {
       tick: this.seq++,
@@ -216,6 +260,8 @@ export class Bot {
       pitch: quantPitch(this.pitch),
       fire: fire ? 1 : 0,
       jump: jump ? 1 : 0,
+      reload: reload ? 1 : 0,
+      weapon,
     };
   }
 }

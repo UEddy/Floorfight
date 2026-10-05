@@ -6,6 +6,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -22,6 +23,8 @@ import {
   LEVEL_STAGE,
   MAX_HP,
   PLAYER_HEIGHT,
+  RESPAWN_TICKS,
+  ROUND_TICKS,
   SPAWNS,
   TICK_HZ,
   YAW_UNITS,
@@ -37,6 +40,11 @@ import {
   type HitEvent,
   type Input,
 } from "../../shared/sim";
+import {
+  SWITCH_TICKS, WEAPONS, WEAPON_COUNT, W_PISTOL, W_RIFLE, W_SHOTGUN, spreadHash,
+} from "../../shared/weapons";
+import { GRID, MAP_ID, MAP_NAME } from "../../shared/map";
+import { sha256Hex } from "../../shared/sha256";
 import { REPLAY_SEED, REPLAY_TICKS, runMatch } from "./replay";
 import { Room } from "../src/room";
 import type { RosterEntry } from "../../shared/protocol";
@@ -47,17 +55,26 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 function input(over: Partial<Input> = {}): Input {
   return {
-    tick: 0, view: 0, moveX: 0, moveY: 0, yaw: 0, pitch: 0, fire: 0, jump: 0, ...over,
+    tick: 0, view: 0, moveX: 0, moveY: 0, yaw: 0, pitch: 0,
+    fire: 0, jump: 0, reload: 0, weapon: 0, ...over,
   };
 }
 
-/** Advance one player for n ticks with a fixed input. */
-function run(world: ReturnType<typeof createWorld>, slot: number, inp: Input, n: number): void {
-  const hits: HitEvent[] = [];
+/**
+ * Advance one player for n ticks with a fixed input.
+ *
+ * `into` collects the hit events. Pass it whenever the test cares about them:
+ * without it they go into a throwaway array and a test that fires inside this
+ * helper will see no hits and believe nothing happened.
+ */
+function run(
+  world: ReturnType<typeof createWorld>, slot: number, inp: Input, n: number,
+  into: HitEvent[] = [],
+): void {
   for (let i = 0; i < n; i++) {
     const inputs: (Input | null)[] = new Array(world.players.length).fill(null);
-    inputs[slot] = { ...inp, tick: world.tick };
-    step(world, inputs, hits);
+    inputs[slot] = { ...inp, tick: world.tick, view: world.tick };
+    step(world, inputs, into);
   }
 }
 
@@ -306,9 +323,9 @@ test("walls and floors block a shot, and an open line does not", () => {
   const toward = YAW_UNITS / 2;
   run(w, 0, input({ yaw: toward }), 1); // record a history frame
   const before = victim.hp;
-  run(w, 0, input({ yaw: toward, fire: 1 }), 1);
+  run(w, 0, input({ yaw: toward, fire: 1 }), 1, hits);
   assert.ok(victim.hp < before, "expected a hit down an open aisle");
-  assert.ok(hits.length >= 0);
+  assert.ok(hits.length > 0, "and a hit event for it");
 
   // Now put a booth between them. Shooting through it must not land.
   const w2 = createWorld(2);
@@ -323,7 +340,7 @@ test("walls and floors block a shot, and an open line does not", () => {
   v2.y = LEVEL_GROUND;
   const hp2 = v2.hp;
   run(w2, 0, input({ yaw: YAW_UNITS / 4 }), 1);
-  run(w2, 0, input({ yaw: YAW_UNITS / 4, fire: 1 }), 20);
+  run(w2, 0, input({ yaw: YAW_UNITS / 4, fire: 1 }), 20, hits);
   assert.equal(v2.hp, hp2, "a shot across the hall should be stopped by cover");
 });
 
@@ -348,7 +365,7 @@ test("a shot at someone on the floor below is stopped by the gallery deck", () =
   assert.equal(down.hp, hp, "the deck should have stopped it");
 });
 
-test("a head shot kills outright and a body shot does not", () => {
+test("a head shot with the pistol kills outright, a body shot does not", () => {
   const w = createWorld(2);
   const s = w.players[0];
   const v = w.players[1];
@@ -360,14 +377,19 @@ test("a head shot kills outright and a body shot does not", () => {
   v.y = LEVEL_STAGE;
 
   const hits: HitEvent[] = [];
-  const inputs: (Input | null)[] = [input({ yaw: YAW_UNITS / 2 }), null];
-  step(w, inputs, hits);
+  // Switch to the pistol and wait out the swap.
+  run(w, 0, input({ weapon: W_PISTOL + 1 }), SWITCH_TICKS + 1);
+  const toward = YAW_UNITS / 2;
+  run(w, 0, input({ yaw: toward }), 1);
+  step(w, [{ ...input({ yaw: toward, fire: 1 }), tick: w.tick, view: w.tick }], hits);
+
   // Eyes are at head height and both players stand on the same surface, so a
   // level shot is a head shot.
-  step(w, [input({ tick: 1, view: 1, yaw: YAW_UNITS / 2, fire: 1 }), null], hits);
   assert.equal(hits.length, 1);
   assert.equal(hits[0].head, true);
   assert.equal(hits[0].lethal, true);
+  assert.equal(hits[0].weapon, W_PISTOL);
+  assert.equal(hits[0].damage, WEAPONS[W_PISTOL].headDamage);
   assert.equal(v.hp, 0);
   assert.equal(v.alive, false);
   assert.equal(s.kills, 1);
@@ -400,10 +422,26 @@ test("every spawn is standable, spread over the levels, and under cover", () => 
   }
 });
 
+/**
+ * The sightline budget, in blocks.
+ *
+ * The design target is twenty. The limit is twenty two because the galleries
+ * are deliberately the long sightline level: they are a thin walkway with a
+ * balustrade you can shoot over, no cover to speak of, and the longest lines
+ * in the building run along them and across the stage from them. That is what
+ * they are for. Anyone standing there trades cover for a view, and the eleven
+ * lines in the hall that exceed twenty are all theirs.
+ *
+ * The floor, the stage and the roof route all come in well under twenty. If a
+ * map edit pushes the worst line past this, the fix is geometry, not a bigger
+ * number here.
+ */
+const SIGHTLINE_LIMIT = 22;
+
 test("no open sightline runs much past twenty blocks", () => {
-  // The design rule for The Hall. Measured from every cell a player can
-  // actually stand in and reach, in 32 horizontal directions at eye height.
-  // Unreachable perches are excluded because nobody can shoot from one.
+  // Measured from every cell a player can actually stand in and reach, in 32
+  // horizontal directions at eye height. Unreachable perches are excluded
+  // because nobody can shoot from one.
   const seen = reachable(SPAWNS);
 
   const dirs: [number, number][] = [];
@@ -423,7 +461,10 @@ test("no open sightline runs much past twenty blocks", () => {
       if (d > worst) { worst = d; where = `(${ix},${iy},${iz})`; }
     }
   }
-  assert.ok(worst <= 22, `longest sightline is ${worst.toFixed(1)} blocks from ${where}`);
+  assert.ok(
+    worst <= SIGHTLINE_LIMIT,
+    `longest sightline is ${worst.toFixed(1)} blocks from ${where}`,
+  );
 });
 
 test("every level and the roof route are reachable on foot from the floor", () => {
@@ -445,6 +486,274 @@ test("every level and the roof route are reachable on foot from the floor", () =
     const k = cellKey(Math.floor(s.x + GRID_X / 2), s.y, Math.floor(s.z + GRID_Z / 2));
     assert.ok(reach.has(k), `spawn at ${s.x},${s.y},${s.z} is cut off from the floor`);
   }
+});
+
+/* ------------------------------------------------------------ map id --- */
+
+test("the map id is the sha256 of the grid bytes", () => {
+  // Checked against node:crypto rather than against itself, because the hash
+  // in shared/ is hand written: it has to run in a WebView where there is no
+  // node:crypto and WebCrypto is asynchronous.
+  const expected = createHash("sha256").update(GRID).digest("hex");
+  assert.equal(MAP_ID, expected);
+  assert.equal(MAP_ID, sha256Hex(GRID));
+  assert.equal(MAP_ID.length, 64);
+  assert.equal(MAP_NAME, "The Hall");
+});
+
+test("changing one block changes the map id", () => {
+  for (const at of [0, 1, GRID.length >> 1, GRID.length - 1]) {
+    const edited = Uint8Array.from(GRID);
+    // Flip the cell to something else: air if it was solid, brick if it was
+    // air. Either way one block of the hall is different.
+    edited[at] = edited[at] === 0 ? 2 : 0;
+    assert.notEqual(sha256Hex(edited), MAP_ID, `editing cell ${at} did not move the id`);
+  }
+  // And an untouched copy still hashes to the same thing, so the test above
+  // is detecting the edit rather than the copy.
+  assert.equal(sha256Hex(Uint8Array.from(GRID)), MAP_ID);
+});
+
+/* ------------------------------------------------------------ weapons --- */
+
+test("every weapon has a coherent spec", () => {
+  assert.equal(WEAPONS.length, WEAPON_COUNT);
+  WEAPONS.forEach((spec, i) => {
+    assert.equal(spec.id, i);
+    assert.ok(spec.mag > 0 && spec.reloadTicks > 0 && spec.fireInterval > 0);
+    assert.ok(spec.damage > 0 && spec.pellets >= 1 && spec.range > 0);
+    assert.equal(spec.headDamage, Math.round(spec.damage * spec.headMult));
+    assert.ok(spec.headDamage > spec.damage, "a head shot should hurt more");
+  });
+  assert.equal(WEAPONS[W_RIFLE].auto, true);
+  assert.equal(WEAPONS[W_PISTOL].auto, false);
+  assert.equal(WEAPONS[W_SHOTGUN].pellets, 8);
+  // The pistol is the only one that kills with a single head shot.
+  assert.ok(WEAPONS[W_PISTOL].headDamage >= MAX_HP);
+  assert.ok(WEAPONS[W_RIFLE].headDamage < MAX_HP);
+});
+
+test("spread comes from a hash of tick, slot and pellet, not from chance", () => {
+  // Same inputs, same number, every time and in any order.
+  assert.equal(spreadHash(1234, 3, 5), spreadHash(1234, 3, 5));
+  const seen = new Set<number>();
+  for (let t = 0; t < 40; t++) {
+    for (let slot = 0; slot < 6; slot++) {
+      for (let pel = 0; pel < 8; pel++) seen.add(spreadHash(t, slot, pel));
+    }
+  }
+  // 1920 draws from a 32 bit space: a generator that ignored one of its three
+  // arguments would collide heavily here.
+  assert.ok(seen.size > 1900, `expected distinct values, got ${seen.size}`);
+  for (const h of seen) assert.ok(h >= 0 && h <= 0xffffffff);
+});
+
+/** Put two players nose to nose in the open pocket on the stage. */
+function duel(): ReturnType<typeof createWorld> {
+  const w = createWorld(2);
+  const s = w.players[0];
+  const v = w.players[1];
+  s.x = cellCentreX(22);
+  s.z = cellCentreZ(10);
+  s.y = LEVEL_STAGE;
+  v.x = cellCentreX(22);
+  v.z = cellCentreZ(12);
+  v.y = LEVEL_STAGE;
+  return w;
+}
+
+const FACING = YAW_UNITS / 2;
+
+test("the rifle fires on a held trigger at its own interval", () => {
+  const w = duel();
+  const hits: HitEvent[] = [];
+  const spec = WEAPONS[W_RIFLE];
+  const p = w.players[0];
+  run(w, 0, input({ yaw: FACING }), 1);
+  // Counted in rounds spent rather than hits landed: two players nose to
+  // nose is a head shot every time and the victim dies after three.
+  for (let i = 0; i < spec.fireInterval * 5; i++) {
+    step(w, [{ ...input({ yaw: FACING, fire: 1 }), tick: w.tick, view: w.tick }], hits);
+  }
+  const fired = spec.mag - p.ammo[W_RIFLE];
+  assert.equal(fired, 5, `a held trigger should fire at its interval, fired ${fired}`);
+  assert.ok(hits.length >= 3);
+  assert.equal(hits[0].weapon, W_RIFLE);
+  assert.ok(hits[0].damage > 0);
+});
+
+test("the pistol needs the trigger released between shots", () => {
+  const w = duel();
+  const hits: HitEvent[] = [];
+  const spec = WEAPONS[W_PISTOL];
+  const p = w.players[0];
+  run(w, 0, input({ weapon: W_PISTOL + 1 }), SWITCH_TICKS + 1);
+  // Hold it down for a long time: exactly one round leaves the magazine.
+  for (let i = 0; i < 120; i++) {
+    step(w, [{ ...input({ yaw: FACING, fire: 1 }), tick: w.tick, view: w.tick }], hits);
+  }
+  assert.equal(spec.mag - p.ammo[W_PISTOL], 1, "a held semi automatic trigger fires once");
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].lethal, true, "and a pistol head shot should be lethal");
+
+  // Release, wait out the interval, pull again: a second round goes.
+  run(w, 0, input({ yaw: FACING }), spec.fireInterval + 1);
+  step(w, [{ ...input({ yaw: FACING, fire: 1 }), tick: w.tick, view: w.tick }], hits);
+  assert.equal(spec.mag - p.ammo[W_PISTOL], 2);
+});
+
+test("a shotgun blast is one hit event with its pellets summed", () => {
+  const w = duel();
+  const hits: HitEvent[] = [];
+  const spec = WEAPONS[W_SHOTGUN];
+  run(w, 0, input({ weapon: W_SHOTGUN + 1 }), SWITCH_TICKS + 1);
+  run(w, 0, input({ yaw: FACING }), 1);
+  step(w, [{ ...input({ yaw: FACING, fire: 1 }), tick: w.tick, view: w.tick }], hits);
+
+  assert.equal(hits.length, 1, "pellets on one victim are one event");
+  assert.equal(hits[0].weapon, W_SHOTGUN);
+  // Two blocks apart, so most of the pattern lands but not necessarily all.
+  assert.ok(hits[0].damage >= spec.damage * 3, `only ${hits[0].damage} damage at point blank`);
+  assert.ok(hits[0].damage <= spec.headDamage * spec.pellets);
+  assert.equal(w.players[0].ammo[W_SHOTGUN], spec.mag - 1);
+});
+
+/**
+ * Find a standing spot with a clear horizontal run of between `min` and `max`
+ * blocks along +z, which is the direction a yaw of half a turn looks.
+ *
+ * Searched rather than written down because the geometry moves: the map's
+ * whole point is that long open lines are rare, so the test has to go and
+ * find the ones that exist instead of assuming a corridor is still there.
+ */
+function clearRun(min: number, max: number): { ix: number; iy: number; iz: number } | null {
+  for (let iy = 1; iy < GRID_Y - 2; iy++) {
+    for (let iz = 1; iz < GRID_Z - 1; iz++) {
+      for (let ix = 1; ix < GRID_X - 1; ix++) {
+        if (!solidAt(ix, iy - 1, iz) || solidAt(ix, iy, iz) || solidAt(ix, iy + 1, iz)) continue;
+        const d = rayGrid(cellCentreX(ix), iy + EYE_HEIGHT, cellCentreZ(iz), 0, 0, 1, 70);
+        if (d >= min && d <= max) return { ix, iy, iz };
+      }
+    }
+  }
+  return null;
+}
+
+test("the shotgun stops at its range, and works inside it", () => {
+  const spec = WEAPONS[W_SHOTGUN];
+  // A line longer than the shotgun reaches, which exists in the galleries.
+  const spot = clearRun(spec.range + 3, 30);
+  assert.ok(spot, `no clear run of ${spec.range + 3} blocks to test with`);
+
+  const place = (gap: number) => {
+    const w = createWorld(2);
+    for (const p of w.players) {
+      p.x = cellCentreX(spot!.ix);
+      p.y = spot!.iy;
+      p.z = cellCentreZ(spot!.iz);
+      p.vy = 0;
+    }
+    w.players[1].z = cellCentreZ(spot!.iz) + gap;
+    const hits: HitEvent[] = [];
+    run(w, 0, input({ weapon: W_SHOTGUN + 1 }), SWITCH_TICKS + 1);
+    run(w, 0, input({ yaw: FACING }), 1);
+    for (let i = 0; i < spec.fireInterval * 3; i++) {
+      step(w, [{ ...input({ yaw: FACING, fire: 1 }), tick: w.tick, view: w.tick }], hits);
+      // Semi automatic: let go between pulls.
+      step(w, [{ ...input({ yaw: FACING }), tick: w.tick, view: w.tick }], hits);
+    }
+    return hits;
+  };
+
+  assert.ok(place(4).length > 0, "a shotgun has to work at four blocks");
+  assert.equal(place(spec.range + 2).length, 0, "and must not reach past its range");
+});
+
+test("a magazine runs out, reloads, and refills", () => {
+  const w = createWorld(1);
+  const p = w.players[0];
+  const spec = WEAPONS[W_RIFLE];
+  const hits: HitEvent[] = [];
+
+  // Empty the magazine into the air.
+  for (let i = 0; i < spec.mag * spec.fireInterval; i++) {
+    step(w, [{ ...input({ fire: 1, pitch: 20000 }), tick: w.tick, view: w.tick }], hits);
+  }
+  assert.equal(p.ammo[W_RIFLE], 0, "the magazine should be empty");
+  // Firing dry starts a reload on its own.
+  step(w, [{ ...input({ fire: 1 }), tick: w.tick, view: w.tick }], hits);
+  assert.ok(p.reloadUntil > w.tick, "a dry trigger should start a reload");
+
+  run(w, 0, input(), spec.reloadTicks + 2);
+  assert.equal(p.ammo[W_RIFLE], spec.mag, "the reload should have filled it");
+  assert.equal(p.reloadUntil, 0);
+});
+
+test("a reload request is refused while already reloading or already full", () => {
+  const w = createWorld(1);
+  const p = w.players[0];
+  const hits: HitEvent[] = [];
+  step(w, [{ ...input({ reload: 1 }), tick: 0, view: 0 }], hits);
+  assert.equal(p.reloadUntil, 0, "a full magazine needs no reload");
+
+  // Fire one round, then reload, then ask again mid reload: the first one
+  // stands rather than being restarted every tick the button is held.
+  step(w, [{ ...input({ fire: 1 }), tick: w.tick, view: w.tick }], hits);
+  step(w, [{ ...input({ reload: 1 }), tick: w.tick, view: w.tick }], hits);
+  const due = p.reloadUntil;
+  assert.ok(due > w.tick);
+  run(w, 0, input({ reload: 1 }), 5);
+  assert.equal(p.reloadUntil, due, "a held reload button must not extend the reload");
+});
+
+test("firing is refused during a weapon swap, and a swap cancels a reload", () => {
+  const w = createWorld(2);
+  const p = w.players[0];
+  const hits: HitEvent[] = [];
+  p.x = cellCentreX(22);
+  p.z = cellCentreZ(10);
+  p.y = LEVEL_STAGE;
+  w.players[1].x = cellCentreX(22);
+  w.players[1].z = cellCentreZ(12);
+  w.players[1].y = LEVEL_STAGE;
+
+  // Ask for the shotgun and pull the trigger immediately.
+  step(w, [{ ...input({ weapon: W_SHOTGUN + 1, yaw: FACING, fire: 1 }), tick: 0, view: 0 }], hits);
+  assert.equal(p.weapon, W_SHOTGUN);
+  assert.equal(hits.length, 0, "the swap has to finish first");
+  run(w, 0, input({ yaw: FACING, fire: 1 }), SWITCH_TICKS - 2, hits);
+  assert.equal(hits.length, 0, `fired ${hits.length} times during the swap`);
+  // The shotgun is semi automatic, so a trigger that was already held when
+  // the swap finished stays dead until it is released. Let go, then pull.
+  run(w, 0, input({ yaw: FACING }), 2, hits);
+  run(w, 0, input({ yaw: FACING, fire: 1 }), 2, hits);
+  assert.ok(hits.length > 0, "and then it fires");
+
+  // A reload interrupted by a swap does not finish.
+  const w2 = createWorld(1);
+  const q = w2.players[0];
+  step(w2, [{ ...input({ fire: 1 }), tick: 0, view: 0 }], hits);
+  step(w2, [{ ...input({ reload: 1 }), tick: 1, view: 1 }], hits);
+  assert.ok(q.reloadUntil > 0);
+  step(w2, [{ ...input({ weapon: W_PISTOL + 1 }), tick: 2, view: 2 }], hits);
+  assert.equal(q.reloadUntil, 0, "swapping should abandon the reload");
+  assert.equal(q.ammo[W_RIFLE], WEAPONS[W_RIFLE].mag - 1, "and not refill it");
+});
+
+test("a hostile weapon index is ignored", () => {
+  const w = createWorld(1);
+  const p = w.players[0];
+  const hits: HitEvent[] = [];
+  for (const bad of [-5, 0.5, 99, WEAPON_COUNT + 1, 1e9]) {
+    step(w, [{ ...input({ weapon: bad }), tick: w.tick, view: w.tick }], hits);
+    assert.ok(p.weapon >= 0 && p.weapon < WEAPON_COUNT, `weapon became ${p.weapon}`);
+  }
+  assert.equal(p.weapon, W_RIFLE, "nothing in that list should have changed the weapon");
+});
+
+test("the round is three minutes and respawning takes three seconds", () => {
+  assert.equal(ROUND_TICKS, 180 * TICK_HZ);
+  assert.equal(RESPAWN_TICKS, 3 * TICK_HZ);
 });
 
 /* -------------------------------------------------------------- rooms --- */
@@ -492,7 +801,7 @@ test("bot inputs reach the match log through the player input path", () => {
   const sample = log.ticks[100].inputs.find((i) => i !== null)!;
   assert.deepEqual(
     Object.keys(sample).sort(),
-    ["fire", "jump", "moveX", "moveY", "pitch", "tick", "view", "yaw"],
+    ["fire", "jump", "moveX", "moveY", "pitch", "reload", "tick", "view", "weapon", "yaw"],
   );
   assert.equal(finished, null);
 });

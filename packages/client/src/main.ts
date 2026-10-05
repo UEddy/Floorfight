@@ -1,4 +1,20 @@
-import { FIRE_COOLDOWN, PITCH_LIMIT, ROUND_TICKS, TICK_HZ, TICK_MS, createWorld, yawToRadians, type Input } from "../../shared/sim";
+import {
+  EYE_HEIGHT,
+  HEAD_TOP,
+  PITCH_LIMIT,
+  RESPAWN_TICKS,
+  ROUND_TICKS,
+  TICK_HZ,
+  TICK_MS,
+  createWorld,
+  cosU,
+  rayGrid,
+  sinU,
+  yawToRadians,
+  type HitEvent,
+  type Input,
+} from "../../shared/sim";
+import { WEAPONS } from "../../shared/weapons";
 import { quantAxis, quantPitch, quantYaw, type SnapshotPlayer } from "../../shared/protocol";
 import { DEV_MATCH_ID } from "../../shared/dev";
 import { devKeypair } from "./keys";
@@ -6,16 +22,19 @@ import { Net } from "./net";
 import { BATCH_TICKS, Interpolator, Predictor, type RemoteView } from "./netcode";
 import { Controls } from "./input";
 import { Renderer } from "./render";
-import { Hud } from "./hud";
+import { Hud, type Plate } from "./hud";
+import { Sfx } from "./audio";
 
 /*
  * URL parameters:
  *   seat    dev seat 0..5, picks which dev keypair signs the join
+ *   debug   1 shows the performance overlay: fps, 1% low, draw calls, ping
  *   server  dev builds only: WebSocket URL, defaults to port 8080 on the
  *           page's host. Production always uses wss://<page host>/ws
  */
 const params = new URLSearchParams(location.search);
 const seat = Number(params.get("seat") ?? "0");
+const DEBUG = params.get("debug") === "1";
 const serverUrl = import.meta.env.DEV
   ? params.get("server") ?? `ws://${location.hostname || "localhost"}:8080`
   : // Production is always the page's own origin, behind Caddy's TLS. There is
@@ -24,7 +43,15 @@ const serverUrl = import.meta.env.DEV
     `wss://${location.host}/ws`;
 
 const canvas = document.getElementById("view") as HTMLCanvasElement;
-const controls = new Controls(canvas, document.getElementById("fire")!, document.getElementById("jump")!);
+const sfx = new Sfx();
+const controls = new Controls(
+  canvas,
+  document.getElementById("fire")!,
+  document.getElementById("jump")!,
+  document.getElementById("reload")!,
+  document.getElementById("swap")!,
+  () => sfx.start(),
+);
 const hud = new Hud(seat);
 
 type Phase = "connecting" | "waiting" | "playing" | "over" | "gone";
@@ -39,10 +66,20 @@ const remotes = new Map<number, RemoteView>();
 let seq = 0;
 const sent: Input[] = [];
 let lastTickAt = 0;
-let lastFireSeq = -FIRE_COOLDOWN;
+let lastFireSeq = -999;
+let lastDrySeq = -999;
 let lastSnap: { tick: number; players: SnapshotPlayer[] } | null = null;
 let firstSnap: SnapshotPlayer[] | null = null;
 const active = new Set<number>();
+
+/** Weapon state as the server last reported it. The HUD shows only this. */
+let myWeapon = 0;
+let myMag = WEAPONS[0].mag;
+let myReload = 0;
+let rtt = 0;
+
+/** Tick we were killed on, for the respawn countdown, or null if alive. */
+let deathTick: number | null = null;
 
 /**
  * Remote players the server has killed but the interpolation buffer, 100 ms
@@ -59,6 +96,36 @@ const stats = {
   hitsOn: {} as Record<number, number>, lastHitAt: 0,
 };
 let lastFrame = performance.now();
+
+/* ------------------------------------------------------- frame timing --- */
+
+/**
+ * Frame times, for the debug overlay.
+ *
+ * `fps` is frames in the last second. The one per cent low is the mean of the
+ * slowest one per cent of the last thousand frames, expressed as a frame
+ * rate: it is the number that says whether the game stutters, which an
+ * average frame rate hides completely.
+ */
+const frameTimes: number[] = [];
+const fpsWindow: number[] = [];
+let fpsNow = 0;
+let onePercentLow = 0;
+
+function recordFrame(now: number, dtMs: number): void {
+  frameTimes.push(dtMs);
+  if (frameTimes.length > 1000) frameTimes.shift();
+  fpsWindow.push(now);
+  while (fpsWindow.length > 0 && now - fpsWindow[0] > 1000) fpsWindow.shift();
+  fpsNow = fpsWindow.length;
+  if (frameTimes.length >= 50) {
+    const slowest = [...frameTimes].sort((a, b) => b - a);
+    const n = Math.max(1, Math.round(slowest.length * 0.01));
+    let sum = 0;
+    for (let i = 0; i < n; i++) sum += slowest[i];
+    onePercentLow = 1000 / (sum / n);
+  }
+}
 
 let keys;
 try {
@@ -94,6 +161,7 @@ const net = new Net(serverUrl, DEV_MATCH_ID, keys, {
     }
     interp.push(msg.tick, msg.players, now);
     lastSnap = { tick: msg.tick, players: msg.players };
+    rtt = msg.rtt;
 
     const me = msg.players.find((p) => p.s === slot);
     if (me) {
@@ -105,30 +173,35 @@ const net = new Net(serverUrl, DEV_MATCH_ID, keys, {
       const c = Math.hypot(predictor.errX - ex, predictor.errZ - ez);
       if (c > 0.01) stats.corrections++;
       if (c > stats.maxCorrection) stats.maxCorrection = c;
+
+      // Weapon state belongs to the server. The sounds hang off its changes.
+      if (me.g !== myWeapon) {
+        sfx.swap();
+        controls.syncWeapon(me.g);
+      }
+      if (myReload === 0 && me.r > 0) sfx.reload((me.r / TICK_HZ) * 1000);
+      myWeapon = me.g;
+      myMag = me.m;
+      myReload = me.r;
+      if (me.a === 1 && deathTick !== null) {
+        deathTick = null;
+        hud.death(null);
+        sfx.respawn();
+      }
     }
 
     if (!firstSnap) firstSnap = msg.players;
     for (const p of msg.players) {
       const f = firstSnap.find((q) => q.s === p.s);
       if (f && (f.x !== p.x || f.z !== p.z || f.e !== p.e || f.y !== p.y)) active.add(p.s);
+      // Somebody else fired: flash and a tracer along the way they are
+      // looking. The server set this flag, so misses are covered too.
+      if (p.f === 1 && p.s !== slot) shotByOther(p, now);
     }
     active.add(slot);
     hud.scoreboard(msg.players, active);
 
-    for (const h of msg.hits) {
-      if (h.shooter === slot) {
-        hud.hitMarker(h);
-        stats.hits++;
-        if (h.lethal) stats.kills++;
-        stats.rewinds.push(h.rewind);
-        stats.hitsOn[h.victim] = (stats.hitsOn[h.victim] ?? 0) + 1;
-        stats.lastHitAt = performance.now();
-      }
-      if (h.lethal) {
-        hud.kill(h);
-        if (h.victim !== slot) killedAt.set(h.victim, h.tick);
-      }
-    }
+    for (const h of msg.hits) onHit(h, now);
   },
 
   onOver(msg) {
@@ -136,6 +209,7 @@ const net = new Net(serverUrl, DEV_MATCH_ID, keys, {
     document.exitPointerLock();
     hud.message("");
     hud.clock(0);
+    hud.death(null);
     hud.showOver(msg.standings, msg.logHash, () => location.reload());
     net.close();
     console.log(`[arena] round over, log hash ${msg.logHash}`, msg.standings);
@@ -153,6 +227,81 @@ const net = new Net(serverUrl, DEV_MATCH_ID, keys, {
     }
   },
 });
+
+/* ------------------------------------------------------------ feedback --- */
+
+/**
+ * One hit event from the server.
+ *
+ * Every number used here came off the wire: the damage, whether it was a head
+ * shot, which weapon it was, who died. The client draws what it was told,
+ * which is the only way a damage number can be honest.
+ */
+function onHit(h: HitEvent, now: number): void {
+  if (h.shooter === slot) {
+    hud.hitMarker(h);
+    sfx.hit(h.head);
+    stats.hits++;
+    stats.rewinds.push(h.rewind);
+    stats.hitsOn[h.victim] = (stats.hitsOn[h.victim] ?? 0) + 1;
+    stats.lastHitAt = now;
+    if (h.lethal) {
+      stats.kills++;
+      sfx.kill();
+      hud.eliminated(h.victim);
+    }
+    // Damage number over the victim, where they are being drawn right now.
+    const r = remotes.get(h.victim);
+    if (r && renderer) {
+      const p = renderer.project(r.x, r.y + HEAD_TOP + 0.1, r.z);
+      if (p.onScreen) hud.damageNumber(h.damage, h.head, p.sx, p.sy);
+    }
+  }
+
+  if (h.victim === slot) {
+    if (h.lethal) {
+      deathTick = h.tick;
+      hud.killedBy(h.shooter, h.weapon);
+      sfx.death();
+    } else {
+      sfx.hurt();
+    }
+  }
+
+  if (h.lethal) {
+    hud.kill(h);
+    if (h.victim !== slot) killedAt.set(h.victim, h.tick);
+    // The body comes apart into blocks. For our own death that happens around
+    // the camera, which is as disorienting as it ought to be.
+    if (renderer) {
+      const r = h.victim === slot ? null : remotes.get(h.victim);
+      if (r) renderer.burst(r.x, r.y, r.z, h.victim);
+      else if (predictor) {
+        renderer.burst(predictor.me.x, predictor.me.y, predictor.me.z, h.victim);
+      }
+    }
+  }
+}
+
+/** Muzzle flash, tracer and report for somebody else's shot. */
+function shotByOther(p: SnapshotPlayer, now: number): void {
+  if (!renderer) return;
+  const spec = WEAPONS[p.g] ?? WEAPONS[0];
+  const pitch = (p.p / 32767) * PITCH_LIMIT;
+  const cp = Math.cos(pitch);
+  const dx = -sinU(p.y) * cp;
+  const dy = Math.sin(pitch);
+  const dz = -cosU(p.y) * cp;
+  const oy = p.e + EYE_HEIGHT;
+  const d = rayGrid(p.x, oy, p.z, dx, dy, dz, spec.range);
+  renderer.remoteFlash(p.s, now);
+  renderer.tracer(p.x, oy - 0.25, p.z, p.x + dx * d, oy + dy * d - 0.25, p.z + dz * d);
+
+  const dist = predictor
+    ? Math.hypot(p.x - predictor.me.x, p.e - predictor.me.y, p.z - predictor.me.z)
+    : 0;
+  sfx.shot(p.g, dist);
+}
 
 /* ------------------------------------------------------------ ticking --- */
 
@@ -178,6 +327,7 @@ function tick(now: number): void {
   const intent = controls.sample();
   const alive = predictor!.me.alive;
   const wantsFire = intent.fire && alive;
+  const spec = WEAPONS[myWeapon] ?? WEAPONS[0];
 
   const inp: Input = {
     tick: seq,
@@ -188,15 +338,23 @@ function tick(now: number): void {
     pitch: quantPitch(intent.pitch),
     fire: wantsFire ? 1 : 0,
     jump: intent.jump && alive ? 1 : 0,
+    reload: intent.reload && alive ? 1 : 0,
+    weapon: intent.weapon,
   };
   predictor!.apply(inp);
 
-  // Cosmetic only. The server decides whether the shot was fired and what it
-  // hit; this just shows a flash at the same cadence as the server cooldown.
-  if (wantsFire && seq - lastFireSeq >= FIRE_COOLDOWN) {
-    lastFireSeq = seq;
-    stats.shots++;
-    renderer?.muzzleFlash(now);
+  // Cosmetic only. The server decides whether the shot happened and what it
+  // hit; this draws a flash, a tracer and a report at the cadence the server
+  // will use, from the ammo count the server last sent.
+  if (wantsFire && myReload === 0 && seq - lastFireSeq >= spec.fireInterval) {
+    if (myMag > 0) {
+      lastFireSeq = seq;
+      stats.shots++;
+      ownShot(now, spec.range);
+    } else if (seq - lastDrySeq > 20) {
+      lastDrySeq = seq;
+      sfx.dryFire();
+    }
   }
 
   sent.push(inp);
@@ -205,15 +363,42 @@ function tick(now: number): void {
   seq++;
 }
 
+/** Our own flash, tracer and report, drawn from where the camera is aiming. */
+function ownShot(now: number, range: number): void {
+  if (!renderer || !predictor) return;
+  renderer.muzzleFlash(now);
+  sfx.shot(myWeapon, 0);
+
+  const yaw = quantYaw(controls.intent.yaw);
+  const pitch = (quantPitch(controls.intent.pitch) / 32767) * PITCH_LIMIT;
+  const cp = Math.cos(pitch);
+  const dx = -sinU(yaw) * cp;
+  const dy = Math.sin(pitch);
+  const dz = -cosU(yaw) * cp;
+  const me = predictor.me;
+  const oy = me.y + EYE_HEIGHT;
+  const d = rayGrid(me.x, oy, me.z, dx, dy, dz, range);
+  // Started a little ahead of the eye so the near end is not inside the
+  // camera, and dropped to roughly the gun's height.
+  renderer.tracer(
+    me.x + dx * 0.6, oy + dy * 0.6 - 0.18, me.z + dz * 0.6,
+    me.x + dx * d, oy + dy * d, me.z + dz * d,
+  );
+}
+
 setInterval(pump, 4);
 
 /* ---------------------------------------------------------- rendering --- */
 
+const plates: Plate[] = [];
+
 function frame(): void {
   requestAnimationFrame(frame);
   const now = performance.now();
-  const dt = Math.min(0.1, (now - lastFrame) / 1000);
+  const dtMs = now - lastFrame;
+  const dt = Math.min(0.1, dtMs / 1000);
   lastFrame = now;
+  recordFrame(now, dtMs);
   pump();
 
   if (!renderer || !predictor) return;
@@ -245,17 +430,48 @@ function frame(): void {
   }
   renderer.draw(now, { x, y, z, yaw, pitch }, slot, remotes);
 
+  // Nameplates, after the draw so the camera matrices are current.
+  plates.length = 0;
+  if (lastSnap) {
+    for (const [s, r] of remotes) {
+      if (s === slot || !r.alive) continue;
+      const p = renderer.project(r.x, r.y + HEAD_TOP + 0.35, r.z);
+      if (!p.onScreen || !p.clear || p.dist > 45) continue;
+      const snap = lastSnap.players.find((q) => q.s === s);
+      plates.push({ slot: s, hp: snap?.h ?? 100, sx: p.sx, sy: p.sy });
+    }
+  }
+  hud.showPlates(plates);
+
   if (phase === "playing" && interp.ready) {
-    hud.clock((ROUND_TICKS - interp.serverTick(now)) / TICK_HZ);
+    const serverTick = interp.serverTick(now);
+    hud.clock((ROUND_TICKS - serverTick) / TICK_HZ);
     const self = lastSnap?.players.find((p) => p.s === slot);
     hud.health(self?.h ?? 100, me.alive);
-    if (!me.alive) hud.message("Respawning...");
-    else if (!controls.locked && !matchMedia("(pointer: coarse)").matches) hud.message("Click to aim");
-    else hud.message("");
+    hud.weapons(myWeapon, myMag, myReload);
+    hud.ammo(myWeapon, myMag, myReload);
+
+    if (deathTick !== null) {
+      hud.death((deathTick + RESPAWN_TICKS - serverTick) / TICK_HZ);
+      hud.message("");
+    } else if (!controls.locked && !matchMedia("(pointer: coarse)").matches) {
+      hud.message("Click to aim");
+    } else {
+      hud.message("");
+    }
+
     hud.netStats(
-      `seat ${slot}  view ${interp.viewTick(now)}  server ${Math.floor(interp.serverTick(now))}  ` +
-      `unacked ${predictor.pendingCount}  draws ${renderer.drawCalls}`,
+      `seat ${slot}  view ${interp.viewTick(now)}  server ${Math.floor(serverTick)}  ` +
+      `unacked ${predictor.pendingCount}`,
     );
+    hud.debug(DEBUG ? [
+      `fps      ${fpsNow}`,
+      `1% low   ${onePercentLow.toFixed(0)}`,
+      `draws    ${renderer.drawCalls}`,
+      `tris     ${renderer.triangles}`,
+      `ping     ${rtt} ms`,
+      `unacked  ${predictor.pendingCount}`,
+    ] : null);
   } else if (phase === "waiting") {
     hud.clock(null);
   }
@@ -266,17 +482,19 @@ requestAnimationFrame(frame);
 /* ----------------------------------------------------------- test hook --- */
 
 // Dev builds only. Lets a headless browser drive a tab the way a player would:
-// aim, move and pull the trigger. It goes through the same Controls and the
-// same input path as a real player, so it cannot do anything a player cannot.
+// aim, move, pull the trigger, reload and swap. It goes through the same
+// Controls and the same input path as a real player, so it cannot do anything
+// a player cannot.
 if (import.meta.env.DEV) {
   (window as unknown as Record<string, unknown>).arena = {
-    aim(yaw: number, pitch: number) {
-      controls.intent.yaw = yaw;
-      controls.intent.pitch = pitch;
+    aim(yawRad: number, pitchRad: number) {
+      controls.intent.yaw = yawRad;
+      controls.intent.pitch = pitchRad;
     },
-    move(x: number, y: number) { controls.botMove = { x, y }; },
+    move(mx: number, my: number) { controls.botMove = { x: mx, y: my }; },
     fire(on: boolean) { controls.botFire = on; },
     jump(on: boolean) { controls.botJump = on; },
+    weapon(n: number) { controls.cycle(n - 1 - myWeapon); },
     peek() {
       return {
         phase,
@@ -286,8 +504,14 @@ if (import.meta.env.DEV) {
             vy: predictor.me.vy, alive: predictor.me.alive,
           }
           : null,
+        weapon: myWeapon,
+        mag: myMag,
+        reload: myReload,
         remotes: Object.fromEntries(remotes),
         drawCalls: renderer?.drawCalls ?? 0,
+        fps: fpsNow,
+        onePercentLow,
+        ping: rtt,
         stats,
       };
     },
@@ -307,6 +531,7 @@ if (import.meta.env.DEV) {
         board: document.getElementById("board")?.innerText,
         feed: document.getElementById("feed")?.innerText,
         timer: document.getElementById("timer")?.innerText,
+        ammo: document.getElementById("ammo")?.innerText,
         over: document.getElementById("over")?.classList.contains("show")
           ? document.querySelector("#over .card")?.textContent
           : null,
