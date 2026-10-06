@@ -19,7 +19,7 @@ export const TILE = 16;
 const CELL = 32;
 const PAD = (CELL - TILE) / 2;
 const COLS = 8;
-const ROWS = 6;
+const ROWS = 7;
 export const ATLAS_W = CELL * COLS;
 export const ATLAS_H = CELL * ROWS;
 
@@ -35,7 +35,8 @@ export const T = {
   GLASS: 28, SKIN: 29, CLOTH: 30, GUNMETAL: 31,
   GUNWOOD: 32, ACCENT: 33, POLYMER: 34, BOOT: 35,
   HAIR: 36, FACE: 37, LEATHER: 38, TROUSER: 39,
-  HEAD_SIDE: 40, HEAD_BACK: 41,
+  HEAD_SIDE: 40, HEAD_BACK: 41, IVY: 42, TUFT: 43,
+  FROND: 44, LAMP: 45, POT: 46, COLUMN: 47,
 } as const;
 
 type RGB = [number, number, number];
@@ -61,7 +62,20 @@ function shade(c: RGB, k: number): RGB {
 
 class Tile {
   px = new Float32Array(TILE * TILE * 3);
+  /** Coverage. Opaque unless a tile cuts itself out, like leaves. */
+  alpha = new Uint8Array(TILE * TILE).fill(255);
   constructor(public r: () => number) {}
+  clear(): void {
+    this.alpha.fill(0);
+  }
+  /** Paint a pixel and make it solid, for cut out tiles. */
+  dot(x: number, y: number, c: RGB): void {
+    this.set(x, y, c);
+    this.alpha[(y & 15) * TILE + (x & 15)] = 255;
+  }
+  a(x: number, y: number): number {
+    return this.alpha[(y & 15) * TILE + (x & 15)];
+  }
   set(x: number, y: number, c: RGB): void {
     const i = ((y & 15) * TILE + (x & 15)) * 3;
     this.px[i] = c[0]; this.px[i + 1] = c[1]; this.px[i + 2] = c[2];
@@ -376,6 +390,78 @@ function headSide(t: Tile, back: boolean): void {
   if (!back) t.rect(6, 7, 3, 4, hex(0xd99a76));
 }
 
+/** Ivy, hanging in strands. Cut out, so the wall shows between the leaves. */
+function ivy(t: Tile): void {
+  t.clear();
+  const g = hex(0x3f8a2e);
+  for (let s = 0; s < 5; s++) {
+    let x = 1 + s * 3 + Math.floor(t.r() * 2);
+    for (let y = 0; y < 16; y++) {
+      if (t.r() < 0.12) x += t.r() < 0.5 ? -1 : 1;
+      if (y > 10 + Math.floor(t.r() * 8)) break;
+      t.dot(x, y, shade(g, 0.7 + t.r() * 0.5));
+      if (t.r() < 0.45) t.dot(x + (t.r() < 0.5 ? -1 : 1), y, shade(g, 0.85 + t.r() * 0.5));
+    }
+  }
+}
+
+/** A tuft of grass blades, for the foot of a wall. */
+function tuft(t: Tile): void {
+  t.clear();
+  const g = hex(0x6cb43e);
+  for (let b = 0; b < 9; b++) {
+    const x0 = 1 + Math.floor(t.r() * 14);
+    const h = 5 + Math.floor(t.r() * 9);
+    const lean = t.r() < 0.5 ? -1 : 1;
+    for (let i = 0; i < h; i++) {
+      const x = x0 + (i > h / 2 ? lean : 0);
+      t.dot(x, 15 - i, shade(g, 0.7 + (i / h) * 0.5));
+    }
+  }
+}
+
+/** Palm fronds, for the potted plants. */
+function frond(t: Tile): void {
+  t.clear();
+  const g = hex(0x4a9a36);
+  for (const [dx, dy] of [[-1, -1], [1, -1], [-1, -0.4], [1, -0.4], [0, -1]] as const) {
+    for (let i = 0; i < 9; i++) {
+      const x = Math.round(7.5 + dx * i * 0.85);
+      const y = Math.round(15 + dy * i * 1.4 + (i * i) / 14);
+      if (y < 0 || y > 15 || x < 0 || x > 15) continue;
+      t.dot(x, y, shade(g, 0.75 + t.r() * 0.45));
+      if (i > 1) t.dot(x, y - 1, shade(g, 0.9 + t.r() * 0.3));
+    }
+  }
+  for (let y = 9; y < 16; y++) t.dot(7, y, hex(0x6b4a2a));
+}
+
+/** Lantern glass: hot in the middle, warm at the frame. */
+function lamp(t: Tile): void {
+  for (let y = 0; y < 16; y++) {
+    for (let x = 0; x < 16; x++) {
+      const d = Math.max(Math.abs(x - 7.5), Math.abs(y - 7.5)) / 7.5;
+      t.set(x, y, [255, 236 - d * 70, 170 - d * 110]);
+    }
+  }
+  for (let i = 0; i < 16; i++) { t.set(i, 0, hex(0x2a2420)); t.set(i, 15, hex(0x2a2420)); }
+  for (let i = 0; i < 16; i++) { t.set(0, i, hex(0x2a2420)); t.set(15, i, hex(0x2a2420)); t.set(7, i, hex(0x4a3a2a)); }
+}
+
+function pot(t: Tile): void {
+  const c = hex(0xb4583a);
+  t.fill(c, 0.08);
+  for (let x = 0; x < 16; x++) { t.set(x, 0, shade(c, 1.2)); t.set(x, 1, shade(c, 1.1)); t.set(x, 3, shade(c, 0.75)); }
+}
+
+/** A fluted cast iron column, painted cream, as the gallery piers are. */
+function column(t: Tile, base: RGB): void {
+  for (let x = 0; x < 16; x++) {
+    const flute = x % 4 === 0 ? 0.72 : x % 4 === 1 ? 1.08 : 0.95;
+    for (let y = 0; y < 16; y++) t.set(x, y, shade(base, flute * (1 + (t.r() - 0.5) * 0.04)));
+  }
+}
+
 /* ------------------------------------------------------------ atlas --- */
 
 const DRAW: Record<number, (t: Tile) => void> = {
@@ -421,6 +507,12 @@ const DRAW: Record<number, (t: Tile) => void> = {
   [T.TROUSER]: trouser,
   [T.HEAD_SIDE]: (t) => headSide(t, false),
   [T.HEAD_BACK]: (t) => headSide(t, true),
+  [T.IVY]: ivy,
+  [T.TUFT]: tuft,
+  [T.FROND]: frond,
+  [T.LAMP]: lamp,
+  [T.POT]: pot,
+  [T.COLUMN]: (t) => column(t, hex(0xe6dcc6)),
 };
 
 /**
@@ -461,7 +553,7 @@ export function atlasImage(): HTMLCanvasElement {
         img.data[i] = Math.max(0, Math.min(255, r));
         img.data[i + 1] = Math.max(0, Math.min(255, g));
         img.data[i + 2] = Math.max(0, Math.min(255, b));
-        img.data[i + 3] = 255;
+        img.data[i + 3] = t.a(x - PAD, y - PAD);
       }
     }
   }

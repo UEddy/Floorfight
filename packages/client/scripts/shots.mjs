@@ -36,10 +36,13 @@ const H = 540;
 const HALF = 24;
 const cell = (i) => i - HALF + 0.5;
 const VIEWS = [
-  { name: "1-floor-lane", x: cell(30), y: 1, z: cell(21), yaw: -Math.PI / 2 + 0.2, pitch: 0.02 },
-  { name: "2-south-gallery", x: cell(24), y: 7, z: cell(45), yaw: 0.3, pitch: -0.28 },
-  { name: "3-stage", x: cell(24), y: 3, z: cell(11), yaw: Math.PI - 0.5, pitch: -0.08 },
-  { name: "4-catwalk", x: cell(29), y: 11, z: cell(20), yaw: Math.PI / 2 - 0.15, pitch: -0.25 },
+  // Picked by casting a fan of rays from every standable cell on each level
+  // and keeping the ones that see furthest: the Hall is a maze, and a view
+  // chosen by hand mostly photographs the nearest pier.
+  { name: "1-floor", x: cell(12), y: 1, z: cell(46), yaw: 1.18, pitch: 0.12 },
+  { name: "2-stage", x: cell(38), y: 3, z: cell(1), yaw: 3.14, pitch: 0.05 },
+  { name: "3-gallery", x: cell(43), y: 7, z: cell(1), yaw: 2.75, pitch: 0.05 },
+  { name: "4-high", x: cell(46), y: 11, z: cell(12), yaw: 1.18, pitch: 0.2 },
 ];
 
 const children = [];

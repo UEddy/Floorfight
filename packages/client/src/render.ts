@@ -28,6 +28,8 @@ import {
 import type { RemoteView } from "./netcode";
 import { T, atlas, tileUV } from "./textures";
 import { ViewModel } from "./viewmodel";
+import { addProps } from "./props";
+import { SKY, SKY_FLOOR, WARM, lanternsSeenFrom, skyAt, warmAt } from "./lighting";
 import { Characters, HAIR, SKIN, scheme } from "./characters";
 
 /** Chunks a body bursts into, and how many the pool holds. */
@@ -163,7 +165,10 @@ function tileFor(m: number, f: number, ix: number, iy: number, iz: number): numb
       if (top || bottom) return T.STAGE_TOP;
       return iy <= 4 ? T.VELVET : T.STAGE_TOP;
     case M_TRIM:
-      return top || bottom ? T.TRIM_TOP : T.TRIM;
+      if (top || bottom) return T.TRIM_TOP;
+      // Stacked trim is a gallery pier, a column rather than a balustrade.
+      return blockAt(ix, iy + 1, iz) === M_TRIM || blockAt(ix, iy - 1, iz) === M_TRIM
+        ? T.COLUMN : T.TRIM;
     default:
       return T.STONE;
   }
@@ -211,6 +216,15 @@ function buildGrid(): THREE.Mesh {
           const shade = FACE_SHADE[f];
           const [u0, v0, u1, v1] = tileUV(tileFor(m, f, ix, iy, iz));
 
+          // Light for this face: how much sky the air cell in front of it
+          // sees, and which lanterns it can see from its centre.
+          const fcx = ox + 0.5 + n[0] * 0.5;
+          const fcy = iy + 0.5 + n[1] * 0.5;
+          const fcz = oz + 0.5 + n[2] * 0.5;
+          const sky = SKY_FLOOR + (1 - SKY_FLOOR) *
+            skyAt(fcx + n[0] * 0.45, fcy + n[1] * 0.45, fcz + n[2] * 0.45);
+          const seen = lanternsSeenFrom(fcx, fcy, fcz, n[0], n[1], n[2]);
+
           // Position, brightness and texture coordinate of the four corners,
           // then two triangles.
           const vx: number[] = [];
@@ -240,11 +254,18 @@ function buildGrid(): THREE.Mesh {
               sy + a[1] * du + b[1] * dv,
               sz + a[2] * du + b[2] * dv,
             ) ? 1 : 0;
-            vk.push(shade * AO_SHADE[s1 && s2 ? 3 : s1 + s2 + cc]);
+            const ao = AO_SHADE[s1 && s2 ? 3 : s1 + s2 + cc];
+            const base = shade * ao * sky;
+            const warm = seen.length ? warmAt(ox + lx, iy + ly, oz + lz, seen) * (0.4 + 0.6 * ao) : 0;
+            vk.push(
+              base * SKY[0] + warm * WARM[0],
+              base * SKY[1] + warm * WARM[1],
+              base * SKY[2] + warm * WARM[2],
+            );
           }
           for (const i of TRIS) {
             P.push(ox + vx[i], iy + vy[i], oz + vz[i]);
-            C.push(vk[i], vk[i], vk[i]);
+            C.push(vk[i * 3], vk[i * 3 + 1], vk[i * 3 + 2]);
             U.push(vu[i], vv[i]);
           }
         }
@@ -384,17 +405,17 @@ export class Renderer {
     this.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     this.renderer.shadowMap.enabled = false;
 
-    // Gaslight haze. It also hides the far wall of a 48 block hall, which is
-    // the cheapest way to keep the depth readable without a shadow in sight.
-    const air = 0x2a2230;
-    this.scene.background = new THREE.Color(air);
-    this.scene.fog = new THREE.Fog(air, 22, 62);
+    // Dusk haze, the colour of the sky low down through the glass. It softens
+    // the far end of a 48 block hall, which is the cheapest way to keep depth
+    // readable without a shadow in sight. The sky itself is a dome in props.
+    this.scene.fog = new THREE.Fog(0x4b3a66, 14, 62);
 
     this.camera = new THREE.PerspectiveCamera(75, 1, 0.05, 140);
     this.camera.rotation.order = "YXZ";
     this.scene.add(this.camera);
 
     this.scene.add(buildGrid());
+    addProps(this.scene);
     const signs = buildSigns();
     if (signs) this.scene.add(signs);
 

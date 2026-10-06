@@ -4,6 +4,7 @@ import { W_PISTOL, W_RIFLE, W_SHOTGUN } from "../../shared/weapons";
 import { buildParts, type Part } from "./boxes";
 import type { RemoteView } from "./netcode";
 import { T, atlas, tileUV } from "./textures";
+import { probe } from "./lighting";
 
 /**
  * Other players, as blocky people: head, torso, two arms, two legs and the
@@ -103,6 +104,7 @@ export class Characters {
   private part = new THREE.Matrix4();
   private rot = new THREE.Matrix4();
   private hidden = new THREE.Matrix4().makeScale(0, 0, 0);
+  private c = new THREE.Color();
 
   constructor(scene: THREE.Scene, private slots: number) {
     const mat = new THREE.MeshBasicMaterial({ map: atlas(), vertexColors: true, fog: true });
@@ -216,6 +218,7 @@ export class Characters {
       }
       w.x = r.x; w.z = r.z; w.y = r.y;
       w.phase += dt * (2 + 10 * w.speed);
+      this.light(i, probe(r.x, r.y + 1, r.z));
 
       const yaw = (r.yaw / YAW_UNITS) * Math.PI * 2;
       const swing = Math.sin(w.phase) * 0.75 * w.speed * (1 - w.air);
@@ -251,7 +254,31 @@ export class Characters {
     }
     for (const mesh of [this.legs, this.torsos, this.arms, this.heads, this.caps, ...this.guns]) {
       mesh.instanceMatrix.needsUpdate = true;
+      if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
     }
+  }
+
+  /**
+   * Light the seat's parts the way the hall around them is lit: the baked
+   * sky and lantern light at the cell they stand in, multiplied over their
+   * colours. A player walking under a lantern warms up, and one in the shade
+   * of a gallery goes dark, which keeps the bodies from glowing flat against
+   * a lit hall.
+   */
+  private light(i: number, l: readonly [number, number, number]): void {
+    const s = scheme(i);
+    const lit = (hex: number) => {
+      this.c.set(hex);
+      return this.c.setRGB(this.c.r * l[0] * 1.15, this.c.g * l[1] * 1.15, this.c.b * l[2] * 1.15);
+    };
+    this.torsos.setColorAt(i, lit(s.shirt));
+    this.arms.setColorAt(i * 2, lit(s.shirt));
+    this.arms.setColorAt(i * 2 + 1, lit(s.shirt));
+    this.legs.setColorAt(i * 2, lit(s.trousers));
+    this.legs.setColorAt(i * 2 + 1, lit(s.trousers));
+    this.caps.setColorAt(i, lit(s.cap));
+    this.heads.setColorAt(i, lit(0xffffff));
+    for (const g of this.guns) g.setColorAt(i, lit(0xffffff));
   }
 
   /** base * translate(joint) * rotX(ax) * rotY(ay), into this.m. */

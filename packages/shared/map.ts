@@ -138,9 +138,9 @@ const TOP = GRID_Y - 1;   // 16
  * The grid stops short of all four walls. The strips it leaves are the side
  * aisles, under the galleries, and they carry their own stalls further down.
  */
-const BAY_X: readonly number[] = [9, 16, 23, 30, 37];
-const BAY_Z: readonly number[] = [16, 23, 30, 37];
-const BOOTHS: readonly (readonly number[])[] = [
+export const BAY_X: readonly number[] = [9, 16, 23, 30, 37];
+export const BAY_Z: readonly number[] = [16, 23, 30, 37];
+export const BOOTHS: readonly (readonly number[])[] = [
   [0, 2, 4, 0, 3],
   [2, 3, 0, 2, 4],
   [0, 4, 0, 0, 2],
@@ -148,7 +148,7 @@ const BOOTHS: readonly (readonly number[])[] = [
 ];
 
 /** Pavilions: tall booths whose roofs carry the girders. */
-const PAVILIONS: readonly { x: number; z: number }[] = [
+export const PAVILIONS: readonly { x: number; z: number }[] = [
   { x: 9, z: 16 }, { x: 30, z: 16 }, { x: 9, z: 30 }, { x: 30, z: 30 },
 ];
 
