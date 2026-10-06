@@ -165,6 +165,8 @@ export interface RemoteView {
   yaw: number;   // units, may be fractional
   pitch: number; // radians
   alive: boolean;
+  /** Weapon held, an index into WEAPONS. Drawn in their hands, nothing more. */
+  weapon: number;
 }
 
 export class Interpolator {
@@ -240,6 +242,7 @@ export class Interpolator {
         yaw: lerpYaw(pa.y, pb.y, t),
         pitch: ((pa.p + (pb.p - pa.p) * t) / 32767) * PITCH_LIMIT,
         alive: (t < 0.5 ? pa.a : pb.a) === 1,
+        weapon: pb.g,
       });
     }
   }

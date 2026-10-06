@@ -19,7 +19,7 @@ export const TILE = 16;
 const CELL = 32;
 const PAD = (CELL - TILE) / 2;
 const COLS = 8;
-const ROWS = 5;
+const ROWS = 6;
 export const ATLAS_W = CELL * COLS;
 export const ATLAS_H = CELL * ROWS;
 
@@ -34,7 +34,8 @@ export const T = {
   TRIM_TOP: 24, FABRIC_A2: 25, FABRIC_B2: 26, CRATE: 27,
   GLASS: 28, SKIN: 29, CLOTH: 30, GUNMETAL: 31,
   GUNWOOD: 32, ACCENT: 33, POLYMER: 34, BOOT: 35,
-  HAIR: 36, FACE: 37, LEATHER: 38,
+  HAIR: 36, FACE: 37, LEATHER: 38, TROUSER: 39,
+  HEAD_SIDE: 40, HEAD_BACK: 41,
 } as const;
 
 type RGB = [number, number, number];
@@ -355,6 +356,26 @@ function face(t: Tile): void {
   t.rect(0, 0, 16, 3, hex(0x3b2a20), 0.2);
 }
 
+/** Trousers, near white for the tint, over boots that stay dark under it. */
+function trouser(t: Tile): void {
+  cloth(t);
+  const boot = hex(0x2a211c);
+  t.rect(0, 12, 16, 4, boot, 0.15);
+  for (let x = 0; x < 16; x++) t.set(x, 11, shade(boot, 1.4));
+}
+
+/** The side of a head: skin, hair over the top and an ear. */
+function headSide(t: Tile, back: boolean): void {
+  skin(t);
+  const h = hex(0x3b2a20);
+  const depth = back ? 11 : 4;
+  for (let x = 0; x < 16; x++) {
+    const d = depth + (back ? 0 : (x > 9 ? 2 : 0));
+    for (let y = 0; y < d; y++) t.set(x, y, shade(h, 0.85 + t.r() * 0.3));
+  }
+  if (!back) t.rect(6, 7, 3, 4, hex(0xd99a76));
+}
+
 /* ------------------------------------------------------------ atlas --- */
 
 const DRAW: Record<number, (t: Tile) => void> = {
@@ -397,6 +418,9 @@ const DRAW: Record<number, (t: Tile) => void> = {
   [T.HAIR]: hair,
   [T.FACE]: face,
   [T.LEATHER]: (t) => planks(t, hex(0x6a4630), true),
+  [T.TROUSER]: trouser,
+  [T.HEAD_SIDE]: (t) => headSide(t, false),
+  [T.HEAD_BACK]: (t) => headSide(t, true),
 };
 
 /**

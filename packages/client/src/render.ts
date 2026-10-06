@@ -1,13 +1,6 @@
 import * as THREE from "three";
 import {
-  BODY_HALF_X,
-  BODY_HALF_Z,
-  BODY_TOP,
   EYE_HEIGHT,
-  HEAD_BOTTOM,
-  HEAD_HALF,
-  HEAD_TOP,
-  YAW_UNITS,
   rayGrid,
 } from "../../shared/sim";
 import {
@@ -35,11 +28,12 @@ import {
 import type { RemoteView } from "./netcode";
 import { T, atlas, tileUV } from "./textures";
 import { ViewModel } from "./viewmodel";
+import { Characters, HAIR, SKIN, scheme } from "./characters";
 
 /** Chunks a body bursts into, and how many the pool holds. */
-const CHUNKS_PER_DEATH = 26;
+const CHUNKS_PER_DEATH = 34;
 const CHUNK_POOL = CHUNKS_PER_DEATH * 6;
-const CHUNK_LIFE = 1.6;
+const CHUNK_LIFE = 2.2;
 
 /** Tracers alive at once, and how long one lasts. */
 const TRACER_POOL = 24;
@@ -51,6 +45,8 @@ interface Chunk {
   rx: number; ry: number;
   life: number;
   colour: THREE.Color;
+  /** Scale of this chunk against the base cube. */
+  size: number;
 }
 
 interface Tracer {
@@ -356,17 +352,15 @@ function buildSigns(): THREE.Mesh | null {
 }
 
 /**
- * Player meshes are drawn at exactly the sim's hitbox sizes. What you see is
- * what the server tests, so a shot that lands on a drawn body is a shot that
- * lands on the server's body at the rewound tick.
+ * Player bodies are drawn inside the sim's hitboxes at any facing (see
+ * characters.ts), so a shot that lands on a drawn body is a shot that lands
+ * on the server's body at the rewound tick.
  */
 export class Renderer {
   readonly renderer: THREE.WebGLRenderer;
   readonly camera: THREE.PerspectiveCamera;
   private scene = new THREE.Scene();
-  private bodies: THREE.InstancedMesh;
-  private heads: THREE.InstancedMesh;
-  private visors: THREE.InstancedMesh;
+  private people: Characters;
   private view = new ViewModel();
   private lastEye = { x: 0, z: 0 };
   private moving = 0;
@@ -382,7 +376,6 @@ export class Renderer {
   private q = new THREE.Quaternion();
   private e = new THREE.Euler();
   private v = new THREE.Vector3();
-  private one = new THREE.Vector3(1, 1, 1);
   private scratch = new THREE.Vector3(1, 1, 1);
   private hidden = new THREE.Matrix4().makeScale(0, 0, 0);
 
@@ -405,32 +398,10 @@ export class Renderer {
     const signs = buildSigns();
     if (signs) this.scene.add(signs);
 
-    // Players: body, head and a visor so facing is readable at range. One
-    // lambert pair for all of them, lit by a hemisphere light only, because
-    // these are the only objects in the scene that move.
+    // Players. The hemisphere light is only for the death chunks, which
+    // tumble, so a baked face shade would be wrong half the time.
     this.scene.add(new THREE.HemisphereLight(0xfff0d0, 0x40304a, 2.1));
-    const mat = new THREE.MeshLambertMaterial();
-    this.bodies = new THREE.InstancedMesh(
-      new THREE.BoxGeometry(BODY_HALF_X * 2, BODY_TOP, BODY_HALF_Z * 2).translate(0, BODY_TOP / 2, 0),
-      mat, slots);
-    this.heads = new THREE.InstancedMesh(
-      new THREE.BoxGeometry(HEAD_HALF * 2, HEAD_TOP - HEAD_BOTTOM, HEAD_HALF * 2)
-        .translate(0, (HEAD_BOTTOM + HEAD_TOP) / 2, 0),
-      mat, slots);
-    this.visors = new THREE.InstancedMesh(
-      new THREE.BoxGeometry(HEAD_HALF * 1.6, 0.12, 0.06).translate(0, HEAD_BOTTOM + 0.3, -HEAD_HALF - 0.02),
-      new THREE.MeshBasicMaterial({ color: 0x111111 }),
-      slots);
-    for (let i = 0; i < slots; i++) {
-      const c = new THREE.Color(SLOT_COLORS[i % SLOT_COLORS.length]);
-      this.bodies.setColorAt(i, c);
-      this.heads.setColorAt(i, c.clone().multiplyScalar(1.15));
-    }
-    for (const mesh of [this.bodies, this.heads, this.visors]) {
-      mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-      mesh.frustumCulled = false;
-      this.scene.add(mesh);
-    }
+    this.people = new Characters(this.scene, slots);
 
     // Death chunks: one instanced mesh for every body that has ever burst.
     // Purely cosmetic, so this is the one place in the client that may use
@@ -514,8 +485,12 @@ export class Renderer {
    * told to anyone.
    */
   burst(x: number, y: number, z: number, slot: number): void {
-    const colour = new THREE.Color(SLOT_COLORS[slot % SLOT_COLORS.length]);
+    // Coloured like the body they came from: mostly shirt, then trousers,
+    // skin, hair and a little of the cap.
+    const s = scheme(slot);
+    const palette = [s.shirt, s.shirt, s.shirt, s.trousers, s.trousers, SKIN, SKIN, HAIR, s.cap];
     for (let i = 0; i < CHUNKS_PER_DEATH; i++) {
+      const colour = new THREE.Color(palette[Math.floor(Math.random() * palette.length)]);
       if (this.chunkState.length >= CHUNK_POOL) this.chunkState.shift();
       const up = 2.5 + Math.random() * 4.5;
       this.chunkState.push({
@@ -531,7 +506,8 @@ export class Renderer {
         // Carried on the chunk rather than written straight into the
         // instance: chunks expire out of the middle of the pool, so the
         // instance a chunk occupies changes during its life.
-        colour: colour.clone().multiplyScalar(0.7 + Math.random() * 0.5),
+        colour: colour.multiplyScalar(0.75 + Math.random() * 0.4),
+        size: 0.6 + Math.random() * 0.8,
       });
     }
   }
@@ -609,7 +585,7 @@ export class Renderer {
       this.chunks.setColorAt(i, c.colour);
       const spin = (CHUNK_LIFE - c.life) * 3;
       this.e.set(c.rx + spin, c.ry + spin, 0);
-      const fade = c.life < 0.35 ? c.life / 0.35 : 1;
+      const fade = (c.life < 0.35 ? c.life / 0.35 : 1) * c.size;
       this.m.compose(
         this.v.set(c.x, c.y, c.z),
         this.q.setFromEuler(this.e),
@@ -680,40 +656,16 @@ export class Renderer {
       dt, held.weapon, held.reload, this.moving, eye.yaw, eye.pitch, held.alive, held.grounded,
     );
 
+    this.people.update(dt, remotes, localSlot);
     for (let i = 0; i < this.slots; i++) {
       const r = remotes.get(i);
-      if (i === localSlot || !r || !r.alive) {
-        this.bodies.setMatrixAt(i, this.hidden);
-        this.heads.setMatrixAt(i, this.hidden);
-        this.visors.setMatrixAt(i, this.hidden);
-        continue;
-      }
-      // Hitboxes in the sim are axis aligned and do not rotate with yaw. The
-      // body is drawn the same way so the silhouette is the hitbox. Only the
-      // visor turns, to show facing.
-      this.m.makeTranslation(r.x, r.y, r.z);
-      this.bodies.setMatrixAt(i, this.m);
-      this.heads.setMatrixAt(i, this.m);
-      this.e.set(0, (r.yaw / YAW_UNITS) * Math.PI * 2, 0);
-      this.m.compose(this.v.set(r.x, r.y, r.z), this.q.setFromEuler(this.e), this.one);
-      this.visors.setMatrixAt(i, this.m);
-
-      // Muzzle flash in front of the chest, on the side their gun is on.
-      if (nowMs < this.muzzleUntil[i]) {
-        const yaw = (r.yaw / YAW_UNITS) * Math.PI * 2;
-        const fx = -Math.sin(yaw);
-        const fz = -Math.cos(yaw);
-        this.m.makeTranslation(
-          r.x + fx * 0.55 - fz * 0.2,
-          r.y + 1.25,
-          r.z + fz * 0.55 + fx * 0.2,
-        );
+      // Muzzle flash at the end of their gun.
+      if (r && r.alive && i !== localSlot && nowMs < this.muzzleUntil[i]) {
+        this.people.muzzle(r, this.v);
+        this.m.makeTranslation(this.v.x, this.v.y, this.v.z);
         this.muzzles.setMatrixAt(i, this.m);
       }
     }
-    this.bodies.instanceMatrix.needsUpdate = true;
-    this.heads.instanceMatrix.needsUpdate = true;
-    this.visors.instanceMatrix.needsUpdate = true;
 
     this.advance(dt, nowMs);
     this.renderer.info.reset();

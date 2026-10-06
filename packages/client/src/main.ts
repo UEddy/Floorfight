@@ -451,7 +451,9 @@ const plates: Plate[] = [];
  * drawing only: input, prediction and everything sent to the server carry on
  * from where the player really is.
  */
-let devCamera: { x: number; y: number; z: number; yaw: number; pitch: number } | null = null;
+let devCamera: {
+  x: number; y: number; z: number; yaw: number; pitch: number; hideGun?: boolean;
+} | null = null;
 
 function frame(): void {
   requestAnimationFrame(frame);
@@ -497,7 +499,7 @@ function frame(): void {
     reload: myReload > 0
       ? Math.min(0.999, (now - reloadStartedAt) / ((spec.reloadTicks / TICK_HZ) * 1000))
       : null,
-    alive: me.alive,
+    alive: me.alive && !devCamera?.hideGun,
     grounded: me.vy === 0,
   });
 
@@ -584,8 +586,11 @@ if (import.meta.env.DEV) {
       }
       if (!best) return null;
       const eyeY = best.y + EYE_HEIGHT;
+      // Start from the way they are facing, so the first clear view is of
+      // their front.
+      const facing = Math.atan2(-Math.sin(yawToRadians(best.yaw)), -Math.cos(yawToRadians(best.yaw)));
       for (let k = 0; k < 16; k++) {
-        const a = (k / 16) * Math.PI * 2;
+        const a = facing + ((k % 2 === 0 ? 1 : -1) * Math.ceil(k / 2) / 16) * Math.PI * 2;
         const dx = Math.sin(a);
         const dz = Math.cos(a);
         const dist = 3.2;
@@ -593,7 +598,7 @@ if (import.meta.env.DEV) {
         const cx = best.x + dx * dist;
         const cz = best.z + dz * dist;
         // Facing back at them: forward is (-sin yaw, -cos yaw).
-        return { x: cx, y: best.y, z: cz, yaw: Math.atan2(dx, dz), pitch: -0.12 };
+        return { x: cx, y: best.y, z: cz, yaw: Math.atan2(dx, dz), pitch: -0.12, hideGun: true };
       }
       return null;
     },
