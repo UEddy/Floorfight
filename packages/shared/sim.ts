@@ -517,6 +517,39 @@ export function hitscanFrame(
   return best;
 }
 
+/**
+ * Points on a body that count as being in the open: the head, the chest,
+ * the hips, and the four corners of the body box at chest height. Offsets
+ * from the feet, in the sim's own exact units.
+ */
+const EXPOSURE_POINTS: readonly [number, number, number][] = [
+  [0, (HEAD_BOTTOM + HEAD_TOP) / 2, 0],
+  [0, BODY_TOP * 0.7, 0],
+  [0, BODY_TOP * 0.3, 0],
+  [BODY_HALF_X * 0.9, BODY_TOP * 0.7, BODY_HALF_Z * 0.9],
+  [-BODY_HALF_X * 0.9, BODY_TOP * 0.7, BODY_HALF_Z * 0.9],
+  [BODY_HALF_X * 0.9, BODY_TOP * 0.7, -BODY_HALF_Z * 0.9],
+  [-BODY_HALF_X * 0.9, BODY_TOP * 0.7, -BODY_HALF_Z * 0.9],
+];
+
+/**
+ * Can the eye at (ox, oy, oz) see any part of this player where they stand
+ * now? A clear grid ray to any one of the exposure points is enough, so a
+ * player peeking round a corner is still hittable, and one entirely behind
+ * cover is not. Square root and the grid walk only, so it replays exactly.
+ */
+export function exposedNow(ox: number, oy: number, oz: number, v: PlayerState): boolean {
+  for (const [px, py, pz] of EXPOSURE_POINTS) {
+    const dx = v.x + px - ox;
+    const dy = v.y + py - oy;
+    const dz = v.z + pz - oz;
+    const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (d === 0) return true;
+    if (rayGrid(ox, oy, oz, dx / d, dy / d, dz / d, d) >= d) return true;
+  }
+  return false;
+}
+
 function record(world: WorldState): void {
   const f = world.history[world.tick % HISTORY_TICKS];
   f.tick = world.tick;
@@ -765,6 +798,12 @@ export function step(
       // The victim may have died between the rewound frame and now. A shot
       // into the past does not kill someone twice.
       if (!victim.alive) continue;
+      // Lag compensation aims at where the shooter saw the victim, up to a
+      // quarter second ago. By now they may be round the corner, and a hit
+      // then is a bullet through a wall from where they stand. So a hit
+      // also needs some part of the victim to be in the open from the
+      // shooter's eye at this tick.
+      if (!exposedNow(p.x, p.y + EYE_HEIGHT, p.z, victim)) continue;
 
       victim.hp -= dealt[v];
       const lethal = victim.hp <= 0;

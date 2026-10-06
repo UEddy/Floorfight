@@ -37,6 +37,7 @@ import {
   onGround,
   rayGrid,
   shotSpread,
+  exposedNow,
   solidAt,
   step,
   supportTop,
@@ -386,6 +387,38 @@ test("walls and floors block a shot, and an open line does not", () => {
   run(w2, 0, input({ yaw: YAW_UNITS / 4 }), 1);
   run(w2, 0, input({ yaw: YAW_UNITS / 4, fire: 1 }), 20, hits);
   assert.equal(v2.hp, hp2, "a shot across the hall should be stopped by cover");
+});
+
+test("a lag compensated shot does not land on someone who is behind cover now", () => {
+  // On the stage, looking north up the pocket in front of the organ case.
+  // Rewound, the victim is in the open; by the tick the shot is resolved
+  // they are behind the case. From where they stand that hit would be a
+  // bullet through a wall, so it does not land.
+  const setup = (nowZ: number) => {
+    const w = createWorld(2);
+    const shooter = w.players[0];
+    const victim = w.players[1];
+    shooter.x = cellCentreX(22); shooter.z = cellCentreZ(13); shooter.y = LEVEL_STAGE;
+    victim.x = cellCentreX(22); victim.z = cellCentreZ(10); victim.y = LEVEL_STAGE;
+    const seen = w.tick;
+    step(w, [input({ tick: 0, view: seen }), null], []); // records the victim in the open
+    victim.z = cellCentreZ(nowZ);
+    const hits: HitEvent[] = [];
+    // Pitched down a little to the victim's chest, as the shooter saw it.
+    const pitch = Math.round((-0.25 / 1.45) * 32767);
+    step(w, [input({ tick: 1, view: seen, yaw: 0, pitch, fire: 1 }), null], hits);
+    return { victim, hits };
+  };
+
+  const hidden = setup(5);
+  assert.ok(!exposedNow(cellCentreX(22), LEVEL_STAGE + EYE_HEIGHT, cellCentreZ(13), hidden.victim));
+  assert.equal(hidden.hits.length, 0, "behind the organ case now, so no hit");
+  assert.equal(hidden.victim.hp, MAX_HP);
+
+  // The same rewound shot on a victim who stepped back but is still in the
+  // open lands, so the rule only takes away hits through cover.
+  const open = setup(11);
+  assert.ok(open.hits.length > 0, "still in the open, so the rewound shot lands");
 });
 
 test("a shot at someone on the floor below is stopped by the gallery deck", () => {

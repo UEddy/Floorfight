@@ -21,8 +21,10 @@ export const PROTOCOL_VERSION = 7;
  * has to run it under. Bumped when the simulation changes what the same
  * inputs produce: 5 added horizontal acceleration and movement and bloom
  * spread, so a v4 log replayed by this build would not reproduce its match.
+ * 6 refuses a lag compensated hit on a victim who is behind cover at the
+ * tick the shot is resolved.
  */
-export const LOG_VERSION = 5;
+export const LOG_VERSION = 6;
 
 /** Abuse limits. Exceed any of these and the connection is closed. */
 export const MAX_MSG_BYTES = 4096;
