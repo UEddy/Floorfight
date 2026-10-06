@@ -433,6 +433,14 @@ setInterval(pump, 4);
 
 const plates: Plate[] = [];
 
+/**
+ * Dev builds only: a camera pose that replaces the predicted eye when drawing.
+ * The screenshot script uses it to look at the hall from fixed places. It is
+ * drawing only: input, prediction and everything sent to the server carry on
+ * from where the player really is.
+ */
+let devCamera: { x: number; y: number; z: number; yaw: number; pitch: number } | null = null;
+
 function frame(): void {
   requestAnimationFrame(frame);
   const now = performance.now();
@@ -469,7 +477,7 @@ function frame(): void {
       else if (r) r.alive = false;
     }
   }
-  renderer.draw(now, { x, y, z, yaw, pitch }, slot, remotes);
+  renderer.draw(now, devCamera ?? { x, y, z, yaw, pitch }, slot, remotes);
 
   // Nameplates, after the draw so the camera matrices are current.
   plates.length = 0;
@@ -536,6 +544,36 @@ if (import.meta.env.DEV) {
     fire(on: boolean) { controls.botFire = on; },
     jump(on: boolean) { controls.botJump = on; },
     weapon(n: number) { controls.cycle(n - 1 - myWeapon); },
+    camera(pose: typeof devCamera) { devCamera = pose; },
+    /**
+     * A camera pose a few blocks from the closest live opponent, looking at
+     * them, from whichever side has a clear line. For the screenshot script.
+     */
+    nearestRemote() {
+      if (!predictor) return null;
+      const me = predictor.me;
+      let best: RemoteView | null = null;
+      let bestD = Infinity;
+      for (const [s, r] of remotes) {
+        if (s === slot || !r.alive) continue;
+        const d = Math.hypot(r.x - me.x, r.z - me.z);
+        if (d < bestD) { bestD = d; best = r; }
+      }
+      if (!best) return null;
+      const eyeY = best.y + EYE_HEIGHT;
+      for (let k = 0; k < 16; k++) {
+        const a = (k / 16) * Math.PI * 2;
+        const dx = Math.sin(a);
+        const dz = Math.cos(a);
+        const dist = 3.2;
+        if (rayGrid(best.x, eyeY, best.z, dx, 0, dz, dist + 0.6) < dist + 0.6) continue;
+        const cx = best.x + dx * dist;
+        const cz = best.z + dz * dist;
+        // Facing back at them: forward is (-sin yaw, -cos yaw).
+        return { x: cx, y: best.y, z: cz, yaw: Math.atan2(dx, dz), pitch: -0.12 };
+      }
+      return null;
+    },
     peek() {
       return {
         phase,
@@ -550,6 +588,7 @@ if (import.meta.env.DEV) {
         reload: myReload,
         remotes: Object.fromEntries(remotes),
         drawCalls: renderer?.drawCalls ?? 0,
+        triangles: renderer?.triangles ?? 0,
         fps: fpsNow,
         onePercentLow,
         ping: rtt,

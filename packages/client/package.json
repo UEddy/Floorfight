@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "shots": "node scripts/shots.mjs"
   },
   "dependencies": {
     "bs58": "6.0.0",
@@ -15,6 +16,7 @@
   },
   "devDependencies": {
     "@types/three": "0.186.0",
+    "playwright": "1.56.1",
     "typescript": "7.0.2",
     "vite": "8.3.1"
   }

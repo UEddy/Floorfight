@@ -10,3 +10,8 @@ target/
 .anchor/
 .expo/
 .test-logs/
+
+# Look-and-feel reference images belong to other people. Never commit them.
+reference/
+# Output of npm run shots in packages/client.
+shots/
