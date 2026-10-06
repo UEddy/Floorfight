@@ -12,8 +12,10 @@ import {
   M_BOOTH,
   M_BOOTH2,
   M_BRICK,
+  M_CRATE,
   M_FLOOR,
   M_GALLERY,
+  M_HEDGE,
   M_IRON,
   M_STAGE,
   M_STAIR,
@@ -30,7 +32,7 @@ import type { RemoteView } from "./netcode";
 import type { RosterEntry } from "../../shared/protocol";
 import { T, atlas, tileUV } from "./textures";
 import { ViewModel } from "./viewmodel";
-import { addProps } from "./props";
+import { SKY_RADIUS, addProps } from "./props";
 import { SKY, SKY_FLOOR, WARM, lanternsSeenFrom, skyAt, warmAt } from "./lighting";
 import { Characters, HAIR, SKIN, scheme } from "./characters";
 
@@ -118,9 +120,14 @@ function cellHash(ix: number, iy: number, iz: number): number {
   return (h ^ (h >>> 15)) >>> 0;
 }
 
-/** Floor columns and rows that are lanes between the booth bays. */
-const LANE_X = new Set([14, 15, 21, 22, 28, 29, 35, 36]);
-const LANE_Z = new Set([15, 21, 22, 28, 29, 35, 36]);
+/**
+ * Where the floor is carpeted: a runner down the middle of the nave, and one
+ * across it between the fountain and the engines. Flagstones in the arcades
+ * under the galleries, boards everywhere else.
+ */
+const runner = (ix: number, iz: number) =>
+  (ix >= 46 && ix <= 49 && iz >= 8) || (iz >= 67 && iz <= 68 && ix >= 8 && ix <= GRID_X - 9);
+const arcade = (ix: number, iz: number) => ix <= 6 || ix >= GRID_X - 7 || iz <= 6;
 
 const isIron = (ix: number, iy: number, iz: number) => blockAt(ix, iy, iz) === M_IRON;
 
@@ -131,14 +138,19 @@ const isIron = (ix: number, iy: number, iz: number) => blockAt(ix, iy, iz) === M
 function tileFor(m: number, f: number, ix: number, iy: number, iz: number): number {
   const top = f === 2;
   const bottom = f === 3;
-  const h = cellHash(ix, iy, iz);
+  // Variants are picked per patch of blocks rather than per block, so a
+  // worn patch of boards is a patch, and so the mesher can still merge a
+  // run of faces: a different tile every few blocks at random would stop
+  // every merge at the first one.
+  const h = cellHash(ix >> 2, iy, iz >> 2);
   switch (m) {
     case M_FLOOR:
       if (!top) return T.STONE;
-      // Carpet runners down the aisles, the way an exhibition lays them, and
-      // bare boards under and round the booths.
-      if (LANE_X.has(ix) || LANE_Z.has(iz)) return h % 5 === 0 ? T.CARPET_WORN : T.CARPET;
-      return h % 3 === 0 ? T.PLANK_WORN : T.PLANK;
+      // Carpet runners down the nave, the way an exhibition lays them,
+      // flagstones under the galleries and bare boards everywhere else.
+      if (runner(ix, iz)) return h % 7 === 0 ? T.CARPET_WORN : T.CARPET;
+      if (arcade(ix, iz)) return T.STONE;
+      return h % 5 === 0 ? T.PLANK_WORN : T.PLANK;
     case M_BRICK:
       if (top || bottom) return T.STONE_CAP;
       // A plinth of cut stone at the foot of every wall, brick above it, and
@@ -174,122 +186,303 @@ function tileFor(m: number, f: number, ix: number, iy: number, iz: number): numb
       // Stacked trim is a gallery pier, a column rather than a balustrade.
       return blockAt(ix, iy + 1, iz) === M_TRIM || blockAt(ix, iy - 1, iz) === M_TRIM
         ? T.COLUMN : T.TRIM;
+    case M_CRATE:
+      return T.CRATE;
+    case M_HEDGE:
+      // Clipped box in a stone planter: the bottom course of a tall hedge is
+      // the planter, and a low one is all leaves.
+      if (top) return T.LEAVES;
+      if (bottom) return T.STONE_CAP;
+      return iy === 1 && blockAt(ix, iy + 1, iz) === M_HEDGE ? T.STONE_CAP : T.LEAVES;
     default:
       return T.STONE;
   }
 }
 
 /**
- * Texture coordinate across a side face, so that u runs left to right for a
- * viewer standing in front of it and v always runs up. Without this half the
- * walls in the hall would show their bricks lying on their side.
+ * Texture coordinate across a face, in blocks, as a linear function of world
+ * position. The shader repeats the face's tile once per block by taking the
+ * fractional part, which is what lets one quad cover a whole run of blocks.
+ * Chosen so that u runs left to right for a viewer standing in front of a
+ * side face and v always runs up: without that half the walls in the hall
+ * would show their bricks lying on their side.
  */
-function faceUV(f: number, lx: number, ly: number, lz: number): [number, number] {
+function faceUV(f: number, x: number, y: number, z: number): [number, number] {
   switch (f) {
-    case 0: return [1 - lz, ly];
-    case 1: return [lz, ly];
-    case 4: return [lx, ly];
-    case 5: return [1 - lx, ly];
-    default: return [lx, 1 - lz];
+    case 0: return [-z, y];
+    case 1: return [z, y];
+    case 4: return [x, y];
+    case 5: return [-x, y];
+    default: return [x, -z];
   }
 }
 
+/** Blocks per chunk side. The hall is three by three of them. */
+const CHUNK = 32;
+
+/** Quantum a baked colour is compared at when deciding whether to merge. */
+const LIGHT_STEPS = 128;
+
 /**
- * Build the hall as one merged mesh.
+ * Sample the atlas tile named by `tile`, repeating it across the face.
  *
- * Only faces with air on the far side are emitted, which throws away every
- * interior face in the hall: the piers, the walls and the booth masses are
- * solid runs of cells and only their skins survive. That is the difference
- * between about sixty thousand triangles and about a million.
+ * The block coordinate goes through fract() to land in the tile, and the
+ * gradient for the mip level is taken from the unwrapped coordinate, so the
+ * seam where fract() wraps does not jump to the smallest mip and draw a line.
  */
-function buildGrid(): THREE.Mesh {
-  const P: number[] = [];
-  const C: number[] = [];
-  const U: number[] = [];
+function gridMaterial(): THREE.MeshBasicMaterial {
+  const m = new THREE.MeshBasicMaterial({ map: atlas(), vertexColors: true, fog: true });
+  m.onBeforeCompile = (shader) => {
+    shader.vertexShader = shader.vertexShader
+      .replace("#include <common>", "#include <common>\nattribute vec4 tileRect;\nvarying vec4 vTile;")
+      .replace("#include <uv_vertex>", "#include <uv_vertex>\nvTile = tileRect;");
+    shader.fragmentShader = shader.fragmentShader
+      .replace("#include <common>", "#include <common>\nvarying vec4 vTile;")
+      .replace("#include <map_fragment>", `
+        vec2 tileSize = vTile.zw - vTile.xy;
+        vec2 tileUv = vTile.xy + fract(vMapUv) * tileSize;
+        diffuseColor *= textureGrad(map, tileUv, dFdx(vMapUv) * tileSize, dFdy(vMapUv) * tileSize);
+      `);
+  };
+  return m;
+}
 
-  for (let iy = 0; iy < GRID_Y; iy++) {
-    for (let iz = 0; iz < GRID_Z; iz++) {
-      for (let ix = 0; ix < GRID_X; ix++) {
-        const m = blockAt(ix, iy, iz);
-        if (m === AIR) continue;
-        const ox = blockMinX(ix);
-        const oz = blockMinZ(iz);
+/** One block face, lit, before merging. */
+interface Face {
+  tile: number;
+  /** Baked colour at the four corners, in CORNERS order, 12 numbers. */
+  rgb: number[];
+  /** Merge key if all four corners agree, or -1. */
+  key: number;
+  /**
+   * Merge keys for a run along the face's a axis (light constant along a,
+   * varying across it, like the occlusion band at the foot of a wall) and
+   * along its b axis. Null where the light varies that way too.
+   */
+  keyA: string | null;
+  keyB: string | null;
+}
 
-        for (let f = 0; f < 6; f++) {
-          const { n, a, b } = FACES[f];
-          if (occludes(ix + n[0], iy + n[1], iz + n[2])) continue;
-          const shade = FACE_SHADE[f];
-          const [u0, v0, u1, v1] = tileUV(tileFor(m, f, ix, iy, iz));
+/**
+ * Light and tile for the face of block (ix, iy, iz) on side f, or null when
+ * the face is hidden against a solid neighbour.
+ */
+function litFace(ix: number, iy: number, iz: number, f: number): Face | null {
+  const m = blockAt(ix, iy, iz);
+  if (m === AIR) return null;
+  const { n, a, b } = FACES[f];
+  if (occludes(ix + n[0], iy + n[1], iz + n[2])) return null;
+  const ox = blockMinX(ix);
+  const oz = blockMinZ(iz);
+  const shade = FACE_SHADE[f];
+  const tile = tileFor(m, f, ix, iy, iz);
 
-          // Light for this face: how much sky the air cell in front of it
-          // sees, and which lanterns it can see from its centre.
-          const fcx = ox + 0.5 + n[0] * 0.5;
-          const fcy = iy + 0.5 + n[1] * 0.5;
-          const fcz = oz + 0.5 + n[2] * 0.5;
-          const sky = SKY_FLOOR + (1 - SKY_FLOOR) *
-            skyAt(fcx + n[0] * 0.45, fcy + n[1] * 0.45, fcz + n[2] * 0.45);
-          const seen = lanternsSeenFrom(fcx, fcy, fcz, n[0], n[1], n[2]);
+  // Light for this face: how much sky the air cell in front of it sees, and
+  // which lanterns it can see from its centre.
+  const fcx = ox + 0.5 + n[0] * 0.5;
+  const fcy = iy + 0.5 + n[1] * 0.5;
+  const fcz = oz + 0.5 + n[2] * 0.5;
+  const sky = SKY_FLOOR + (1 - SKY_FLOOR) *
+    skyAt(fcx + n[0] * 0.45, fcy + n[1] * 0.45, fcz + n[2] * 0.45);
+  const seen = lanternsSeenFrom(fcx, fcy, fcz, n[0], n[1], n[2]);
 
-          // Position, brightness and texture coordinate of the four corners,
-          // then two triangles.
-          const vx: number[] = [];
-          const vy: number[] = [];
-          const vz: number[] = [];
-          const vk: number[] = [];
-          const vu: number[] = [];
-          const vv: number[] = [];
-          for (const [sa, sb] of CORNERS) {
-            const ha = sa - 0.5;
-            const hb = sb - 0.5;
-            const lx = 0.5 + 0.5 * n[0] + a[0] * ha + b[0] * hb;
-            const ly = 0.5 + 0.5 * n[1] + a[1] * ha + b[1] * hb;
-            const lz = 0.5 + 0.5 * n[2] + a[2] * ha + b[2] * hb;
-            vx.push(lx); vy.push(ly); vz.push(lz);
-            const [tu, tv] = faceUV(f, lx, ly, lz);
-            vu.push(u0 + (u1 - u0) * tu);
-            vv.push(v0 + (v1 - v0) * tv);
+  const rgb: number[] = [];
+  for (const [sa, sb] of CORNERS) {
+    const ha = sa - 0.5;
+    const hb = sb - 0.5;
+    const lx = 0.5 + 0.5 * n[0] + a[0] * ha + b[0] * hb;
+    const ly = 0.5 + 0.5 * n[1] + a[1] * ha + b[1] * hb;
+    const lz = 0.5 + 0.5 * n[2] + a[2] * ha + b[2] * hb;
+    // Corner occlusion from the three cells round the corner on the air
+    // side of the face.
+    const du = sa ? 1 : -1;
+    const dv = sb ? 1 : -1;
+    const sx = ix + n[0], sy = iy + n[1], sz = iz + n[2];
+    const s1 = occludes(sx + a[0] * du, sy + a[1] * du, sz + a[2] * du) ? 1 : 0;
+    const s2 = occludes(sx + b[0] * dv, sy + b[1] * dv, sz + b[2] * dv) ? 1 : 0;
+    const cc = occludes(
+      sx + a[0] * du + b[0] * dv,
+      sy + a[1] * du + b[1] * dv,
+      sz + a[2] * du + b[2] * dv,
+    ) ? 1 : 0;
+    const ao = AO_SHADE[s1 && s2 ? 3 : s1 + s2 + cc];
+    const base = shade * ao * sky;
+    const warm = seen.length ? warmAt(ox + lx, iy + ly, oz + lz, seen) * (0.4 + 0.6 * ao) : 0;
+    rgb.push(
+      base * SKY[0] + warm * WARM[0],
+      base * SKY[1] + warm * WARM[1],
+      base * SKY[2] + warm * WARM[2],
+    );
+  }
 
-            const du = sa ? 1 : -1;
-            const dv = sb ? 1 : -1;
-            const sx = ix + n[0], sy = iy + n[1], sz = iz + n[2];
-            const s1 = occludes(sx + a[0] * du, sy + a[1] * du, sz + a[2] * du) ? 1 : 0;
-            const s2 = occludes(sx + b[0] * dv, sy + b[1] * dv, sz + b[2] * dv) ? 1 : 0;
-            const cc = occludes(
-              sx + a[0] * du + b[0] * dv,
-              sy + a[1] * du + b[1] * dv,
-              sz + a[2] * du + b[2] * dv,
-            ) ? 1 : 0;
-            const ao = AO_SHADE[s1 && s2 ? 3 : s1 + s2 + cc];
-            const base = shade * ao * sky;
-            const warm = seen.length ? warmAt(ox + lx, iy + ly, oz + lz, seen) * (0.4 + 0.6 * ao) : 0;
-            vk.push(
-              base * SKY[0] + warm * WARM[0],
-              base * SKY[1] + warm * WARM[1],
-              base * SKY[2] + warm * WARM[2],
-            );
+  // Quantised, a face can merge with its neighbours only where its corners
+  // came out the same colour: four the same and it is flat, and a rectangle
+  // of flat faces is one quad; the same along one axis only and a strip of
+  // such faces is one quad, the light still varying across it exactly as it
+  // did. Either way one quad over the lot looks like the separate faces did.
+  const q = (v: number) => Math.min(255, Math.round(v * LIGHT_STEPS / 2));
+  const ck: number[] = [];
+  for (let c = 0; c < 4; c++) {
+    ck.push(q(rgb[c * 3]) * 65536 + q(rgb[c * 3 + 1]) * 256 + q(rgb[c * 3 + 2]));
+    for (let k = 0; k < 3; k++) rgb[c * 3 + k] = q(rgb[c * 3 + k]) * 2 / LIGHT_STEPS;
+  }
+  // CORNERS is (0,0) (1,0) (1,1) (0,1) in (a, b).
+  const alongA = ck[0] === ck[1] && ck[3] === ck[2];
+  const alongB = ck[0] === ck[3] && ck[1] === ck[2];
+  const key = alongA && alongB ? tile * 2 ** 24 + ck[0] : -1;
+  const keyA = alongA ? `${tile}:${ck[0]}:${ck[3]}` : null;
+  const keyB = alongB ? `${tile}:${ck[0]}:${ck[1]}` : null;
+  return { tile, rgb, key, keyA, keyB };
+}
+
+/** Geometry being filled for one chunk. */
+class ChunkGeometry {
+  P: number[] = [];
+  C: number[] = [];
+  U: number[] = [];
+  R: number[] = [];
+
+  /**
+   * A quad on side f covering blocks [lo, hi) on the face's two in-plane
+   * axes, at the face plane of layer d on the normal's axis.
+   */
+  quad(f: number, d: number, lo: Axis, hi: Axis, tile: number, rgb: number[]): void {
+    const { n, a } = FACES[f];
+    const axis = n[0] ? 0 : n[1] ? 1 : 2;
+    const plane = d + (n[axis] > 0 ? 1 : 0);
+    const [u0, v0, u1, v1] = tileUV(tile);
+    const corner = (sa: number, sb: number): [number, number, number] => {
+      const p: number[] = [0, 0, 0];
+      for (let k = 0; k < 3; k++) {
+        if (k === axis) p[k] = plane;
+        else if (a[k]) p[k] = sa ? hi[k] : lo[k];
+        else p[k] = sb ? hi[k] : lo[k];
+      }
+      // Grid index to world: x and z are offset by half the grid.
+      return [p[0] - GRID_X / 2, p[1], p[2] - GRID_Z / 2];
+    };
+    const pts = CORNERS.map(([sa, sb]) => corner(sa, sb));
+    for (const i of TRIS) {
+      const [x, y, z] = pts[i];
+      this.P.push(x, y, z);
+      this.C.push(rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2]);
+      const [u, v] = faceUV(f, x, y, z);
+      this.U.push(u, v);
+      this.R.push(u0, v0, u1, v1);
+    }
+  }
+
+  mesh(material: THREE.Material): THREE.Mesh | null {
+    if (this.P.length === 0) return null;
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.Float32BufferAttribute(this.P, 3));
+    g.setAttribute("color", new THREE.Float32BufferAttribute(this.C, 3));
+    g.setAttribute("uv", new THREE.Float32BufferAttribute(this.U, 2));
+    g.setAttribute("tileRect", new THREE.Float32BufferAttribute(this.R, 4));
+    g.computeBoundingSphere();
+    // Unlit and vertex coloured. The shading is already in the colours, so
+    // there is no normal attribute and no light to evaluate per fragment.
+    return new THREE.Mesh(g, material);
+  }
+}
+
+/** Triangles in the hall meshes, for the debug overlay and the shots script. */
+export let hallTriangles = 0;
+
+/**
+ * Build the hall as a handful of merged meshes, one per 32 by 32 chunk.
+ *
+ * Only faces with air on the far side are kept, which throws away every
+ * interior face: the walls, the columns and the stalls are solid runs of
+ * cells and only their skins survive. Then the surviving faces are merged
+ * greedily, slice by slice: a rectangle of faces on the same plane with the
+ * same tile and the same flat baked light becomes one quad. Faces whose
+ * light varies across them (a lantern's pool, a corner's occlusion) stay as
+ * they are, so the merge never changes what the hall looks like.
+ *
+ * The chunks are there so the camera can drop the ones behind it. On a hall
+ * this size that is usually half of them.
+ */
+function buildGrid(): THREE.Mesh[] {
+  const dims = [GRID_X, GRID_Y, GRID_Z];
+  const chunks = new Map<number, ChunkGeometry>();
+  const chunkOf = (ix: number, iz: number) => {
+    const k = Math.floor(ix / CHUNK) * 16 + Math.floor(iz / CHUNK);
+    let c = chunks.get(k);
+    if (!c) chunks.set(k, (c = new ChunkGeometry()));
+    return c;
+  };
+
+  for (let f = 0; f < 6; f++) {
+    const { n, a, b } = FACES[f];
+    const axis = n[0] ? 0 : n[1] ? 1 : 2;
+    const ax = a[0] ? 0 : a[1] ? 1 : 2;
+    const bx = b[0] ? 0 : b[1] ? 1 : 2;
+    const na = dims[ax];
+    const nb = dims[bx];
+    const faces: (Face | null)[] = new Array(na * nb);
+    const used = new Uint8Array(na * nb);
+
+    for (let d = 0; d < dims[axis]; d++) {
+      // The slice: every face on this side at this layer.
+      for (let j = 0; j < nb; j++) {
+        for (let i = 0; i < na; i++) {
+          const c = [0, 0, 0];
+          c[axis] = d; c[ax] = i; c[bx] = j;
+          faces[j * na + i] = litFace(c[0], c[1], c[2], f);
+        }
+      }
+      used.fill(0);
+
+      for (let j = 0; j < nb; j++) {
+        for (let i = 0; i < na; i++) {
+          const face = faces[j * na + i];
+          if (!face || used[j * na + i]) continue;
+          // Merges stop at chunk edges, so each chunk can be culled alone.
+          const cell = [0, 0, 0];
+          cell[axis] = d; cell[ax] = i; cell[bx] = j;
+          const limA = ax === 1 ? na : Math.min(na, (Math.floor(i / CHUNK) + 1) * CHUNK);
+          const limB = bx === 1 ? nb : Math.min(nb, (Math.floor(j / CHUNK) + 1) * CHUNK);
+          let w = 1;
+          let h = 1;
+          const free = (ii: number, jj: number) => (used[jj * na + ii] ? null : faces[jj * na + ii]);
+          if (face.key >= 0) {
+            // Flat: grow a rectangle.
+            const same = (ii: number, jj: number) => free(ii, jj)?.key === face.key;
+            while (i + w < limA && same(i + w, j)) w++;
+            grow: while (j + h < limB) {
+              for (let k = 0; k < w; k++) if (!same(i + k, j + h)) break grow;
+              h++;
+            }
+          } else if (face.keyA !== null) {
+            // Light constant along a: a strip along a.
+            while (i + w < limA && free(i + w, j)?.keyA === face.keyA) w++;
+          } else if (face.keyB !== null) {
+            while (j + h < limB && free(i, j + h)?.keyB === face.keyB) h++;
           }
-          for (const i of TRIS) {
-            P.push(ox + vx[i], iy + vy[i], oz + vz[i]);
-            C.push(vk[i * 3], vk[i * 3 + 1], vk[i * 3 + 2]);
-            U.push(vu[i], vv[i]);
-          }
+          for (let jj = 0; jj < h; jj++) for (let ii = 0; ii < w; ii++) used[(j + jj) * na + i + ii] = 1;
+          const lo = [0, 0, 0];
+          const hi = [0, 0, 0];
+          lo[ax] = i; hi[ax] = i + w;
+          lo[bx] = j; hi[bx] = j + h;
+          chunkOf(cell[0], cell[2]).quad(
+            f, d, lo as unknown as Axis, hi as unknown as Axis, face.tile, face.rgb,
+          );
         }
       }
     }
   }
 
-  const g = new THREE.BufferGeometry();
-  g.setAttribute("position", new THREE.Float32BufferAttribute(P, 3));
-  g.setAttribute("color", new THREE.Float32BufferAttribute(C, 3));
-  g.setAttribute("uv", new THREE.Float32BufferAttribute(U, 2));
-  g.computeBoundingSphere();
-  // Unlit and vertex coloured. The shading is already in the colours, so
-  // there is no normal attribute and no light to evaluate per fragment.
-  const mesh = new THREE.Mesh(
-    g, new THREE.MeshBasicMaterial({ map: atlas(), vertexColors: true, fog: true }),
-  );
-  mesh.frustumCulled = false;
-  return mesh;
+  const material = gridMaterial();
+  const out: THREE.Mesh[] = [];
+  hallTriangles = 0;
+  for (const c of chunks.values()) {
+    const mesh = c.mesh(material);
+    if (!mesh) continue;
+    hallTriangles += c.P.length / 9;
+    out.push(mesh);
+  }
+  return out;
 }
 
 /**
@@ -437,15 +630,18 @@ export class Renderer {
     this.renderer.shadowMap.enabled = false;
 
     // Dusk haze, the colour of the sky low down through the glass. It softens
-    // the far end of a 48 block hall, which is the cheapest way to keep depth
-    // readable without a shadow in sight. The sky itself is a dome in props.
-    this.scene.fog = new THREE.Fog(0x4b3a66, 14, 62);
+    // the far end of a 96 block hall, which is the cheapest way to keep depth
+    // readable without a shadow in sight, and it starts far enough out that
+    // someone at the other end of the nave is still a shape worth shooting
+    // at. The sky itself is a dome in props.
+    this.scene.fog = new THREE.Fog(0x4b3a66, 24, 120);
 
-    this.camera = new THREE.PerspectiveCamera(FOV, 1, 0.05, 140);
+    // Far enough for the sky dome, which is past the far corner of the hall.
+    this.camera = new THREE.PerspectiveCamera(FOV, 1, 0.05, SKY_RADIUS + 20);
     this.camera.rotation.order = "YXZ";
     this.scene.add(this.camera);
 
-    this.scene.add(buildGrid());
+    for (const chunk of buildGrid()) this.scene.add(chunk);
     addProps(this.scene);
     const signs = buildSigns();
     if (signs) this.scene.add(signs);

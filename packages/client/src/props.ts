@@ -1,13 +1,12 @@
 import * as THREE from "three";
 import {
-  BAY_X,
-  BAY_Z,
-  BOOTHS,
+  ENGINES,
   GRID_X,
   GRID_Y,
   GRID_Z,
   LEVEL_GROUND,
   M_BRICK,
+  STALLS,
   M_IRON,
   blockAt,
   blockMinX,
@@ -26,7 +25,7 @@ import { T, atlas, tileUV } from "./textures";
  * bullet then went straight through, would be a lie about the one thing a
  * shooter has to be able to trust. So everything here is flat against a
  * surface (ivy, grass at the foot of a wall), above head height (lanterns,
- * bunting, the roof), or on a booth's top ledge where nobody stands.
+ * bunting, the roof), or on top of a stall or an engine where nobody stands.
  *
  * Draw calls: sky, roof iron, roof glass, solid props, cut out props and the
  * lantern glows. Six, whatever the number of things in them.
@@ -45,11 +44,17 @@ function hash(a: number, b: number, c = 0): number {
 /* ---------------------------------------------------------------- sky --- */
 
 /**
+ * Past the far corner of the hall from anywhere inside it, and inside the
+ * camera's far plane (render.ts), so it is never clipped.
+ */
+export const SKY_RADIUS = 160;
+
+/**
  * Dusk over the glass: deep blue overhead, violet, then a warm band at the
  * horizon. A gradient on a big sphere, drawn first and never fogged.
  */
 function sky(): THREE.Mesh {
-  const g = new THREE.SphereGeometry(110, 24, 12);
+  const g = new THREE.SphereGeometry(SKY_RADIUS, 24, 12);
   const m = new THREE.ShaderMaterial({
     side: THREE.BackSide,
     depthWrite: false,
@@ -89,9 +94,11 @@ function sky(): THREE.Mesh {
  * something to look up at.
  */
 const SPRING = GRID_Y;
-const RISE = 9;
-const SEGMENTS = 14;
+const RISE = 14;
+const SEGMENTS = 20;
 const RIB_EVERY = 6;
+/** Length of a glass pane along the hall. Two to a bay between ribs. */
+const PANE = 3;
 
 /** A point on the arch, t from 0 (west wall) to 1 (east wall). */
 function arch(t: number): [number, number] {
@@ -138,11 +145,11 @@ function roof(): { iron: THREE.Mesh; glass: THREE.Mesh } {
     pos.push(...a, ...b, ...c, ...a, ...c, ...d);
     uv.push(u0, v0, u1, v0, u1, v1, u0, v0, u1, v1, u0, v1);
   };
-  for (let z = -HALF_Z; z < HALF_Z; z += 1.5) {
+  for (let z = -HALF_Z; z < HALF_Z; z += PANE) {
     for (let i = 0; i < SEGMENTS; i++) {
       const [x0, y0] = arch(i / SEGMENTS);
       const [x1, y1] = arch((i + 1) / SEGMENTS);
-      quad([x0, y0, z], [x0, y0, z + 1.5], [x1, y1, z + 1.5], [x1, y1, z]);
+      quad([x0, y0, z], [x0, y0, z + PANE], [x1, y1, z + PANE], [x1, y1, z]);
     }
   }
   // End walls: fan the arch down to the wall top.
@@ -178,7 +185,6 @@ function lanternParts(): Part[] {
     parts.push(
       { x: l.x, y: l.y, z: l.z, w: 0.22, h: 0.28, d: 0.22, tile: T.LAMP, top: T.GUNMETAL },
       { x: l.x, y: l.y + 0.17, z: l.z, w: 0.28, h: 0.06, d: 0.28, tile: T.GUNMETAL },
-      { x: l.x, y: l.y - 0.16, z: l.z, w: 0.26, h: 0.05, d: 0.26, tile: T.GUNMETAL },
       // The bracket back to the wall.
       {
         x: l.x + l.wx * 0.16, y: l.y + 0.24, z: l.z + l.wz * 0.16,
@@ -214,29 +220,34 @@ function glows(): THREE.Points {
 
 /* -------------------------------------------------------------- flora --- */
 
-/** Little potted palms on the ledge round the top of the taller booths. */
+/**
+ * Little potted palms on the tops of the market stalls and the engines,
+ * which are two blocks and more off the floor: out of reach of a step and of
+ * a jump, so nobody stands among them and nobody is fooled into hiding
+ * behind one.
+ */
 function plantParts(): { solid: Part[]; leaves: Quad[] } {
   const solid: Part[] = [];
   const leaves: Quad[] = [];
-  for (let r = 0; r < BAY_Z.length; r++) {
-    for (let c = 0; c < BAY_X.length; c++) {
-      const h = BOOTHS[r][c];
-      if (h < 3) continue;
-      const corners = [[0, 0], [4, 0], [0, 4], [4, 4]];
-      for (let k = 0; k < 4; k++) {
-        if (hash(r, c, k) > 0.5) continue;
-        const ix = BAY_X[c] + corners[k][0];
-        const iz = BAY_Z[r] + corners[k][1];
-        const y = LEVEL_GROUND + h;
-        if (solidAt(ix, y, iz)) continue;
-        const x = blockMinX(ix) + 0.5;
-        const z = blockMinZ(iz) + 0.5;
-        solid.push({ x, y: y + 0.2, z, w: 0.4, h: 0.4, d: 0.4, tile: T.POT });
-        const s = 0.55 + hash(ix, iz) * 0.25;
-        leaves.push(...cross(x, y + 0.3, z, s * 2, s * 2.2, T.FROND, hash(iz, ix) * Math.PI));
-      }
+  const tops: { x: number; z: number; w: number; d: number; top: number }[] = [
+    ...STALLS.map((s) => ({ x: s.x, z: s.z, w: 3, d: 4, top: LEVEL_GROUND + s.h })),
+    ...ENGINES.map((e) => ({ x: e.x, z: e.z, w: e.w, d: e.d, top: LEVEL_GROUND + e.h })),
+  ];
+  tops.forEach((t, n) => {
+    const corners = [[0, 0], [t.w - 1, 0], [0, t.d - 1], [t.w - 1, t.d - 1]];
+    for (let k = 0; k < 4; k++) {
+      if (hash(n, k) > 0.6) continue;
+      const ix = t.x + corners[k][0];
+      const iz = t.z + corners[k][1];
+      const y = t.top;
+      if (solidAt(ix, y, iz) || !solidAt(ix, y - 1, iz)) continue;
+      const x = blockMinX(ix) + 0.5;
+      const z = blockMinZ(iz) + 0.5;
+      solid.push({ x, y: y + 0.2, z, w: 0.4, h: 0.4, d: 0.4, tile: T.POT });
+      const s = 0.55 + hash(ix, iz) * 0.25;
+      leaves.push(...cross(x, y + 0.3, z, s * 2, s * 2.2, T.FROND, hash(iz, ix) * Math.PI));
     }
-  }
+  });
   return { solid, leaves };
 }
 
@@ -327,8 +338,10 @@ function ivyAndGrass(): Quad[] {
 }
 
 /**
- * Strings of pennants across the hall, well above head height. Triangles
- * in the booth colours, sagging between the walls.
+ * Strings of pennants across the nave, high above the galleries. Triangles
+ * in the stall colours, sagging between the walls. Two runs across the hall
+ * between column pairs and two down the nave inside the columns, so the
+ * nave's long lines have something overhead to read depth against.
  */
 function bunting(): Quad[] {
   const out: Quad[] = [];
@@ -336,10 +349,10 @@ function bunting(): Quad[] {
   const [u0, v0, u1, v1] = tileUV(T.CLOTH);
   const runs: [number, number, number, number, number][] = [
     // x0, z0, x1, z1, height
-    [-19, -1.5, 19, -1.5, 6.4],
-    [-19, 5.5, 19, 5.5, 6.4],
-    [-2.5, -19, -2.5, 19, 7.4],
-    [5.5, -19, 5.5, 19, 7.4],
+    [-40.5, -6.5, 40.5, -6.5, 13.4],
+    [-40.5, 17.5, 40.5, 17.5, 13.4],
+    [-12.5, -40.5, -12.5, 40.5, 14.6],
+    [12.5, -40.5, 12.5, 40.5, 14.6],
   ];
   for (const [x0, z0, x1, z1, y] of runs) {
     const len = Math.hypot(x1 - x0, z1 - z0);
@@ -347,7 +360,7 @@ function bunting(): Quad[] {
     for (let i = 0; i < n; i++) {
       const t0 = i / n;
       const t1 = (i + 0.7) / n;
-      const sag = (t: number) => y - Math.sin(t * Math.PI * 6) ** 2 * 0.6;
+      const sag = (t: number) => y - Math.sin(t * Math.PI * 10) ** 2 * 0.8;
       const ax = x0 + (x1 - x0) * t0, az = z0 + (z1 - z0) * t0;
       const bx = x0 + (x1 - x0) * t1, bz = z0 + (z1 - z0) * t1;
       const ay = sag(t0), by = sag(t1);

@@ -19,15 +19,17 @@ import {
   GRID_Z,
   JUMP_SPEED,
   LEVEL_GALLERY,
-  LEVEL_GIRDER,
   LEVEL_GROUND,
   LEVEL_STAGE,
   MAX_HP,
-  PLAYER_HEIGHT,
   PLAYER_SPEED,
   RESPAWN_TICKS,
   ROUND_TICKS,
   SPAWNS,
+  pickSpawn,
+  recoilSettle,
+  recoilShot,
+  RECOIL_SETTLE_DELAY,
   TICK_HZ,
   YAW_UNITS,
   boxBlocked,
@@ -48,7 +50,10 @@ import {
   FREE_SALT, FREE_SALT_BYTES, SWITCH_TICKS, WEAPONS, WEAPON_COUNT,
   W_PISTOL, W_RIFLE, W_SHOTGUN, saltSeeds, spreadHash,
 } from "../../shared/weapons";
-import { GRID, MAP_ID, MAP_NAME } from "../../shared/map";
+import { BANDSTAND, GRID, MAP_ID, MAP_NAME, ZONES } from "../../shared/map";
+import {
+  inWideSpace, key as cellKeyOf, nearestCover, pocketCells, reachable as walkable, sees, walkDistances,
+} from "./mapcheck";
 import { fromHex, sha256Hex, toHex } from "../../shared/sha256";
 import { REPLAY_SEED, REPLAY_TICKS, runMatch } from "./replay";
 import { FREE_SEAT_BOT, FREE_SEAT_OPEN, Room } from "../src/room";
@@ -95,43 +100,12 @@ function roster(n: number): RosterEntry[] {
   return out;
 }
 
-const cellKey = (x: number, y: number, z: number) => (y * GRID_Z + z) * GRID_X + x;
-
 /**
- * Cells a player can stand in and get to on foot from the given starts.
- *
- * Walk, climb one block, or fall any distance: exactly the moves sim.step
- * allows without jumping. Used by the map tests so that neither the sightline
- * budget nor the reachability check counts a perch nobody can occupy.
+ * A clear spot on the bandstand for two players to face each other along +z:
+ * east of both music stands, inside the canopy posts.
  */
-function reachable(starts: readonly { x: number; y: number; z: number }[]): Set<number> {
-  const standable = (ix: number, iy: number, iz: number) =>
-    solidAt(ix, iy - 1, iz) && !solidAt(ix, iy, iz) &&
-    !solidAt(ix, iy + Math.ceil(PLAYER_HEIGHT) - 1, iz);
-
-  const seen = new Set<number>();
-  const queue: [number, number, number][] = [];
-  for (const s of starts) {
-    const c: [number, number, number] = [
-      Math.floor(s.x + GRID_X / 2), s.y, Math.floor(s.z + GRID_Z / 2),
-    ];
-    seen.add(cellKey(...c));
-    queue.push(c);
-  }
-  while (queue.length > 0) {
-    const [x, y, z] = queue.pop()!;
-    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as [number, number][]) {
-      for (let ny = y + 1; ny >= 1; ny--) {
-        if (ny >= GRID_Y - 1) continue;
-        if (!standable(x + dx, ny, z + dz)) continue;
-        const k = cellKey(x + dx, ny, z + dz);
-        if (!seen.has(k)) { seen.add(k); queue.push([x + dx, ny, z + dz]); }
-        break;
-      }
-    }
-  }
-  return seen;
-}
+const DUEL_X = 52;
+const DUEL_Z = 19;
 
 /* -------------------------------------------------------- determinism --- */
 
@@ -271,20 +245,29 @@ test("walking into a wall stops, and never enters it", () => {
 });
 
 test("a one block step is climbed by walking, a two block one is not", () => {
-  // A stage lip is two blocks above the floor. The stair beside it is two
-  // separate one block steps, which is the difference the map relies on.
+  // The bandstand is two blocks above the floor. The steps on its south
+  // face are two separate one block steps, which is the difference the map
+  // relies on: walking climbs the steps, and walking into the side does not.
   const w = createWorld(1);
   const p = w.players[0];
-
-  // Stand in the lane in front of the middle stage bay and walk north into
-  // its step run, which climbs the two block stage lip one block at a time.
-  p.x = cellCentreX(22);
-  p.z = cellCentreZ(19);
+  p.x = cellCentreX(47);
+  p.z = cellCentreZ(32);
   p.y = LEVEL_GROUND;
   p.vy = 0;
-  // Yaw 0 looks along -z, so this walks north up the lane into the steps.
-  run(w, 0, input({ moveY: 127, yaw: 0 }), 180);
-  assert.equal(p.y, LEVEL_STAGE, `expected to be on the stage at ${LEVEL_STAGE}, got ${p.y}`);
+  // Yaw 0 looks along -z, so this walks north up the steps.
+  run(w, 0, input({ moveY: 127, yaw: 0 }), 120);
+  assert.equal(p.y, LEVEL_STAGE, `expected to be on the bandstand at ${LEVEL_STAGE}, got ${p.y}`);
+
+  // Beside the steps, the same walk meets the two block side and stops.
+  const w2 = createWorld(1);
+  const q = w2.players[0];
+  q.x = cellCentreX(42);
+  q.z = cellCentreZ(32);
+  q.y = LEVEL_GROUND;
+  q.vy = 0;
+  run(w2, 0, input({ moveY: 127, yaw: 0 }), 120);
+  assert.equal(q.y, LEVEL_GROUND, "a two block side should not be walked up");
+  assert.ok(q.z > cellCentreZ(BANDSTAND.z1), "and should stop against it");
 });
 
 test("supportTop and onGround agree with the grid", () => {
@@ -341,8 +324,8 @@ test("a ray stops at the first solid block", () => {
 });
 
 test("a ray fired up through the open roof hits nothing", () => {
-  // Over the hall floor between the stage and the first booth row there is no
-  // roof structure, so a shot straight up leaves the world.
+  // Over the nave floor between the bandstand and the north gallery there is
+  // no roof structure, so a shot straight up leaves the world.
   const x = cellCentreX(24);
   const z = cellCentreZ(15);
   if (!solidAt(24, GRID_Y - 1, 15)) {
@@ -357,12 +340,12 @@ test("walls and floors block a shot, and an open line does not", () => {
   const victim = w.players[1];
   const hits: HitEvent[] = [];
 
-  // Three blocks apart in the open pocket on the stage: the shot lands.
-  shooter.x = cellCentreX(22);
-  shooter.z = cellCentreZ(10);
+  // Three blocks apart on the open bandstand: the shot lands.
+  shooter.x = cellCentreX(DUEL_X);
+  shooter.z = cellCentreZ(DUEL_Z);
   shooter.y = LEVEL_STAGE;
-  victim.x = cellCentreX(22);
-  victim.z = cellCentreZ(13);
+  victim.x = cellCentreX(DUEL_X);
+  victim.z = cellCentreZ(DUEL_Z + 3);
   victim.y = LEVEL_STAGE;
   // Yaw 0 looks along -z, so looking at +z is half a turn.
   const toward = YAW_UNITS / 2;
@@ -372,34 +355,35 @@ test("walls and floors block a shot, and an open line does not", () => {
   assert.ok(victim.hp < before, "expected a hit down an open aisle");
   assert.ok(hits.length > 0, "and a hit event for it");
 
-  // Now put a booth between them. Shooting through it must not land.
+  // Now put the fountain's brick plinth between them, which stands taller
+  // than an eye. Shooting through it must not land.
   const w2 = createWorld(2);
   const s2 = w2.players[0];
   const v2 = w2.players[1];
-  s2.x = cellCentreX(6);
-  s2.z = cellCentreZ(20);
+  s2.x = cellCentreX(30);
+  s2.z = cellCentreZ(47);
   s2.y = LEVEL_GROUND;
-  // Across the hall: there are booths, piers and trusses in between.
-  v2.x = cellCentreX(41);
-  v2.z = cellCentreZ(20);
+  v2.x = cellCentreX(62);
+  v2.z = cellCentreZ(47);
   v2.y = LEVEL_GROUND;
   const hp2 = v2.hp;
-  run(w2, 0, input({ yaw: YAW_UNITS / 4 }), 1);
-  run(w2, 0, input({ yaw: YAW_UNITS / 4, fire: 1 }), 20, hits);
+  const east = (YAW_UNITS * 3) / 4;
+  run(w2, 0, input({ yaw: east }), 1);
+  run(w2, 0, input({ yaw: east, fire: 1 }), 20, hits);
   assert.equal(v2.hp, hp2, "a shot across the hall should be stopped by cover");
 });
 
 test("a lag compensated shot does not land on someone who is behind cover now", () => {
-  // On the stage, looking north up the pocket in front of the organ case.
-  // Rewound, the victim is in the open; by the tick the shot is resolved
-  // they are behind the case. From where they stand that hit would be a
-  // bullet through a wall, so it does not land.
+  // On the nave floor, looking north at one of the iron columns. Rewound,
+  // the victim is in the open in front of it; by the tick the shot is
+  // resolved they are behind it. From where they stand that hit would be a
+  // bullet through iron, so it does not land.
   const setup = (nowZ: number) => {
     const w = createWorld(2);
     const shooter = w.players[0];
     const victim = w.players[1];
-    shooter.x = cellCentreX(22); shooter.z = cellCentreZ(13); shooter.y = LEVEL_STAGE;
-    victim.x = cellCentreX(22); victim.z = cellCentreZ(10); victim.y = LEVEL_STAGE;
+    shooter.x = cellCentreX(27); shooter.z = cellCentreZ(42); shooter.y = LEVEL_GROUND;
+    victim.x = cellCentreX(27); victim.z = cellCentreZ(39); victim.y = LEVEL_GROUND;
     const seen = w.tick;
     step(w, [input({ tick: 0, view: seen }), null], []); // records the victim in the open
     victim.z = cellCentreZ(nowZ);
@@ -410,14 +394,14 @@ test("a lag compensated shot does not land on someone who is behind cover now", 
     return { victim, hits };
   };
 
-  const hidden = setup(5);
-  assert.ok(!exposedNow(cellCentreX(22), LEVEL_STAGE + EYE_HEIGHT, cellCentreZ(13), hidden.victim));
-  assert.equal(hidden.hits.length, 0, "behind the organ case now, so no hit");
+  const hidden = setup(34);
+  assert.ok(!exposedNow(cellCentreX(27), LEVEL_GROUND + EYE_HEIGHT, cellCentreZ(42), hidden.victim));
+  assert.equal(hidden.hits.length, 0, "behind the column now, so no hit");
   assert.equal(hidden.victim.hp, MAX_HP);
 
   // The same rewound shot on a victim who stepped back but is still in the
   // open lands, so the rule only takes away hits through cover.
-  const open = setup(11);
+  const open = setup(40);
   assert.ok(open.hits.length > 0, "still in the open, so the rewound shot lands");
 });
 
@@ -426,7 +410,7 @@ test("a shot at someone on the floor below is stopped by the gallery deck", () =
   const up = w.players[0];
   const down = w.players[1];
 
-  // Gallery above the west aisle, and someone directly underneath it.
+  // The west gallery, and someone in the arcade directly underneath it.
   up.x = cellCentreX(2);
   up.z = cellCentreZ(20);
   up.y = LEVEL_GALLERY;
@@ -446,11 +430,11 @@ test("a head shot with the pistol kills outright, a body shot does not", () => {
   const w = createWorld(2);
   const s = w.players[0];
   const v = w.players[1];
-  s.x = cellCentreX(22);
-  s.z = cellCentreZ(10);
+  s.x = cellCentreX(DUEL_X);
+  s.z = cellCentreZ(DUEL_Z);
   s.y = LEVEL_STAGE;
-  v.x = cellCentreX(22);
-  v.z = cellCentreZ(13);
+  v.x = cellCentreX(DUEL_X);
+  v.z = cellCentreZ(DUEL_Z + 3);
   v.y = LEVEL_STAGE;
 
   const hits: HitEvent[] = [];
@@ -474,95 +458,121 @@ test("a head shot with the pistol kills outright, a body shot does not", () => {
 
 /* --------------------------------------------------------------- map --- */
 
-test("every spawn is standable, spread over the levels, and under cover", () => {
-  assert.equal(SPAWNS.length, 6);
+const cellOf = (s: { x: number; y: number; z: number }): [number, number, number] =>
+  [Math.floor(s.x + GRID_X / 2), s.y, Math.floor(s.z + GRID_Z / 2)];
+
+test("there are at least twelve spawns, standable and under cover", () => {
+  assert.ok(SPAWNS.length >= 12, `only ${SPAWNS.length} spawns`);
   const levels = new Set(SPAWNS.map((s) => s.y));
-  assert.ok(levels.size >= 3, `spawns should span at least three levels, got ${[...levels]}`);
-  assert.ok(levels.has(LEVEL_GROUND));
-  assert.ok(levels.has(LEVEL_GALLERY));
-  assert.ok(levels.has(LEVEL_GIRDER) || levels.has(LEVEL_STAGE));
-
+  assert.ok(levels.has(LEVEL_GROUND) && levels.has(LEVEL_GALLERY), `spawn levels ${[...levels]}`);
   for (const s of SPAWNS) {
-    const ix = Math.floor(s.x + GRID_X / 2);
-    const iz = Math.floor(s.z + GRID_Z / 2);
-    assert.ok(solidAt(ix, s.y - 1, iz), "nothing to stand on");
-    assert.ok(!boxBlocked(s.x, s.y, s.z), "inside a block");
-    // Cover within a few blocks in at least one direction, so a spawn is not
-    // in the open on a map this dense.
-    let nearest = Infinity;
-    for (let i = 0; i < 16; i++) {
-      const a = (i / 16) * Math.PI * 2;
-      const d = rayGrid(s.x, s.y + EYE_HEIGHT, s.z, Math.sin(a), 0, Math.cos(a), 40);
-      if (d < nearest) nearest = d;
-    }
-    assert.ok(nearest < 5, `spawn at ${s.x},${s.z} has no cover within 5 blocks`);
+    const [ix, iy, iz] = cellOf(s);
+    assert.ok(solidAt(ix, iy - 1, iz), `nothing to stand on at ${ix},${iy},${iz}`);
+    assert.ok(!boxBlocked(s.x, s.y, s.z), `inside a block at ${ix},${iy},${iz}`);
+    // Something to put between yourself and the room within a few steps.
+    assert.ok(nearestCover(ix, iy, iz) < 5, `spawn ${ix},${iy},${iz} has no cover within 5 blocks`);
   }
 });
 
-/**
- * The sightline budget, in blocks.
- *
- * The design target is twenty. The limit is twenty two because the galleries
- * are deliberately the long sightline level: they are a thin walkway with a
- * balustrade you can shoot over, no cover to speak of, and the longest lines
- * in the building run along them and across the stage from them. That is what
- * they are for. Anyone standing there trades cover for a view, and the eleven
- * lines in the hall that exceed twenty are all theirs.
- *
- * The floor, the stage and the roof route all come in well under twenty. If a
- * map edit pushes the worst line past this, the fix is geometry, not a bigger
- * number here.
- */
-const SIGHTLINE_LIMIT = 22;
-
-test("no open sightline runs much past twenty blocks", () => {
-  // Measured from every cell a player can actually stand in and reach, in 32
-  // horizontal directions at eye height. Unreachable perches are excluded
-  // because nobody can shoot from one.
-  const seen = reachable(SPAWNS);
-
-  const dirs: [number, number][] = [];
-  for (let i = 0; i < 32; i++) {
-    const a = (i / 32) * Math.PI * 2;
-    dirs.push([Math.sin(a), Math.cos(a)]);
-  }
-
-  let worst = 0;
-  let where = "";
-  for (const k of seen) {
-    const ix = k % GRID_X;
-    const iz = Math.floor(k / GRID_X) % GRID_Z;
-    const iy = Math.floor(k / (GRID_X * GRID_Z));
-    for (const [dx, dz] of dirs) {
-      const d = rayGrid(cellCentreX(ix), iy + EYE_HEIGHT, cellCentreZ(iz), dx, 0, dz, 70);
-      if (d > worst) { worst = d; where = `(${ix},${iy},${iz})`; }
+test("no spawn can see another", () => {
+  const cells = SPAWNS.map(cellOf);
+  for (let i = 0; i < cells.length; i++) {
+    for (let j = i + 1; j < cells.length; j++) {
+      assert.ok(!sees(cells[i], cells[j]), `spawns ${cells[i]} and ${cells[j]} see each other`);
     }
   }
-  assert.ok(
-    worst <= SIGHTLINE_LIMIT,
-    `longest sightline is ${worst.toFixed(1)} blocks from ${where}`,
-  );
 });
 
-test("every level and the roof route are reachable on foot from the floor", () => {
+test("every spawn is under six seconds' walk from a fight", () => {
+  // Six seconds at full speed, walking, no jumps.
+  const budget = 6 * PLAYER_SPEED;
+  const zones = ZONES.map((z) => cellKeyOf(z.x, z.y, z.z));
+  for (const s of SPAWNS) {
+    const dist = walkDistances(cellOf(s));
+    const best = Math.min(...zones.map((k) => dist.get(k) ?? Infinity));
+    assert.ok(best <= budget, `spawn ${cellOf(s)} is ${best.toFixed(1)} blocks from the nearest zone`);
+  }
+});
+
+test("every level, every zone and every spawn are reachable on foot", () => {
   // Walk and one block climbs only, from a ground spawn. No jumping, which is
-  // the conservative set: if the galleries and the catwalks are reachable
-  // without it, they are reachable.
-  const reach = reachable([SPAWNS[0]]);
+  // the conservative set: if the galleries are reachable without it, they
+  // are reachable.
+  const start = SPAWNS.find((s) => s.y === LEVEL_GROUND)!;
+  const reach = walkable([cellOf(start)]);
   const counts = new Map<number, number>();
   for (const k of reach) {
     const iy = Math.floor(k / (GRID_X * GRID_Z));
     counts.set(iy, (counts.get(iy) ?? 0) + 1);
   }
-  for (const level of [LEVEL_GROUND, LEVEL_STAGE, LEVEL_GALLERY, LEVEL_GIRDER]) {
-    assert.ok((counts.get(level) ?? 0) > 20, `level ${level} barely reachable: ${counts.get(level)}`);
+  for (const level of [LEVEL_GROUND, LEVEL_STAGE, LEVEL_GALLERY]) {
+    assert.ok((counts.get(level) ?? 0) > 100, `level ${level} barely reachable: ${counts.get(level)}`);
+  }
+  for (const z of ZONES) {
+    assert.ok(reach.has(cellKeyOf(z.x, z.y, z.z)), `${z.name} is cut off`);
   }
   // And every spawn, since a player respawning into a sealed pocket is stuck
   // there for the rest of the round.
   for (const s of SPAWNS) {
-    const k = cellKey(Math.floor(s.x + GRID_X / 2), s.y, Math.floor(s.z + GRID_Z / 2));
-    assert.ok(reach.has(k), `spawn at ${s.x},${s.y},${s.z} is cut off from the floor`);
+    assert.ok(reach.has(cellKeyOf(...cellOf(s))), `spawn ${cellOf(s)} is cut off from the floor`);
   }
+});
+
+test("there is no pocket narrower than four blocks", () => {
+  const reach = walkable(SPAWNS.map(cellOf));
+  const pockets = pocketCells(reach);
+  assert.equal(pockets.length, 0, `${pockets.length} cells in narrow pockets`);
+});
+
+test("the arcades under the side galleries are six blocks wide the whole way", () => {
+  for (const [x0, x1] of [[1, 6], [GRID_X - 7, GRID_X - 2]]) {
+    for (let z = 8; z < GRID_Z - 8; z++) {
+      for (let x = x0; x <= x1; x++) {
+        assert.ok(
+          solidAt(x, LEVEL_GROUND - 1, z) && !solidAt(x, LEVEL_GROUND, z) && !solidAt(x, LEVEL_GROUND + 1, z),
+          `arcade blocked at ${x},${z}`,
+        );
+      }
+    }
+  }
+});
+
+test("the nave is open: long lines run most of its length", () => {
+  // Down the nave at eye height, just inside each row of columns, a line
+  // runs from the north gallery's edge most of the way to the engines.
+  for (const x of [31, 64]) {
+    const d = rayGrid(cellCentreX(x), LEVEL_GROUND + EYE_HEIGHT, cellCentreZ(8), 0, 0, 1, 90);
+    assert.ok(d > 60, `the nave line at x ${x} is only ${d.toFixed(1)} blocks`);
+  }
+  // And across it, between two column pairs, wall to wall under the galleries.
+  const across = rayGrid(cellCentreX(8), LEVEL_GROUND + EYE_HEIGHT, cellCentreZ(66), 1, 0, 0, 90);
+  assert.ok(across > 50, `the cross line is only ${across.toFixed(1)} blocks`);
+  // The centre of the nave is a big open floor, not a set of rooms.
+  assert.ok(inWideSpace(34, LEVEL_GROUND, 44, 6) && inWideSpace(60, LEVEL_GROUND, 44, 6));
+});
+
+test("a respawn lands out of sight of the living, and away from them", () => {
+  const w = createWorld(6);
+  // Everybody but slot 0 stands on a spawn; slot 0 is dead and due back.
+  const taken = [0, 3, 6, 9, 12];
+  for (let i = 1; i < 6; i++) {
+    const s = SPAWNS[taken[i - 1] % SPAWNS.length];
+    Object.assign(w.players[i], { x: s.x, y: s.y, z: s.z });
+  }
+  for (let deaths = 0; deaths < 20; deaths++) {
+    w.players[0].deaths = deaths;
+    const i = pickSpawn(w, 0);
+    const mine = cellOf(SPAWNS[i]);
+    for (let j = 1; j < 6; j++) {
+      const e = cellOf(w.players[j]);
+      assert.ok(!sees(e, mine), `respawn ${mine} is in sight of slot ${j} at ${e}`);
+      assert.notDeepEqual(mine, e, "respawned on top of someone");
+    }
+  }
+  // With nobody else alive it still picks a spawn, and the choice is a pure
+  // function of the world, so the replay picks the same one.
+  for (let j = 1; j < 6; j++) w.players[j].alive = false;
+  assert.equal(pickSpawn(w, 0), pickSpawn(w, 0));
 });
 
 /* ------------------------------------------------------------ map id --- */
@@ -647,16 +657,16 @@ test("folding the salt uses every byte of it", () => {
   assert.equal(seen.size, 32);
 });
 
-/** Put two players nose to nose in the open pocket on the stage. */
+/** Put two players nose to nose on the bandstand. */
 function duel(): ReturnType<typeof createWorld> {
   const w = createWorld(2);
   const s = w.players[0];
   const v = w.players[1];
-  s.x = cellCentreX(22);
-  s.z = cellCentreZ(10);
+  s.x = cellCentreX(DUEL_X);
+  s.z = cellCentreZ(DUEL_Z);
   s.y = LEVEL_STAGE;
-  v.x = cellCentreX(22);
-  v.z = cellCentreZ(12);
+  v.x = cellCentreX(DUEL_X);
+  v.z = cellCentreZ(DUEL_Z + 2);
   v.y = LEVEL_STAGE;
   return w;
 }
@@ -809,11 +819,11 @@ test("firing is refused during a weapon swap, and a swap cancels a reload", () =
   const w = createWorld(2);
   const p = w.players[0];
   const hits: HitEvent[] = [];
-  p.x = cellCentreX(22);
-  p.z = cellCentreZ(10);
+  p.x = cellCentreX(DUEL_X);
+  p.z = cellCentreZ(DUEL_Z);
   p.y = LEVEL_STAGE;
-  w.players[1].x = cellCentreX(22);
-  w.players[1].z = cellCentreZ(12);
+  w.players[1].x = cellCentreX(DUEL_X);
+  w.players[1].z = cellCentreZ(DUEL_Z + 2);
   w.players[1].y = LEVEL_STAGE;
 
   // Ask for the shotgun and pull the trigger immediately.
@@ -848,6 +858,93 @@ test("a hostile weapon index is ignored", () => {
     assert.ok(p.weapon >= 0 && p.weapon < WEAPON_COUNT, `weapon became ${p.weapon}`);
   }
   assert.equal(p.weapon, W_RIFLE, "nothing in that list should have changed the weapon");
+});
+
+/* ------------------------------------------------------------ recoil --- */
+
+test("a held rifle climbs, walks sideways, and settles once the trigger rests", () => {
+  const w = createWorld(1);
+  const p = w.players[0];
+  const spec = WEAPONS[W_RIFLE];
+  const hits: HitEvent[] = [];
+  let last = 0;
+  // Into the air, so nothing is hit and nothing else changes.
+  for (let i = 0; i < spec.fireInterval * 12; i++) {
+    step(w, [{ ...input({ fire: 1, pitch: 10000 }), tick: w.tick, view: w.tick }], hits);
+    assert.ok(p.kick >= last - spec.recoil.settle * spec.fireInterval, "the climb should not drop away mid string");
+    last = p.kick;
+  }
+  assert.ok(p.kick > spec.recoil.kick * 3, `twelve shots climbed only ${p.kick}`);
+  assert.ok(p.kick <= spec.recoil.kickMax);
+  let swayed = false;
+  for (let i = 0; i < spec.fireInterval * 6; i++) {
+    step(w, [{ ...input({ fire: 1, pitch: 10000 }), tick: w.tick, view: w.tick }], hits);
+    if (p.drift !== 0) swayed = true;
+  }
+  assert.ok(swayed, "a string of shots should push the aim sideways");
+  run(w, 0, input(), 120);
+  assert.equal(p.kick, 0, "two seconds after letting go the aim is back");
+  assert.equal(p.drift, 0);
+});
+
+test("the client's recoil model is the sim's, tick for tick", () => {
+  // The client runs recoilShot and recoilSettle over its own shots to move
+  // the camera. Fed the same trigger and the same cadence, it has to land on
+  // exactly the numbers the sim does, or the crosshair is lying.
+  for (const weapon of [W_RIFLE, W_PISTOL, W_SHOTGUN]) {
+    const spec = WEAPONS[weapon];
+    const w = createWorld(1);
+    const p = w.players[0];
+    run(w, 0, input({ weapon: weapon + 1 }), SWITCH_TICKS + 1);
+    const mine = { kick: 0, drift: 0 };
+    let lastFire = -999;
+    let streak = 0;
+    let held = false;
+    for (let t = 0; t < 400; t++) {
+      // Bursts with pauses, so the settle path runs too.
+      const fire = t % 50 < 30 && p.ammo[weapon] > 0;
+      const tick = w.tick;
+      step(w, [{ ...input({ fire: fire ? 1 : 0, pitch: 12000 }), tick, view: tick }], []);
+      recoilSettle(mine, spec, tick - lastFire);
+      const edge = spec.auto || !held;
+      held = fire;
+      if (fire && edge && tick - lastFire >= spec.fireInterval && p.reloadUntil === 0) {
+        streak = tick - lastFire <= 15 ? streak + 1 : 0;
+        lastFire = tick;
+        recoilShot(mine, spec, streak);
+      }
+      assert.equal(mine.kick, p.kick, `${spec.name} kick parted at tick ${tick}`);
+      assert.equal(mine.drift, p.drift, `${spec.name} drift parted at tick ${tick}`);
+    }
+    assert.ok(RECOIL_SETTLE_DELAY > 0);
+  }
+});
+
+test("a shot goes where the recoil has put the aim", () => {
+  // Point blank on the bandstand with the pistol: level, it is a head shot.
+  // With the aim already kicked thirty degrees up, the same shot sails over.
+  const shoot = (kick: number) => {
+    const w = duel();
+    const hits: HitEvent[] = [];
+    w.players[1].z = cellCentreZ(DUEL_Z + 3);
+    run(w, 0, input({ weapon: W_PISTOL + 1, yaw: FACING }), SWITCH_TICKS + 1);
+    w.players[0].kick = kick;
+    w.players[0].lastFireTick = w.tick - WEAPONS[W_PISTOL].fireInterval;
+    step(w, [{ ...input({ yaw: FACING, fire: 1 }), tick: w.tick, view: w.tick }], hits);
+    return hits;
+  };
+  assert.equal(shoot(0).length, 1, "level, the shot lands");
+  assert.equal(shoot(0.5).length, 0, "kicked up, it goes over their head");
+});
+
+test("a weapon swap and a respawn both start with no recoil", () => {
+  const w = createWorld(1);
+  const p = w.players[0];
+  for (let i = 0; i < 30; i++) step(w, [{ ...input({ fire: 1, pitch: 10000 }), tick: w.tick, view: w.tick }], []);
+  assert.ok(p.kick > 0);
+  step(w, [{ ...input({ weapon: W_SHOTGUN + 1 }), tick: w.tick, view: w.tick }], []);
+  assert.equal(p.kick, 0);
+  assert.equal(p.drift, 0);
 });
 
 test("the round is three minutes and respawning takes three seconds", () => {

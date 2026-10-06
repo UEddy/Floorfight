@@ -1,22 +1,21 @@
 /**
  * The Hall: the arena, as data.
  *
- * A blocky reading of a large Victorian exhibition hall. Ground floor is a
- * grid of expo booths of varying heights, so the floor is a maze of narrow
- * lanes with cover in every one of them. A raised main stage fills the north
- * end under a balcony. Galleries run the full way around all four walls,
- * reached by stairs in the four corners. Above everything, iron roof girders
- * link four pavilion tops: the shortest way across the hall and the one with
- * nothing to hide behind.
+ * An original reading of a great Victorian exhibition hall, at the scale of
+ * an open arena rather than a maze. One long central nave under the glass,
+ * wide enough to fight across, with a fountain court in the middle of it.
+ * Iron columns march down both sides of the nave and split it from two side
+ * aisles: a market of stalls on the west and a glasshouse garden of hedges on
+ * the east. A bandstand stands at the north end and a court of great engines
+ * at the south. Galleries run along the west, north and east walls on cast
+ * iron, reached by six block wide staircases, and the arcades under them are
+ * covered walkways the length of the hall.
  *
- * Nothing here is branded. Booth signs carry invented names only, because the
- * app has to be publishable and because borrowing a real company's name for
- * set dressing is not worth a single argument.
+ * Nothing here is branded. Signs carry invented names only, because the app
+ * has to be publishable and because borrowing a real company's name for set
+ * dressing is not worth a single argument.
  *
- * One block grid, 1 world unit per block, authored by hand and checked in. It
- * replaces the seeded crate scatter that came before it. A seeded map was
- * reproducible but could not be designed, and sightlines, cover and the route
- * between levels are the whole game.
+ * One block grid, 1 world unit per block, authored by hand and checked in.
  *
  * Determinism: the ops below are integers, the builder only writes array
  * cells, and nothing here calls Math.random or reads the clock. Two runs of
@@ -29,9 +28,19 @@ import { sha256Hex } from "./sha256";
 
 /* ---------------------------------------------------------------- size --- */
 
-export const GRID_X = 48;
-export const GRID_Y = 17;
-export const GRID_Z = 48;
+/**
+ * 96 by 96 blocks of floor and 24 of height.
+ *
+ * At 7.4 blocks a second a player crosses the hall in about thirteen seconds
+ * and reaches the nearest fight from any spawn in under six, which is the
+ * size an open six player arena wants: room to manoeuvre and long lines down
+ * the nave, without anyone spending a round looking for somebody to shoot.
+ * Twenty four high leaves the galleries a full storey up and room above them
+ * for the glass roof to read as a roof.
+ */
+export const GRID_X = 96;
+export const GRID_Y = 24;
+export const GRID_Z = 96;
 
 /**
  * World origin sits at the middle of the grid, so the arena is centred on
@@ -45,9 +54,10 @@ export const HALF_Z = GRID_Z / 2;
 
 /** Walk surfaces, as feet heights. The layout is written in terms of these. */
 export const LEVEL_GROUND = 1;
+/** The bandstand's platform. */
 export const LEVEL_STAGE = 3;
+/** The three galleries. */
 export const LEVEL_GALLERY = 7;
-export const LEVEL_GIRDER = 11;
 
 /** Human readable name. Only ever shown to people. */
 export const MAP_NAME = "The Hall";
@@ -56,20 +66,22 @@ export const MAP_NAME = "The Hall";
 
 /**
  * Block values. 0 is air. Everything else is solid: the sim only ever asks
- * whether a cell is non-zero, and the value exists so the renderer can draw
- * each material as one merged mesh, one draw call.
+ * whether a cell is non-zero, and the value exists so the renderer can pick
+ * each material's look.
  */
 export const AIR = 0;
 export const M_FLOOR = 1;    // board floor
-export const M_BRICK = 2;    // perimeter wall
-export const M_BOOTH = 3;    // booth stalls
-export const M_BOOTH2 = 4;   // booth stalls, second tone
-export const M_STAIR = 5;    // stairs and ramps, deliberately loud
-export const M_GALLERY = 6;  // gallery decks and bridges
-export const M_IRON = 7;     // girders, trusses, pavilion tops
-export const M_STAGE = 8;    // stage platform and organ case
-export const M_TRIM = 9;     // balustrades, parapets, clock faces
-export const MATERIAL_COUNT = 10;
+export const M_BRICK = 2;    // perimeter wall, fountain plinth
+export const M_BOOTH = 3;    // market stalls
+export const M_BOOTH2 = 4;   // market stalls, second tone
+export const M_STAIR = 5;    // stairs, deliberately loud
+export const M_GALLERY = 6;  // gallery decks
+export const M_IRON = 7;     // columns, engines
+export const M_STAGE = 8;    // bandstand
+export const M_TRIM = 9;     // balustrades, fountain rim, canopy
+export const M_CRATE = 10;   // crates, the hall's loose cover
+export const M_HEDGE = 11;   // garden hedges and planters
+export const MATERIAL_COUNT = 12;
 
 /* ------------------------------------------------------------------ ops --- */
 
@@ -101,12 +113,12 @@ function air(x0: number, y0: number, z0: number, x1: number, y1: number, z1: num
   return { k: "air", x0, y0, z0, x1, y1, z1 };
 }
 /**
- * A run of one-block steps climbing away from (x, z).
+ * A run of one block steps climbing away from (x, z).
  *
  * Step i is filled from y up to y + i, so the last step's top is y + steps.
  * `w` is the width across the direction of travel. One block per step is what
- * the sim's step-up resolution expects, which is why every ramp in the hall is
- * a staircase rather than a slope.
+ * the sim's step-up resolution expects, which is why every way up in the hall
+ * is a staircase rather than a slope: a player walks straight up it.
  */
 function stair(
   x: number, y: number, z: number,
@@ -115,361 +127,238 @@ function stair(
   return { k: "stair", x, y, z, w, steps, dir, m };
 }
 
-/** Low cover: two blocks is enough to break a standing player's sightline. */
-function stall(x: number, z: number, w = 2, d = 2, h = 2, y = LEVEL_GROUND, m = M_BOOTH): Box {
+/** A block of cover standing on the floor: w by d, h high. */
+function cover(x: number, z: number, w: number, d: number, h: number, m = M_CRATE, y = LEVEL_GROUND): Box {
   return box(x, y, z, x + w - 1, y + h - 1, z + d - 1, m);
 }
 
 /* --------------------------------------------------------------- layout --- */
 
 const G = LEVEL_GROUND;   // 1
-const S = LEVEL_STAGE;    // 3
 const L = LEVEL_GALLERY;  // 7
-const R = LEVEL_GIRDER;   // 11
-const TOP = GRID_Y - 1;   // 16
+const TOP = GRID_Y - 1;   // 23
+const MAXX = GRID_X - 1;  // 95
+const MAXZ = GRID_Z - 1;  // 95
 
 /**
- * Booth grid. Five bays across, four deep, on a seven block pitch: a five
- * block booth and a two block lane. Values are booth heights in blocks, so
- * the floor reads as a city of stalls of different sizes rather than a flat
- * field of identical crates. 0 leaves the bay to a pavilion or to the clock
- * tower.
- *
- * The grid stops short of all four walls. The strips it leaves are the side
- * aisles, under the galleries, and they carry their own stalls further down.
+ * The nave columns: 2 by 2 iron, the full height, in two rows down either
+ * side of the nave. Ten blocks of open floor between each pair, so they are
+ * cover to duck behind rather than a wall, and they frame the lines down the
+ * nave instead of cutting them.
  */
-export const BAY_X: readonly number[] = [9, 16, 23, 30, 37];
-export const BAY_Z: readonly number[] = [16, 23, 30, 37];
-export const BOOTHS: readonly (readonly number[])[] = [
-  [0, 2, 4, 0, 3],
-  [2, 3, 0, 2, 4],
-  [0, 4, 0, 0, 2],
-  [4, 2, 3, 4, 3],
+export const NAVE_COLUMN_Z: readonly number[] = [12, 24, 36, 48, 60, 72, 84];
+export const NAVE_COLUMN_X: readonly number[] = [26, 68];
+
+/**
+ * Cast iron columns carrying the gallery decks, on the deck's inner edge. The
+ * arcade behind them stays six blocks clear the whole way along.
+ */
+export const GALLERY_COLUMNS: readonly number[] = [10, 18, 30, 40, 50, 58, 66, 80, 88];
+
+/** The same for the north gallery, along x. */
+export const NORTH_GALLERY_COLUMNS: readonly number[] = [16, 30, 62, 78];
+
+/** Market stalls in the west aisle: x, z, height, material. */
+export const STALLS: readonly { x: number; z: number; h: number }[] = [
+  { x: 14, z: 30, h: 2 }, { x: 14, z: 40, h: 3 }, { x: 14, z: 50, h: 2 }, { x: 14, z: 60, h: 3 },
+];
+const STALL_W = 3;
+const STALL_D = 4;
+
+/** Garden hedges in the east aisle: x, z, length along x. */
+export const HEDGES: readonly { x: number; z: number; w: number }[] = [
+  { x: 72, z: 32, w: 5 }, { x: 79, z: 40, w: 5 }, { x: 72, z: 48, w: 5 },
+  { x: 79, z: 56, w: 5 }, { x: 72, z: 64, w: 5 },
 ];
 
-/** Pavilions: tall booths whose roofs carry the girders. */
-export const PAVILIONS: readonly { x: number; z: number }[] = [
-  { x: 9, z: 16 }, { x: 30, z: 16 }, { x: 9, z: 30 }, { x: 30, z: 30 },
+/** The fountain at the heart of the nave. */
+export const FOUNTAIN = { x0: 40, z0: 40, x1: 55, z1: 55 } as const;
+
+/** The bandstand at the north end of the nave. */
+export const BANDSTAND = { x0: 40, z0: 18, x1: 55, z1: 27 } as const;
+
+/** The engine court at the south end. */
+export const ENGINES: readonly { x: number; z: number; w: number; d: number; h: number }[] = [
+  { x: 32, z: 78, w: 6, d: 6, h: 3 },
+  { x: 58, z: 78, w: 6, d: 6, h: 3 },
+  { x: 44, z: 86, w: 8, d: 5, h: 4 },
 ];
 
 /**
- * Lane crossings closed by a stall, as a three by four grid over the gaps
- * between bays. Closing them in a staggered pattern keeps every lane short
- * without cutting the floor into disconnected pockets.
+ * The combat zones, for the tests and for anyone reading the map: the middle
+ * of each, as a cell on the floor (or the bandstand). Every spawn has to have
+ * one of these within about six seconds' walk.
  */
-const CROSSINGS: readonly (readonly number[])[] = [
-  [1, 0, 1, 0],
-  [0, 1, 0, 1],
-  [1, 0, 1, 0],
+export const ZONES: readonly { name: string; x: number; y: number; z: number }[] = [
+  { name: "fountain court", x: 47, y: G, z: 37 },
+  { name: "bandstand", x: 47, y: 3, z: 22 },
+  { name: "engine court", x: 47, y: G, z: 80 },
+  { name: "market", x: 19, y: G, z: 46 },
+  { name: "garden", x: 77, y: G, z: 48 },
 ];
 
-function booths(): Op[] {
+function galleries(): Op[] {
   const out: Op[] = [];
-  for (let r = 0; r < BAY_Z.length; r++) {
-    for (let c = 0; c < BAY_X.length; c++) {
-      const h = BOOTHS[r][c];
-      if (h === 0) continue;
-      const x = BAY_X[c];
-      const z = BAY_Z[r];
-      out.push(box(x, G, z, x + 4, G + h - 1, z + 4, (r + c) % 2 === 0 ? M_BOOTH : M_BOOTH2));
-      // One of the hall's roof piers stands in the middle of every bay. They
-      // run the full height of the grid, which is the whole point: a pier
-      // that stopped short of the roof would leave a lane open above it, and
-      // a column that reaches the roof has no standable top for anyone to
-      // shoot from. The booth is built around its pier, and the girders
-      // overhead thread between them.
-      out.push(box(x + 1, G, z + 1, x + 3, TOP, z + 3, M_IRON));
-    }
+  // Decks, one block thick at y 6, so their tops are the gallery level.
+  out.push(box(1, L - 1, 1, 7, L - 1, MAXZ - 1, M_GALLERY));          // west
+  out.push(box(MAXX - 7, L - 1, 1, MAXX - 1, L - 1, MAXZ - 1, M_GALLERY)); // east
+  out.push(box(8, L - 1, 1, MAXX - 8, L - 1, 7, M_GALLERY));           // north
+  // Balustrades on the inner edges: one block, so a player can shoot over
+  // them and be shot over them, which is the trade a gallery offers.
+  out.push(box(7, L, 8, 7, L, MAXZ - 1, M_TRIM));
+  out.push(box(MAXX - 7, L, 8, MAXX - 7, L, MAXZ - 1, M_TRIM));
+  out.push(box(7, L, 7, MAXX - 7, L, 7, M_TRIM));
+  // Every few blocks a taller post in the balustrade, the only cover up
+  // there worth the name.
+  for (const z of [14, 34, 46, 62, 84]) {
+    out.push(box(7, L + 1, z, 7, L + 1, z, M_TRIM));
+    out.push(box(MAXX - 7, L + 1, z, MAXX - 7, L + 1, z, M_TRIM));
   }
-  for (let r = 0; r < CROSSINGS.length; r++) {
-    for (let c = 0; c < CROSSINGS[r].length; c++) {
-      if (!CROSSINGS[r][c]) continue;
-      out.push(stall(BAY_X[c] + 5, BAY_Z[r] + 5, 2, 2, 3, G, M_BOOTH2));
-    }
+  for (const x of NORTH_GALLERY_COLUMNS) out.push(box(x, L + 1, 7, x, L + 1, 7, M_TRIM));
+  // Columns under the decks' inner edges.
+  for (const z of GALLERY_COLUMNS) {
+    out.push(box(7, G, z, 7, L - 2, z, M_IRON));
+    out.push(box(MAXX - 7, G, z, MAXX - 7, L - 2, z, M_IRON));
+  }
+  for (const x of NORTH_GALLERY_COLUMNS) out.push(box(x, G, 7, x, L - 2, 7, M_IRON));
+  // A few crates on the decks against the back wall, leaving four blocks of
+  // walkway past each one.
+  for (const z of [24, 54, 76]) {
+    out.push(cover(1, z, 2, 3, 2, M_CRATE, L));
+    out.push(cover(MAXX - 2, z + 4, 2, 3, 2, M_CRATE, L));
+  }
+  out.push(cover(38, 1, 3, 2, 2, M_CRATE, L));
+  out.push(cover(56, 1, 3, 2, 2, M_CRATE, L));
+  return out;
+}
+
+function stairs(): Op[] {
+  const out: Op[] = [];
+  // Six wide, six steps, out into the aisles and climbing towards the wall.
+  // The balustrade is opened where each one lands.
+  for (const z of [20, 70]) {
+    out.push(stair(13, G, z, 6, 6, "-x"));
+    out.push(air(7, L, z, 7, L + 1, z + 5));
+    out.push(stair(MAXX - 13, G, z, 6, 6, "+x"));
+    out.push(air(MAXX - 7, L, z, MAXX - 7, L + 1, z + 5));
+  }
+  // The north gallery from the nave, behind the bandstand.
+  out.push(stair(45, G, 13, 6, 6, "-z"));
+  out.push(air(45, L, 7, 50, L + 1, 7));
+  return out;
+}
+
+function nave(): Op[] {
+  const out: Op[] = [];
+  for (const x of NAVE_COLUMN_X) {
+    for (const z of NAVE_COLUMN_Z) out.push(box(x, G, z, x + 1, TOP, z + 1, M_IRON));
+  }
+
+  // The fountain: a low rim you can step over, a pool, and a brick plinth in
+  // the middle with a column on it, which is the one piece of hard cover in
+  // the open centre of the nave.
+  const f = FOUNTAIN;
+  out.push(box(f.x0, G, f.z0, f.x1, G, f.z0, M_TRIM));
+  out.push(box(f.x0, G, f.z1, f.x1, G, f.z1, M_TRIM));
+  out.push(box(f.x0, G, f.z0, f.x0, G, f.z1, M_TRIM));
+  out.push(box(f.x1, G, f.z0, f.x1, G, f.z1, M_TRIM));
+  out.push(box(f.x0 + 5, G, f.z0 + 5, f.x1 - 5, G + 2, f.z1 - 5, M_BRICK));
+  out.push(box(f.x0 + 7, G + 3, f.z0 + 7, f.x1 - 7, G + 6, f.z1 - 7, M_TRIM));
+
+  // Islands of crates down the nave: enough to break up a run across it,
+  // spaced so the nave still reads as one open floor.
+  for (const [x, z, w, d, h] of [
+    [34, 33, 3, 2, 2], [59, 33, 3, 2, 2], [33, 60, 2, 3, 2], [61, 60, 2, 3, 2],
+    [46, 63, 4, 2, 2], [36, 12, 2, 2, 2], [58, 12, 2, 2, 2],
+  ] as const) {
+    out.push(cover(x, z, w, d, h));
   }
   return out;
 }
 
-/** The four pavilion masses, their girder pads and their truss webs. */
-function pavilions(): Op[] {
+function bandstand(): Op[] {
   const out: Op[] = [];
-  for (const p of PAVILIONS) {
-    const x0 = p.x, x1 = p.x + 4;
-    const z0 = p.z, z1 = p.z + 4;
-    out.push(box(x0, G, z0, x1, R - 2, z1, M_BOOTH2));
-    out.push(box(x0, R - 1, z0, x1, R - 1, z1, M_IRON));
-    // Truss webs on the two faces that point at a wall. They terminate the
-    // sightline along the girder that lands there and double as the only
-    // fall protection on the roof. The two faces that point into the hall
-    // are deliberately open ledges.
-    const west = p.x < GRID_X / 2;
-    const north = p.z < GRID_Z / 2;
-    out.push(box(west ? x0 : x1, R, z0, west ? x0 : x1, R + 2, z1, M_IRON));
-    out.push(box(x0, R, north ? z0 : z1, x1, R + 2, north ? z0 : z1, M_IRON));
+  const b = BANDSTAND;
+  // Two blocks up, so its top is the stage level.
+  out.push(box(b.x0, G, b.z0, b.x1, LEVEL_STAGE - 1, b.z1, M_STAGE));
+  // Steps on the south and north faces, six wide, and a canopy on four
+  // posts high enough to stand under.
+  out.push(stair(45, G, b.z1 + 2, 6, 2, "-z"));
+  out.push(stair(45, G, b.z0 - 2, 6, 2, "+z"));
+  for (const [x, z] of [[b.x0, b.z0], [b.x1, b.z0], [b.x0, b.z1], [b.x1, b.z1]] as const) {
+    out.push(box(x, LEVEL_STAGE, z, x, LEVEL_STAGE + 5, z, M_IRON));
+  }
+  out.push(box(b.x0, LEVEL_STAGE + 6, b.z0, b.x1, LEVEL_STAGE + 6, b.z1, M_TRIM));
+  // Music stands, which on a bandstand are the cover.
+  out.push(cover(45, 21, 2, 1, 1, M_TRIM, LEVEL_STAGE));
+  out.push(cover(49, 24, 2, 1, 1, M_TRIM, LEVEL_STAGE));
+  return out;
+}
+
+function aisles(): Op[] {
+  const out: Op[] = [];
+  // West: the market, one row of stalls down the middle of the aisle, with
+  // crates between them.
+  STALLS.forEach((s, i) => {
+    out.push(cover(s.x, s.z, STALL_W, STALL_D, s.h, i % 2 === 0 ? M_BOOTH : M_BOOTH2));
+  });
+  for (const [x, z] of [[20, 35], [10, 45], [20, 55], [10, 64]] as const) out.push(cover(x, z, 2, 2, 2));
+  // East: the garden, hedges staggered across the aisle.
+  for (const h of HEDGES) out.push(cover(h.x, h.z, h.w, 2, 2, M_HEDGE));
+  for (const [x, z] of [[85, 36], [74, 44], [84, 60]] as const) out.push(cover(x, z, 2, 2, 1, M_HEDGE));
+  return out;
+}
+
+function engines(): Op[] {
+  const out: Op[] = [];
+  for (const e of ENGINES) {
+    out.push(box(e.x, G, e.z, e.x + e.w - 1, G + e.h - 1, e.z + e.d - 1, M_IRON));
+    // A chimney on each, which is what makes them read as engines.
+    out.push(box(e.x + 1, G + e.h, e.z + 1, e.x + 2, G + e.h + 3, e.z + 2, M_BRICK));
+  }
+  for (const [x, z, w, d, h] of [
+    [40, 74, 2, 2, 2], [54, 74, 2, 2, 2], [28, 88, 3, 2, 2], [64, 88, 3, 2, 2], [20, 82, 2, 3, 2],
+    [74, 82, 2, 3, 2],
+  ] as const) {
+    out.push(cover(x, z, w, d, h));
   }
   return out;
 }
 
 /**
- * The roof route: two catwalks, one over each of the outer booth rows,
- * linking the pavilion roofs across the hall.
- *
- * Each one zigzags between the roof piers rather than running straight, and
- * that is not decoration. A straight girder from one pavilion to the other
- * would be a twenty six block sightline with no cover on it at any point,
- * which is exactly the firing lane the rest of the hall is built to avoid.
- * Threaded between the piers, no leg of the walk is open for more than about
- * fourteen blocks, and crossing from one side of the hall to the other means
- * stepping into the open four separate times.
- *
- * Each cell listed here is carved clear to head height and then floored, so
- * the route is continuous by construction, through piers and trusses
- * included. The hole a girder leaves in a pier is how a girder meets a
- * column anyway.
+ * Bays along the south wall, between short buttresses. They are where most
+ * of the floor level spawns are: off the floor's long lines, a step from the
+ * engine court, and walled off from each other.
  */
-const CATWALK: readonly { x0: number; z0: number; x1: number; z1: number }[] = [
-  // North catwalk, over the booth row at z 16 to 20.
-  { x0: 14, z0: 20, x1: 16, z1: 20 },
-  { x0: 16, z0: 16, x1: 16, z1: 20 },
-  { x0: 17, z0: 16, x1: 23, z1: 16 },
-  { x0: 23, z0: 16, x1: 23, z1: 20 },
-  { x0: 24, z0: 20, x1: 29, z1: 20 },
-  // South catwalk, over the booth row at z 30 to 34.
-  { x0: 14, z0: 30, x1: 16, z1: 30 },
-  { x0: 16, z0: 30, x1: 16, z1: 34 },
-  { x0: 17, z0: 34, x1: 23, z1: 34 },
-  { x0: 23, z0: 30, x1: 23, z1: 34 },
-  { x0: 24, z0: 30, x1: 29, z1: 30 },
-];
-
-function catwalks(): Op[] {
+function southBays(): Op[] {
   const out: Op[] = [];
-  for (const c of CATWALK) {
-    out.push(air(c.x0, R, c.z0, c.x1, R + 1, c.z1));
-    out.push(box(c.x0, R - 1, c.z0, c.x1, R - 1, c.z1, M_IRON));
-  }
+  for (const x of [12, 24, 36, 59, 71, 83]) out.push(box(x, G, MAXZ - 5, x, G + 3, MAXZ - 1, M_BRICK));
   return out;
 }
 
-/**
- * Gallery piers: one block deep, blocking two of the gallery's three walking
- * cells and leaving the third open.
- *
- * The open cell is never the middle one, and it alternates between the inner
- * and the outer lane along the run. That is what bounds the sightline: a shot
- * angled across the gallery has to cross the middle lane and is stopped by
- * the first pier it meets, and a shot straight down either outer lane is
- * stopped by the next pier that opens the other side. The positions are
- * listed rather than spaced evenly because they have to miss the four
- * stairwells, the two bridges and the trusses.
- */
-const PIERS_NS: readonly number[] = [7, 11, 18, 22, 25, 32, 36, 40];
-const PIERS_WE: readonly number[] = [5, 12, 16, 22, 25, 29, 35, 42];
-
-function galleryPiers(): Op[] {
-  const out: Op[] = [];
-  let cycle = 0;
-  const run = (at: (i: number, cell: number) => [number, number], list: readonly number[]) => {
-    for (const i of list) {
-      const open = (cycle++ % 2) * 2;
-      for (let cell = 0; cell < 3; cell++) {
-        if (cell === open) continue;
-        const [x, z] = at(i, cell);
-        out.push(box(x, L, z, x, L + 3, z, M_TRIM));
-      }
-    }
-  };
-  run((i, cell) => [i, 1 + cell], PIERS_NS);
-  run((i, cell) => [i, 46 - cell], PIERS_NS);
-  run((i, cell) => [1 + cell, i], PIERS_WE);
-  run((i, cell) => [46 - cell, i], PIERS_WE);
-  return out;
-}
-
-/**
- * The hall. Order matters: later ops overwrite earlier ones, which is how
- * doorways are cut into walls, how the galleries are opened over their
- * stairwells and how the catwalks are carved through the roof structure.
- */
 const OPS: readonly Op[] = [
   /* shell ---------------------------------------------------------------- */
+  box(0, 0, 0, MAXX, 0, MAXZ, M_FLOOR),
+  // Full height on all four sides. Nothing sees out, nothing shoots out.
+  box(0, 1, 0, MAXX, TOP, 0, M_BRICK),
+  box(0, 1, MAXZ, MAXX, TOP, MAXZ, M_BRICK),
+  box(0, 1, 0, 0, TOP, MAXZ, M_BRICK),
+  box(MAXX, 1, 0, MAXX, TOP, MAXZ, M_BRICK),
 
-  box(0, 0, 0, GRID_X - 1, 0, GRID_Z - 1, M_FLOOR),
-  // Full height on all four sides. Nothing sees out, nothing shoots out, and
-  // the roof route cannot be left over the top of the wall.
-  box(0, 1, 0, GRID_X - 1, TOP, 0, M_BRICK),
-  box(0, 1, GRID_Z - 1, GRID_X - 1, TOP, GRID_Z - 1, M_BRICK),
-  box(0, 1, 0, 0, TOP, GRID_Z - 1, M_BRICK),
-  box(GRID_X - 1, 1, 0, GRID_X - 1, TOP, GRID_Z - 1, M_BRICK),
-
-  /* booths and pavilions ------------------------------------------------- */
-
-  ...booths(),
-  ...pavilions(),
-
-  /* side aisle stalls ---------------------------------------------------- */
-
-  // The aisles under the galleries would otherwise be four clear runs the
-  // length of the hall. Each stall here spans most of its aisle and the gap
-  // it leaves alternates from one side to the other, so no straight channel
-  // survives more than about twenty blocks.
-  stall(1, 13, 6, 2, 4), stall(3, 17, 6, 2, 4, G, M_BOOTH2),
-  stall(1, 22, 6, 2, 4), stall(3, 28, 6, 2, 4, G, M_BOOTH2),
-  stall(1, 32, 6, 2, 4), stall(3, 37, 6, 2, 4, G, M_BOOTH2),
-  stall(42, 13, 6, 2, 4), stall(40, 17, 6, 2, 4, G, M_BOOTH2),
-  stall(42, 22, 6, 2, 4), stall(40, 28, 6, 2, 4, G, M_BOOTH2),
-  stall(42, 32, 6, 2, 4), stall(40, 37, 6, 2, 4, G, M_BOOTH2),
-  stall(13, 42, 2, 5, 4), stall(18, 40, 2, 7, 4, G, M_BOOTH2),
-  stall(24, 42, 2, 5, 4), stall(30, 40, 2, 7, 4, G, M_BOOTH2),
-  stall(36, 42, 2, 5, 4),
-  stall(6, 6, 2, 3, 4, G, M_BOOTH2), stall(42, 6, 2, 3, 4, G, M_BOOTH2),
-
-  /* the stage ------------------------------------------------------------ */
-
-  // Two blocks up, filling the north end. The north gallery runs above its
-  // back as a balcony, and the front is open to the hall, so the stage is
-  // fought over from three sides at once.
-  box(9, G, 1, 38, S - 1, 14, M_STAGE),
-  // One step run per stage bay, in the one block lane in front of the stage.
-  // They cannot reach back to z 16: that is the first booth row.
-  stair(10, G, 15, 3, 2, "-z"),
-  stair(22, G, 15, 3, 2, "-z"),
-  stair(33, G, 15, 3, 2, "-z"),
-  // The organ case. A tall mass at the north end, and the single most useful
-  // piece of geometry in the hall for cutting lines down its length.
-  box(20, S, 6, 27, 13, 9, M_STAGE),
-  box(21, 13, 7, 26, 13, 8, M_TRIM),
-  // Podiums at the stage lip, which also chop the lane along its front.
-  stall(16, 14, 3, 3, 3, G, M_STAGE),
-  stall(25, 14, 3, 3, 3, G, M_STAGE),
-  stall(35, 14, 3, 3, 3, G, M_STAGE),
-  // Display cases on the stage, placed to break the view through the two
-  // proscenium arches. Without these the stage is one long shot end to end.
-  stall(16, 2, 3, 3, 3, S, M_BOOTH),
-  stall(31, 4, 3, 4, 3, S, M_BOOTH),
-  stall(17, 11, 2, 2, 2, S, M_BOOTH2),
-  stall(30, 11, 3, 3, 3, S, M_BOOTH2),
-  stall(34, 9, 3, 3, 2, S, M_BOOTH),
-  stall(10, 6, 3, 3, 3, S, M_BOOTH2),
-
-  /* galleries ------------------------------------------------------------ */
-
-  // Three blocks of deck all the way round, so the hall is overlooked from
-  // every wall. A Victorian hall does this in cast iron; here it is one slab,
-  // a balustrade thin enough to shoot over, and a pier every few blocks.
-  box(1, L - 1, 1, 46, L - 1, 4, M_GALLERY),
-  box(1, L - 1, 43, 46, L - 1, 46, M_GALLERY),
-  box(1, L - 1, 5, 4, L - 1, 42, M_GALLERY),
-  box(43, L - 1, 5, 46, L - 1, 42, M_GALLERY),
-  // The balustrade stands on the innermost cell of the deck, which leaves a
-  // walkway three blocks wide behind it.
-  box(1, L, 4, 46, L, 4, M_TRIM),
-  box(1, L, 43, 46, L, 43, M_TRIM),
-  box(4, L, 5, 4, L, 42, M_TRIM),
-  box(43, L, 5, 43, L, 42, M_TRIM),
-  ...galleryPiers(),
-
-  /* corner stairs to the galleries --------------------------------------- */
-
-  // Six steps, three wide, one in each corner. The gallery slab is cut away
-  // over each run, which is what makes a corner a stairwell rather than a
-  // ceiling two blocks above the steps.
-  // Two blocks wide, not three: the stairwell has to leave one lane of deck
-  // beside it or it cuts the gallery ring in half.
-  stair(1, G, 10, 2, 6, "-z"),
-  air(1, L - 1, 6, 2, L - 1, 10),
-  stair(45, G, 10, 2, 6, "-z"),
-  air(45, L - 1, 6, 46, L - 1, 10),
-  stair(1, G, 37, 2, 6, "+z"),
-  air(1, L - 1, 37, 2, L - 1, 41),
-  stair(45, G, 37, 2, 6, "+z"),
-  air(45, L - 1, 37, 46, L - 1, 41),
-
-  /* roof structure ------------------------------------------------------- */
-
-  // Lattice trusses spanning the hall, one block thick, carried on the piers.
-  // Over the floor they sit four blocks up, so the aisles walk freely under
-  // them. Over the stage they run to the ground as proscenium walls, because
-  // the stage surface is already three blocks up and a truss above it would
-  // leave a clear shot the full width of the hall at head height.
-  //
-  // Between these four and the piers, the volume above the booths is cut into
-  // compartments around fourteen blocks across. That is the entire reason the
-  // galleries and the roof route are not firing positions over the whole map.
-  box(14, 4, 15, 14, TOP, 46, M_IRON),
-  box(28, 4, 15, 28, TOP, 46, M_IRON),
-  box(14, G, 1, 14, TOP, 14, M_IRON),
-  box(28, G, 1, 28, TOP, 14, M_IRON),
-  box(1, 4, 21, 46, TOP, 21, M_IRON),
-  box(1, 4, 35, 46, TOP, 35, M_IRON),
-
-  // Two more roof piers, standing on the stage itself. The hall's roof needs
-  // carrying over the stage as much as over the floor, and these are what
-  // stop the long diagonal from a side gallery across the stage to the far
-  // wall, which is otherwise the worst line in the building.
-  box(10, G, 5, 12, TOP, 8, M_IRON),
-  box(32, G, 5, 34, TOP, 8, M_IRON),
-
-  // Two posts carrying the ends of the catwalks. They exist to stop the
-  // sightline along the open face of a pavilion roof, which is the one line
-  // the zigzag does not break on its own.
-  box(19, R, 20, 20, TOP, 20, M_IRON),
-  box(19, R, 30, 20, TOP, 30, M_IRON),
-  box(39, R, 27, 40, TOP, 31, M_IRON),
-
-  // The proscenium truss, across the front of the stage. It starts six
-  // blocks up rather than four, so the stage still overlooks the hall at head
-  // height while the galleries and the roof cannot see over the stage wall.
-  box(1, 6, 15, 46, TOP, 15, M_IRON),
-
-  // Arched openings through the trusses, two blocks of headroom each. The
-  // proscenium walls are deliberately not arched at stage level: each of the
-  // three stage bays is entered up its own steps from the hall floor, which
-  // is what keeps the stage from being one clear shot end to end.
-  air(14, L, 1, 14, L + 1, 3),
-  air(28, L, 1, 28, L + 1, 3),
-  air(14, L, 44, 14, L + 1, 46),
-  air(28, L, 44, 28, L + 1, 46),
-  air(1, L, 21, 3, L + 1, 21),
-  air(44, L, 21, 46, L + 1, 21),
-  air(1, L, 35, 3, L + 1, 35),
-  air(44, L, 35, 46, L + 1, 35),
-  air(1, L, 15, 3, L + 1, 15),
-  air(44, L, 15, 46, L + 1, 15),
-
-  /* the clock tower ------------------------------------------------------ */
-
-  // The centrepiece, and the piece of geometry the sightline budget leans on
-  // hardest: the only thing standing in the middle of the hall that is taller
-  // than the roof route, so no line crosses the centre at any level.
-  box(21, G, 23, 27, TOP, 29, M_BRICK),
-  box(21, 12, 23, 27, 13, 29, M_IRON),
-  box(22, 14, 23, 26, 15, 23, M_TRIM),
-  box(22, 14, 29, 26, 15, 29, M_TRIM),
-  box(21, 14, 24, 21, 15, 28, M_TRIM),
-  box(27, 14, 24, 27, 15, 28, M_TRIM),
-
-  /* the roof route ------------------------------------------------------- */
-
-  ...catwalks(),
-
-  // Two ways up, on opposite corners of the hall: a bridge out from the
-  // gallery, then four steps onto a pavilion roof. The last step lands in a
-  // notch cut through that pavilion's truss web.
-  box(5, L - 1, 17, 8, L - 1, 18, M_GALLERY),
-  air(4, L, 17, 4, L, 18),
-  stair(6, L, 17, 2, 4, "+x"),
-  air(9, R, 17, 9, R + 2, 18),
-  box(39, L - 1, 29, 42, L - 1, 30, M_GALLERY),
-  air(43, L, 29, 43, L, 30),
-  stair(38, L, 29, 2, 4, "-x"),
-  air(34, R, 29, 34, R + 2, 30),
+  ...galleries(),
+  ...nave(),
+  ...bandstand(),
+  ...aisles(),
+  ...engines(),
+  ...southBays(),
+  // Stairs last, so their landings cut through anything above.
+  ...stairs(),
 ];
 
 /* --------------------------------------------------------------- signs --- */
 
 /**
- * Booth signage. Invented names only: no real conference, company or token
+ * Signage. Invented names only: no real conference, company or token
  * branding anywhere in the hall, so nothing here can be mistaken for an
  * endorsement and nothing has to come out before the app is published.
  *
@@ -485,24 +374,17 @@ export interface Sign {
 }
 
 export const SIGNS: readonly Sign[] = [
-  { x: 16, y: 2, z: 16, w: 5, facing: 0, text: "HALL OF LOOMS" },
-  { x: 23, y: 4, z: 16, w: 5, facing: 0, text: "AERATED WATERS" },
-  { x: 37, y: 3, z: 16, w: 5, facing: 0, text: "PNEUMATIC POST" },
-  { x: 9, y: 2, z: 27, w: 5, facing: 1, text: "GLASSWORKS" },
-  { x: 16, y: 3, z: 27, w: 5, facing: 1, text: "MINERAL CABINET" },
-  { x: 30, y: 2, z: 27, w: 5, facing: 1, text: "SILK AND DAMASK" },
-  { x: 37, y: 4, z: 27, w: 5, facing: 1, text: "IRON AND STEAM" },
-  { x: 16, y: 4, z: 34, w: 5, facing: 1, text: "BOTANIC HOUSE" },
-  { x: 37, y: 2, z: 34, w: 5, facing: 1, text: "TELEGRAPHY" },
-  { x: 9, y: 4, z: 41, w: 5, facing: 1, text: "ORRERY NO. 4" },
-  { x: 16, y: 2, z: 41, w: 5, facing: 1, text: "CARRIAGE WORKS" },
-  { x: 23, y: 3, z: 41, w: 5, facing: 1, text: "ELECTRIC LIGHT" },
-  { x: 30, y: 4, z: 41, w: 5, facing: 1, text: "GRAND BAZAAR" },
-  { x: 37, y: 3, z: 41, w: 5, facing: 1, text: "CLOCKWORK COURT" },
-  { x: 9, y: 6, z: 16, w: 5, facing: 2, text: "WEST PAVILION" },
-  { x: 34, y: 6, z: 30, w: 5, facing: 3, text: "EAST PAVILION" },
-  { x: 20, y: 11, z: 9, w: 8, facing: 1, text: "THE GREAT ORGAN" },
-  { x: 21, y: 11, z: 23, w: 7, facing: 0, text: "THE HALL" },
+  { x: 14, y: 1, z: 30, w: 3, facing: 0, text: "SILKS" },
+  { x: 14, y: 2, z: 40, w: 3, facing: 0, text: "CLOCKS" },
+  { x: 14, y: 1, z: 50, w: 3, facing: 0, text: "SPICES" },
+  { x: 14, y: 2, z: 60, w: 3, facing: 0, text: "GLASS" },
+  { x: 32, y: 2, z: 78, w: 6, facing: 0, text: "STEAM HAMMER" },
+  { x: 58, y: 2, z: 78, w: 6, facing: 0, text: "BEAM ENGINE" },
+  { x: 44, y: 3, z: 86, w: 8, facing: 0, text: "THE GREAT ENGINE" },
+  { x: 40, y: 1, z: 27, w: 16, facing: 1, text: "THE BANDSTAND" },
+  { x: 1, y: 10, z: 30, w: 12, facing: 3, text: "WEST GALLERY" },
+  { x: 94, y: 10, z: 54, w: 12, facing: 2, text: "EAST GALLERY" },
+  { x: 36, y: 10, z: 1, w: 24, facing: 1, text: "THE HALL" },
 ];
 
 /* -------------------------------------------------------------- build --- */
@@ -612,21 +494,33 @@ export function cellCentreZ(iz: number): number {
   return iz - HALF_Z + 0.5;
 }
 
+/**
+ * Spawn cells, as grid indices: x, feet height, z.
+ *
+ * Picked by walking the map: every reachable cell out at the edge of the hall
+ * with cover close by and a combat zone within about forty blocks' walk, then
+ * chosen one at a time, each as far as possible from the ones before and out
+ * of sight of all of them. The order is that order, so the first six, which
+ * are where a fresh round's seats start, are already spread round the hall.
+ */
+const SPAWN_CELLS: readonly [number, number, number][] = [
+  [42, 1, 94], [78, 1, 1], [1, 7, 23], [94, 7, 62], [1, 1, 69], [39, 7, 3],
+  [79, 1, 94], [75, 1, 34], [14, 1, 94], [21, 1, 34], [55, 1, 16], [56, 1, 76],
+  [75, 1, 61], [24, 1, 74],
+];
+
 /* ------------------------------------------------------------- spawns --- */
 
 /**
- * Six spawns, one per seat, spread over every level: two on the hall floor at
- * opposite corners, one on the stage, two on the galleries and one on the
- * roof. Feet heights are the walk surface, so a spawning player is standing,
- * not falling. The map test checks each spawn is standable and has cover
- * within a few blocks, because spawning in the open on a floor this dense is
- * a death sentence.
+ * Fourteen spawns, spread round the hall and over its levels. Each one stands
+ * on a surface, has cover within a few blocks, is within about six seconds'
+ * walk of a combat zone, and cannot see any other spawn: those are tests in
+ * sim.test.ts, so a map edit that breaks one fails loudly. Feet heights are
+ * the walk surface, so a spawning player is standing, not falling.
+ *
+ * Which one a player gets is decided in sim.ts by pickSpawn, away from the
+ * living enemies; this list only says where the choices are.
  */
-export const SPAWNS: readonly { x: number; y: number; z: number }[] = [
-  { x: cellCentreX(6), y: LEVEL_GROUND, z: cellCentreZ(20) },
-  { x: cellCentreX(44), y: LEVEL_GROUND, z: cellCentreZ(26) },
-  { x: cellCentreX(21), y: LEVEL_STAGE, z: cellCentreZ(2) },
-  { x: cellCentreX(2), y: LEVEL_GALLERY, z: cellCentreZ(14) },
-  { x: cellCentreX(45), y: LEVEL_GALLERY, z: cellCentreZ(33) },
-  { x: cellCentreX(11), y: LEVEL_GIRDER, z: cellCentreZ(31) },
-];
+export const SPAWNS: readonly { x: number; y: number; z: number }[] = SPAWN_CELLS.map(
+  ([ix, iy, iz]) => ({ x: cellCentreX(ix), y: iy, z: cellCentreZ(iz) }),
+);

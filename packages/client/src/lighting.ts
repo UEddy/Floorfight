@@ -1,14 +1,18 @@
 import {
-  BAY_X,
-  BAY_Z,
-  BOOTHS,
+  BANDSTAND,
+  ENGINES,
+  FOUNTAIN,
+  GALLERY_COLUMNS,
   GRID_X,
   GRID_Y,
   GRID_Z,
   LEVEL_GALLERY,
   LEVEL_GROUND,
   LEVEL_STAGE,
-  PAVILIONS,
+  NAVE_COLUMN_X,
+  NAVE_COLUMN_Z,
+  NORTH_GALLERY_COLUMNS,
+  STALLS,
   blockMinX,
   blockMinZ,
   solidAt,
@@ -23,10 +27,10 @@ import { rayGrid } from "../../shared/sim";
  * while the open lanes are lit from above. Lanterns: warm points hung round
  * the hall, each lighting what it can see within a few blocks, tested
  * against the block grid with the same ray the server uses for shots, so a
- * booth throws a shadow across the lane behind it.
+ * column throws a shadow across the floor behind it.
  *
  * None of this costs anything per frame. A real point light per lantern
- * would be ninety lights in a forward renderer on a phone, which is not a
+ * would be hundreds of lights in a forward renderer on a phone, which is not a
  * thing a Galaxy S10 does at 60 fps; baked, it is the same single draw call
  * the hall already was.
  */
@@ -64,38 +68,38 @@ function place(): Lantern[] {
       wx, wz, k,
     });
   };
+  /** A lamp on each face of a w by d footprint, at height y. */
+  const ring = (x: number, z: number, w: number, d: number, y: number, h = 0.6, k = 1) => {
+    const mx = x + (w >> 1);
+    const mz = z + (d >> 1);
+    hang(mx, y, z - 1, 0, 1, h, k);
+    hang(mx, y, z + d, 0, -1, h, k);
+    hang(x - 1, y, mz, 1, 0, h, k);
+    hang(x + w, y, mz, -1, 0, h, k);
+  };
 
-  // On the roof pier in the middle of every booth, just above the booth, on
-  // the two faces that look down a lane. Alternating which two, so the lanes
-  // get light from both directions along their length.
-  for (let r = 0; r < BAY_Z.length; r++) {
-    for (let c = 0; c < BAY_X.length; c++) {
-      const h = BOOTHS[r][c];
-      if (h === 0) continue;
-      const x = BAY_X[c];
-      const z = BAY_Z[r];
-      const y = LEVEL_GROUND + h;
-      if ((r + c) % 2 === 0) {
-        hang(x + 2, y, z, 0, 1);
-        hang(x + 2, y, z + 4, 0, -1);
-      } else {
-        hang(x, y, z + 2, 1, 0);
-        hang(x + 4, y, z + 2, -1, 0);
-      }
-    }
+  // The nave columns, a lamp on every face above head height, so the nave
+  // floor is lit in pools between them and the columns read down its length.
+  for (const x of NAVE_COLUMN_X) {
+    for (const z of NAVE_COLUMN_Z) ring(x, z, 2, 2, 4);
   }
 
-  // Pavilion sides, a lamp in the middle of each face at head height.
-  for (const p of PAVILIONS) {
-    hang(p.x + 2, 3, p.z - 1, 0, 1, 0.9);
-    hang(p.x + 2, 3, p.z + 5, 0, -1, 0.9);
-    hang(p.x - 1, 3, p.z + 2, 1, 0, 0.9);
-    hang(p.x + 5, 3, p.z + 2, -1, 0, 0.9);
+  // The gallery columns, on both faces: one into the nave, one into the
+  // arcade under the deck, which has no sky to speak of.
+  for (const z of GALLERY_COLUMNS) {
+    hang(8, 3, z, -1, 0);
+    hang(6, 3, z, 1, 0);
+    hang(GRID_X - 7, 3, z, 1, 0);
+    hang(GRID_X - 9, 3, z, -1, 0);
+  }
+  for (const x of NORTH_GALLERY_COLUMNS) {
+    hang(x, 3, 8, 0, -1);
+    hang(x, 3, 6, 0, 1);
   }
 
-  // Sconces round the perimeter wall: under the galleries, lighting the
-  // side aisles, and again on the galleries themselves.
-  for (let i = 3; i < GRID_X - 2; i += 5) {
+  // Sconces round the perimeter wall: in the arcades, and again on the
+  // galleries themselves.
+  for (let i = 3; i < GRID_X - 2; i += 6) {
     for (const y of [3, LEVEL_GALLERY + 2]) {
       hang(i, y, 1, 0, -1, 0.3);
       hang(i, y, GRID_Z - 2, 0, 1, 0.3);
@@ -104,16 +108,20 @@ function place(): Lantern[] {
     }
   }
 
-  // Footlights along the stage lip, low and dim, facing the hall.
-  for (let x = 10; x <= 37; x += 3) hang(x, LEVEL_STAGE, 13, 0, -1, 0.15, 0.55);
-
-  // The clock tower, lit from its four sides at the height of the booths.
+  // The bandstand: lamps on the inside of its canopy posts.
+  const b = BANDSTAND;
   for (const [x, z, wx, wz] of [
-    [24, 22, 0, 1], [24, 30, 0, -1], [20, 26, 1, 0], [28, 26, -1, 0],
-    [22, 22, 0, 1], [26, 30, 0, -1],
+    [b.x0 + 1, b.z0, -1, 0], [b.x1 - 1, b.z0, 1, 0], [b.x0 + 1, b.z1, -1, 0], [b.x1 - 1, b.z1, 1, 0],
   ] as const) {
-    hang(x, 4, z, wx, wz, 0.5);
+    hang(x, LEVEL_STAGE + 3, z, wx, wz, 0.5);
   }
+
+  // Market stalls, the engines and the fountain plinth, each lit from its
+  // sides, low and a little dim, like lamps on a counter.
+  for (const s of STALLS) ring(s.x, s.z, 3, 4, LEVEL_GROUND + s.h - 1, 0.4, 0.8);
+  for (const e of ENGINES) ring(e.x, e.z, e.w, e.d, LEVEL_GROUND + 1, 0.6, 0.9);
+  const f = FOUNTAIN;
+  ring(f.x0 + 5, f.z0 + 5, f.x1 - f.x0 - 9, f.z1 - f.z0 - 9, LEVEL_GROUND + 2, 0.4, 0.9);
 
   return out;
 }

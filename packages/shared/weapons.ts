@@ -60,17 +60,33 @@ export interface WeaponSpec {
   readonly bloom: number;
   /** Most the bloom can add, in yaw units. */
   readonly bloomMax: number;
+  /** How the weapon climbs and settles. See recoilShot in sim.ts. */
+  readonly recoil: Recoil;
+}
+
+/**
+ * Recoil, as the sim applies it. A shot lifts the aim by `kick` radians, up
+ * to `kickMax`, and pushes it sideways along a fixed sway pattern scaled by
+ * `sway` yaw units. Once the trigger has rested for RECOIL_SETTLE_DELAY ticks
+ * the aim settles back by `settle` radians a tick, and by a yaw unit or two.
+ */
+export interface Recoil {
+  readonly kick: number;
+  readonly kickMax: number;
+  readonly sway: number;
+  readonly settle: number;
 }
 
 function spec(
   id: number, name: string, mag: number, reloadTicks: number, fireInterval: number,
   damage: number, headMult: number, spread: number, pellets: number,
   auto: boolean, range: number, moveSpread: number, bloom: number, bloomMax: number,
+  recoil: Recoil,
 ): WeaponSpec {
   return {
     id, name, mag, reloadTicks, fireInterval, damage, headMult,
     headDamage: Math.round(damage * headMult),
-    spread, pellets, auto, range, moveSpread, bloom, bloomMax,
+    spread, pellets, auto, range, moveSpread, bloom, bloomMax, recoil,
   };
 }
 
@@ -86,18 +102,27 @@ export const WEAPONS: readonly WeaponSpec[] = [
   // Six body shots or three heads. 1.5 second reload.
   // Moving or holding the trigger opens the rifle up to about four degrees,
   // so tapping from a standstill is how it holds a lane.
-  spec(W_RIFLE, "Rifle", 30, 90, 7, 18, 2, 60, 1, true, 90, 40, 8, 48),
+  // Range is the length of the hall and more, so the nave's long lines are
+  // the rifle's to hold.
+  // It climbs about half a degree a shot held down, to five degrees, and
+  // walks side to side as it goes: pulling down against it is the skill.
+  spec(W_RIFLE, "Rifle", 30, 90, 7, 18, 2, 60, 1, true, 140, 40, 8, 48,
+    { kick: 0.017, kickMax: 0.09, sway: 9, settle: 0.003 }),
   // 100 damage to the head: one shot, and the only weapon in the game that
   // can do it. Three to the body, at five rounds a second at best.
   // The one shot head kill wants a still shooter: running, the pistol is
   // three times as wide.
-  spec(W_PISTOL, "Pistol", 12, 75, 13, 40, 2.5, 14, 1, false, 90, 30, 10, 20),
+  // A sharp three degree flip a shot that has mostly settled by the next.
+  spec(W_PISTOL, "Pistol", 12, 75, 13, 40, 2.5, 14, 1, false, 140, 30, 10, 20,
+    { kick: 0.05, kickMax: 0.1, sway: 6, settle: 0.006 }),
   // Eight pellets of 14: everything lands at touching distance, and the shot
-  // stops dead at sixteen blocks. The hall's longest sightline is about
-  // twenty one, so the range limit is what keeps this a weapon for the booth
-  // lanes and the stairwells rather than one more way to hold a long lane.
+  // stops dead at sixteen blocks. The nave's lines run eighty and more, so
+  // the range limit is what keeps this a weapon for the market, the garden
+  // hedges and the stairs rather than one more way to hold a long lane.
   // The pattern is already the spread. Moving does not widen it.
-  spec(W_SHOTGUN, "Shotgun", 6, 150, 45, 14, 1.5, 420, 8, false, 16, 0, 0, 0),
+  // A five degree heave, settled well before the pump is done.
+  spec(W_SHOTGUN, "Shotgun", 6, 150, 45, 14, 1.5, 420, 8, false, 16, 0, 0, 0,
+    { kick: 0.09, kickMax: 0.12, sway: 14, settle: 0.006 }),
 ];
 
 /* --------------------------------------------------------------- spread --- */

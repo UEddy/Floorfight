@@ -22,9 +22,10 @@ export const PROTOCOL_VERSION = 7;
  * inputs produce: 5 added horizontal acceleration and movement and bloom
  * spread, so a v4 log replayed by this build would not reproduce its match.
  * 6 refuses a lag compensated hit on a victim who is behind cover at the
- * tick the shot is resolved.
+ * tick the shot is resolved. 7 is the 96 by 96 hall, respawning away from
+ * enemies, rifle and pistol range long enough for it, and recoil.
  */
-export const LOG_VERSION = 6;
+export const LOG_VERSION = 7;
 
 /** Abuse limits. Exceed any of these and the connection is closed. */
 export const MAX_MSG_BYTES = 4096;

@@ -281,7 +281,9 @@ export class ViewModel {
     this.lagYaw += (Math.max(-0.08, Math.min(0.08, dyaw)) - this.lagYaw) * k;
     this.lagPitch += (Math.max(-0.08, Math.min(0.08, dpitch)) - this.lagPitch) * k;
 
-    // Kick: a spring that snaps back.
+    // Kick: a spring that snaps back. The gun comes back into the shoulder
+    // and its muzzle flips up, on top of the camera's own climb, which is
+    // the sim's recoil.
     this.kick -= this.kick * Math.min(1, dt * 16);
     const kick = this.kick * model.kick;
 
@@ -292,11 +294,11 @@ export class ViewModel {
     const [hx, hy, hz] = model.hold;
     this.root.position.set(
       hx + bobX + swayX + this.lagYaw * 0.35 + kick * 0.004 * this.kickSide,
-      hy + bobY + swayY - lowered * 0.3 - env * 0.05 - this.lagPitch * 0.25,
-      hz + kick * 0.05,
+      hy + bobY + swayY - lowered * 0.3 - env * 0.05 - this.lagPitch * 0.25 + kick * 0.012,
+      hz + kick * 0.075,
     );
     this.root.rotation.set(
-      kick * 0.09 - lowered * 0.7 + env * 0.18 + this.lagPitch * 0.6,
+      kick * 0.14 - lowered * 0.7 + env * 0.18 + this.lagPitch * 0.6,
       // Toed in a touch, so the barrel points at the crosshair rather than
       // parallel to it.
       0.05 + this.lagYaw * 0.8 + env * 0.15,

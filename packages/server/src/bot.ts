@@ -54,6 +54,12 @@ const AIM_TOLERANCE = 140;
  */
 const TURN_RATE = 240;
 
+/**
+ * How far either side of the bearing to the nearest player a hunting bot
+ * heads, in yaw units. About 30 degrees, enough to find a way round a column.
+ */
+const HUNT_JITTER = 700;
+
 /** Ticks of being stuck before picking a new heading and hopping. */
 const STUCK_TICKS = 20;
 
@@ -110,10 +116,22 @@ export class Bot {
       return this.input(tick, 0, 0, false, false, false, 0);
     }
 
-    // Wander: hold a heading for a while, then pick another.
+    // Wander: hold a heading for a while, then pick another. On a hall this
+    // size a purely random walk can spend a round in an empty corner, so
+    // most headings point roughly at the nearest living player, the way a
+    // person heads for the sound of shooting. The jitter and the odd random
+    // heading keep the bots from forming a queue.
     if (tick >= this.headingUntil) {
       this.headingUntil = tick + HEADING_MIN + this.rand(HEADING_MAX - HEADING_MIN);
-      this.aim = this.rand(YAW_UNITS);
+      const prey = this.rand(3) > 0 ? this.nearestLiving(world) : -1;
+      if (prey >= 0) {
+        const t = world.players[prey];
+        const toward = quantYaw(Math.atan2(-(t.x - me.x), -(t.z - me.z)));
+        const jitter = this.rand(HUNT_JITTER * 2) - HUNT_JITTER;
+        this.aim = ((toward + jitter) % YAW_UNITS + YAW_UNITS) % YAW_UNITS;
+      } else {
+        this.aim = this.rand(YAW_UNITS);
+      }
       this.strafe = this.rand(3) - 1;
     }
 
@@ -152,7 +170,9 @@ export class Bot {
       // Yaw units run the same way sim.ts reads them: x is -sin, z is -cos.
       const want = quantYaw(Math.atan2(-dx, -dz));
       this.aim = (want + this.rand(AIM_SLOP * 2) - AIM_SLOP + YAW_UNITS) % YAW_UNITS;
-      this.pitch = Math.atan2(dy, Math.sqrt(dx * dx + dz * dz));
+      // Pull down against most of the climb, the way a person does, and not
+      // all of it, the way a person does not.
+      this.pitch = Math.atan2(dy, Math.sqrt(dx * dx + dz * dz)) - me.kick * 0.7;
       this.strafe = 0;
     }
 
@@ -209,6 +229,20 @@ export class Bot {
     const dx = t.x - me.x;
     const dz = t.z - me.z;
     return dx * dx + dz * dz < 36;
+  }
+
+  /** Nearest living player, seen or not, or -1. */
+  private nearestLiving(world: WorldState): number {
+    const me = world.players[this.slot];
+    let best = -1;
+    let bestD = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < world.players.length; i++) {
+      const t = world.players[i];
+      if (i === this.slot || !t.alive) continue;
+      const d = (t.x - me.x) * (t.x - me.x) + (t.z - me.z) * (t.z - me.z);
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    return best;
   }
 
   /**

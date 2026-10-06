@@ -33,16 +33,23 @@ const H = 540;
  * stands on; the renderer adds eye height. Yaw 0 looks towards -z (the stage
  * end), and a positive yaw turns left.
  */
-const HALF = 24;
+const HALF = 48;
 const cell = (i) => i - HALF + 0.5;
 const VIEWS = [
-  // Picked by casting a fan of rays from every standable cell on each level
-  // and keeping the ones that see furthest: the Hall is a maze, and a view
-  // chosen by hand mostly photographs the nearest pier.
-  { name: "1-floor", x: cell(12), y: 1, z: cell(46), yaw: 1.18, pitch: 0.12 },
-  { name: "2-stage", x: cell(38), y: 3, z: cell(1), yaw: 3.14, pitch: 0.05 },
-  { name: "3-gallery", x: cell(43), y: 7, z: cell(1), yaw: 2.75, pitch: 0.05 },
-  { name: "4-high", x: cell(46), y: 11, z: cell(12), yaw: 1.18, pitch: 0.2 },
+  // Where a player lands: the first spawn, on the floor by the south wall,
+  // looking up the hall.
+  { name: "1-spawn", x: cell(42), y: 1, z: cell(94), yaw: -0.25, pitch: 0.06 },
+  // The nave from the floor south of the fountain, looking north past it to
+  // the bandstand and the north gallery.
+  { name: "2-nave", x: cell(47), y: 1, z: cell(72), yaw: 0, pitch: 0.08 },
+  // The west gallery, looking north along it and across the nave.
+  { name: "3-gallery", x: cell(4), y: 7, z: cell(64), yaw: -0.45, pitch: -0.08 },
+  // The arcade under the east gallery: the covered corridor the length of
+  // the hall.
+  { name: "4-corridor", x: cell(92), y: 1, z: cell(88), yaw: 0.12, pitch: 0.04 },
+  // The market and the garden, the two aisles' fights.
+  { name: "5-market", x: cell(22), y: 1, z: cell(70), yaw: 0.2, pitch: 0.04 },
+  { name: "6-garden", x: cell(84), y: 1, z: cell(70), yaw: 0.1, pitch: 0.04 },
 ];
 
 const children = [];
@@ -141,10 +148,16 @@ async function main() {
   // The fixed views are for looking at the hall, so the death overlay, if the
   // bots got us during the walk, is taken off them.
   await page.addStyleTag({ content: "#tint, #killedby, #respawn { display: none !important; }" });
+  // Draw calls and triangles as the renderer counted them for the frame on
+  // screen, at each view: the hall is chunked, so what is drawn depends on
+  // where the camera looks.
+  const counts = [];
   for (const v of VIEWS) {
     await page.evaluate((v) => window.arena.camera(v), v);
     await sleep(700);
     await page.screenshot({ path: join(OUT, `${v.name}.png`) });
+    const s = await page.evaluate(() => window.arena.peek());
+    counts.push([v.name, s.drawCalls, s.triangles]);
   }
 
   // Closest live opponent, from a few blocks away, for the character model.
@@ -161,7 +174,7 @@ async function main() {
     // pause here photographs the spot they were standing in.
     await page.evaluate((v) => window.arena.camera(v), near);
     await sleep(60);
-    await page.screenshot({ path: join(OUT, "5-opponent.png") });
+    await page.screenshot({ path: join(OUT, "7-opponent.png") });
   }
 
   // The view model, from the player's own eye: each weapon at rest, and the
@@ -171,19 +184,21 @@ async function main() {
   for (const [w, name] of [[2, "pistol"], [3, "shotgun"], [1, "rifle"]]) {
     await page.evaluate((w) => window.arena.weapon(w), w);
     await sleep(900);
-    await page.screenshot({ path: join(OUT, `6-${name}.png`) });
+    await page.screenshot({ path: join(OUT, `8-${name}.png`) });
   }
   await page.evaluate(() => window.arena.fire(true));
   await sleep(250);
   await page.evaluate(() => { window.arena.fire(false); window.arena.reload(true); });
   await sleep(550);
   await page.evaluate(() => window.arena.reload(false));
-  await page.screenshot({ path: join(OUT, "7-reload.png") });
+  await page.screenshot({ path: join(OUT, "9-reload.png") });
 
   const s = await page.evaluate(() => window.arena.peek());
   await page.close();
   await menus(browser);
-  console.log(`draw calls ${s.drawCalls}, triangles ${s.triangles}`);
+  for (const [name, d, t] of counts) console.log(`${name}: draw calls ${d}, triangles ${t}`);
+  console.log(`playing: draw calls ${s.drawCalls}, triangles ${s.triangles}`);
+  console.log(`hall mesh, all chunks: ${s.hallTriangles} triangles`);
   await browser.close();
   stopAll();
   console.log(`screenshots in ${OUT}`);
@@ -205,7 +220,7 @@ async function menus(browser) {
   const plain = await browser.newPage(opts);
   await plain.goto(url);
   await plain.waitForSelector("#menu.show");
-  await plain.screenshot({ path: join(OUT, "8-modes-browser.png") });
+  await plain.screenshot({ path: join(OUT, "10-modes-browser.png") });
   await plain.close();
 
   const page = await browser.newPage(opts);
@@ -236,18 +251,18 @@ async function menus(browser) {
   });
   await page.goto(url);
   await page.waitForSelector("#menu.show");
-  await page.screenshot({ path: join(OUT, "8-modes-app.png") });
+  await page.screenshot({ path: join(OUT, "10-modes-app.png") });
   await page.click('[data-m="holders"]');
   await page.click('[data-a="connect"]');
   await page.waitForSelector("#menu .grid img");
   await page.click('[data-mint^="Face2"]');
   await sleep(400);
-  await page.screenshot({ path: join(OUT, "9-holders.png") });
+  await page.screenshot({ path: join(OUT, "11-holders.png") });
   await page.evaluate((now) => window.arena.menu.showLobby({
     t: "lobby", matchId: "1844674407370955161", phase: "waiting", count: 3, maxPlayers: 6,
     stake: "10000000", joinDeadline: now + 263, present: [true, true, false], lockBefore: 60,
   }), now);
-  await page.screenshot({ path: join(OUT, "10-lobby.png") });
+  await page.screenshot({ path: join(OUT, "12-lobby.png") });
   await page.close();
 }
 

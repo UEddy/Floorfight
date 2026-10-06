@@ -48,7 +48,7 @@ import {
 
 export {
   GRID_X, GRID_Y, GRID_Z, HALF_X, HALF_Z, MAP_ID, SPAWNS,
-  LEVEL_GROUND, LEVEL_STAGE, LEVEL_GALLERY, LEVEL_GIRDER,
+  LEVEL_GROUND, LEVEL_STAGE, LEVEL_GALLERY,
   blockAt, solidAt, cellCentreX, cellCentreZ,
 } from "./map";
 
@@ -176,6 +176,14 @@ export interface PlayerState {
   /** Tick the current weapon becomes usable after a swap. */
   switchUntil: number;
   /**
+   * Recoil: radians the aim has climbed above what the player is pointing
+   * at, and yaw units it has been pushed sideways. Every shot goes where the
+   * player points plus these, and the client's camera shows them, so the
+   * middle of the screen is still where the next shot goes.
+   */
+  kick: number;
+  drift: number;
+  /**
    * Whether the fire bit was set last tick. A semi automatic weapon needs the
    * trigger released between shots, and that is the only state it takes.
    */
@@ -247,7 +255,7 @@ export function newPlayer(id: number, slot: number): PlayerState {
     hp: MAX_HP, kills: 0, deaths: 0, alive: true,
     respawnAt: 0, lastFireTick: -999, lastInputTick: -1,
     weapon: 0, ammo: fullMags(), reloadUntil: 0, switchUntil: 0,
-    triggerHeld: false,
+    kick: 0, drift: 0, triggerHeld: false,
   };
 }
 
@@ -550,6 +558,53 @@ export function exposedNow(ox: number, oy: number, oz: number, v: PlayerState): 
   return false;
 }
 
+/**
+ * Where a player comes back in: a spawn none of the living enemies can see,
+ * as far as possible from the nearest of them. If every spawn is in someone's
+ * sight, the farthest one. Ties go to whichever comes first in an order that
+ * rotates with the slot and the death count, so two players dying at once
+ * do not get the same answer and a player is not sent back to the same spot
+ * every time.
+ *
+ * Deterministic: grid rays and exact arithmetic over state the log already
+ * contains, so a replay picks the same spawn the server did.
+ */
+export function pickSpawn(world: WorldState, slot: number): number {
+  const me = world.players[slot];
+  const n = SPAWNS.length;
+  const start = ((slot * 5 + me.deaths * 7) % n + n) % n;
+  let best = start;
+  let bestHidden = false;
+  let bestDist = -1;
+  for (let k = 0; k < n; k++) {
+    const i = (start + k) % n;
+    const s = SPAWNS[i];
+    const ey = s.y + EYE_HEIGHT;
+    let nearest = Infinity;
+    let hidden = true;
+    for (let j = 0; j < world.players.length; j++) {
+      const e = world.players[j];
+      if (j === slot || !e || !e.alive) continue;
+      const dx = s.x - e.x;
+      const dy = ey - (e.y + EYE_HEIGHT);
+      const dz = s.z - e.z;
+      const d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 < nearest) nearest = d2;
+      if (hidden) {
+        const d = Math.sqrt(d2);
+        if (d === 0 || rayGrid(e.x, e.y + EYE_HEIGHT, e.z, dx / d, dy / d, dz / d, d) >= d) hidden = false;
+      }
+    }
+    // Hidden beats visible; then the farther from the nearest enemy.
+    if ((hidden && !bestHidden) || (hidden === bestHidden && nearest > bestDist)) {
+      best = i;
+      bestHidden = hidden;
+      bestDist = nearest;
+    }
+  }
+  return best;
+}
+
 function record(world: WorldState): void {
   const f = world.history[world.tick % HISTORY_TICKS];
   f.tick = world.tick;
@@ -594,9 +649,10 @@ export function step(
 
     if (!p.alive) {
       if (tick >= p.respawnAt) {
-        const s = SPAWNS[(slot + p.deaths) % SPAWNS.length];
+        const s = SPAWNS[pickSpawn(world, slot)];
         p.x = s.x; p.y = s.y; p.z = s.z; p.vy = 0; p.vx = 0; p.vz = 0;
         p.streak = 0;
+        p.kick = 0; p.drift = 0;
         p.hp = MAX_HP; p.alive = true;
         // Fresh magazines, and whatever weapon they died holding.
         p.ammo = fullMags();
@@ -721,10 +777,13 @@ export function step(
         p.weapon = want;
         p.switchUntil = tick + SWITCH_TICKS;
         p.reloadUntil = 0;
+        p.kick = 0;
+        p.drift = 0;
       }
     }
 
     const spec = WEAPONS[p.weapon];
+    recoilSettle(p, spec, tick - p.lastFireTick);
 
     if (p.reloadUntil > 0 && tick >= p.reloadUntil) {
       p.ammo[p.weapon] = spec.mag;
@@ -757,6 +816,11 @@ export function step(
     p.streak = tick - p.lastFireTick <= BLOOM_GAP ? p.streak + 1 : 0;
     p.lastFireTick = tick;
     const spread = shotSpread(spec, p.vx, p.vz, onGround(p.x, p.y, p.z), p.streak);
+    // The shot goes where the recoil so far has put the aim. Its own kick
+    // lands after it, on the next one.
+    const aimYaw = p.yaw + p.drift;
+    const aimPitch = p.pitch + p.kick;
+    recoilShot(p, spec, p.streak);
 
     const view = clamp(inp!.view | 0, tick - MAX_REWIND, tick);
     const rewind = tick - view;
@@ -776,12 +840,12 @@ export function step(
       // in the middle, and Math.sqrt is exact under IEEE-754.
       const ang = h & (YAW_UNITS - 1);
       const off = Math.sqrt(((h >>> 13) & 1023) / 1023) * spread;
-      const yaw = (p.yaw + Math.round(off * cosU(ang)) + YAW_UNITS) % YAW_UNITS;
+      const yaw = (((aimYaw + Math.round(off * cosU(ang))) % YAW_UNITS) + YAW_UNITS) % YAW_UNITS;
       // Clamped because the pitch limit sits below a quarter turn: without
       // this a pellet fired at full elevation could tip past vertical and
       // come back down facing the other way.
       const pitch = clamp(
-        p.pitch + off * sinU(ang) * RAD_PER_UNIT, -PITCH_LIMIT, PITCH_LIMIT,
+        aimPitch + off * sinU(ang) * RAD_PER_UNIT, -PITCH_LIMIT, PITCH_LIMIT,
       );
 
       const hit = hitscanFrame(
@@ -822,6 +886,43 @@ export function step(
   }
 
   world.tick = tick + 1;
+}
+
+/* ------------------------------------------------------------ recoil --- */
+
+/** Sideways push for each shot in a string, as multiples of a weapon's sway. */
+const SWAY_PATTERN: readonly number[] = [0, 1, 2, 2, 1, -1, -2, -2, -1, 0];
+
+/** Ticks the trigger has to rest before the aim starts to settle. */
+export const RECOIL_SETTLE_DELAY = 4;
+
+/** Yaw units a tick the sideways push settles by. */
+const SWAY_SETTLE = 2;
+
+export interface RecoilState { kick: number; drift: number }
+
+/**
+ * What one shot does to the aim. Exported, with recoilSettle, because the
+ * client runs the same two functions over its own shots to move its camera:
+ * a camera kick that was not the sim's recoil would put the crosshair
+ * somewhere the next shot is not going.
+ *
+ * Exact arithmetic on constants from the weapon table, and an integer sway,
+ * so a replay climbs exactly as the match did.
+ */
+export function recoilShot(r: RecoilState, spec: WeaponSpec, streak: number): void {
+  const k = r.kick + spec.recoil.kick;
+  r.kick = k > spec.recoil.kickMax ? spec.recoil.kickMax : k;
+  r.drift = SWAY_PATTERN[streak % SWAY_PATTERN.length] * spec.recoil.sway;
+}
+
+/** One tick of settling, given the ticks since the last shot. */
+export function recoilSettle(r: RecoilState, spec: WeaponSpec, sinceShot: number): void {
+  if (sinceShot <= RECOIL_SETTLE_DELAY) return;
+  const k = r.kick - spec.recoil.settle;
+  r.kick = k < 0 ? 0 : k;
+  if (r.drift > 0) r.drift = r.drift > SWAY_SETTLE ? r.drift - SWAY_SETTLE : 0;
+  else if (r.drift < 0) r.drift = r.drift < -SWAY_SETTLE ? r.drift + SWAY_SETTLE : 0;
 }
 
 /**
