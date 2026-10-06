@@ -22,11 +22,14 @@ import {
 import { BLOOM_GAP, WEAPONS } from "../../shared/weapons";
 import { fromHex, sha256Hex } from "../../shared/sha256";
 import {
-  quantAxis, quantPitch, quantYaw, type RosterEntry, type SnapshotPlayer,
+  MAX_INPUTS_PER_BATCH, quantAxis, quantPitch, quantYaw, type RosterEntry, type SnapshotPlayer,
 } from "../../shared/protocol";
 import { DEV_MATCH_ID } from "../../shared/dev";
 import { devKeypair, guestKeypair } from "./keys";
-import { Net, signLocally, type NetHandlers } from "./net";
+import { Net, signLocally, type NetHandlers, type SignedJoin } from "./net";
+import { DeathCam } from "./deathcam";
+import { HALF_X, HALF_Z } from "../../shared/map";
+import { surfaceAt } from "./surfaces";
 import { Menu } from "./menu";
 import * as native from "./native";
 import { BATCH_TICKS, Interpolator, Predictor, type RemoteView } from "./netcode";
@@ -51,6 +54,21 @@ const seat = Number(params.get("seat") ?? "0");
  */
 const devSeat = import.meta.env.DEV && params.has("seat");
 const DEBUG = params.get("debug") === "1";
+
+/**
+ * Damage numbers over the people we hit. Off unless asked for, with ?dmg=1
+ * once (remembered) or ?dmg=0 to turn them back off: the hit marker and its
+ * sound already say a hit landed, and a number on every one is noise.
+ */
+const SHOW_DAMAGE = (() => {
+  const asked = params.get("dmg");
+  try {
+    if (asked === "1" || asked === "0") localStorage.setItem("floorfight.dmg", asked);
+    return (asked ?? localStorage.getItem("floorfight.dmg")) === "1";
+  } catch {
+    return asked === "1";
+  }
+})();
 const serverUrl = import.meta.env.DEV
   ? params.get("server") ?? `ws://${location.hostname || "localhost"}:8080`
   : // Production is always the page's own origin, behind Caddy's TLS. There is
@@ -71,7 +89,7 @@ const controls = new Controls(
 const hud = new Hud(seat);
 hud.onWeaponTap((i) => controls.select(i));
 
-type Phase = "connecting" | "waiting" | "playing" | "over" | "gone";
+type Phase = "connecting" | "waiting" | "playing" | "reconnecting" | "over" | "gone";
 let phase: Phase = "connecting";
 
 let slot = seat;
@@ -81,7 +99,10 @@ const interp = new Interpolator();
 const remotes = new Map<number, RemoteView>();
 
 let seq = 0;
+/** The last inputs sent or waiting to be, newest last, for resends. */
 const sent: Input[] = [];
+/** Inputs at the end of `sent` that have not gone out in a message yet. */
+let unsent = 0;
 let lastTickAt = 0;
 let lastFireSeq = -999;
 /**
@@ -117,6 +138,15 @@ let rtt = 0;
 
 /** Tick we were killed on, for the respawn countdown, or null if alive. */
 let deathTick: number | null = null;
+const deathCam = new DeathCam();
+
+/**
+ * Blocks walked since the last footstep, ours and everyone else's, and where
+ * each was last frame. A stride is a little over two blocks at a run.
+ */
+const STRIDE = 2.2;
+let myStride = 0;
+const strides = new Map<number, { x: number; y: number; z: number; walked: number }>();
 
 /**
  * The spread salt commitment from the accepted message, kept until the end of
@@ -189,6 +219,70 @@ const menu = new Menu({
 
 let net: Net | null = null;
 
+/**
+ * What it takes to join this match again: the match id and a way to sign a
+ * fresh nonce for it. Set on the first join. A free room keeps the guest key
+ * for the page's lifetime, so signing again gets the same seat back; a
+ * holders match asks the wallet again.
+ */
+let rejoin: { matchId: string; sign: (nonce: string) => Promise<SignedJoin> } | null = null;
+/** The last reason the server gave for closing us, if it gave one. */
+let lastKick: string | null = null;
+let reconnectTries = 0;
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * Kicks worth trying again after. A seat that went quiet for ten seconds, or
+ * a burst the budget refused, is a bad patch of network, not a verdict.
+ * Everything else (a bad signature, a full room, a newer connection on the
+ * same seat) would only be refused again.
+ */
+const RETRYABLE = new Set(["timed out", "too many messages"]);
+
+/** Seconds between reconnect attempts. About half a minute in all. */
+const BACKOFF_MS = [300, 700, 1500, 2500, 4000, 6000, 8000, 8000];
+
+/**
+ * Send this tick's input, with the last few for redundancy.
+ *
+ * While the browser still has bytes it could not get onto the network, a
+ * fresh message would only queue behind them and arrive in the same burst,
+ * so inputs are held and go out together, up to nine at a time, in one
+ * message. On mobile data that turns a stall's backlog from sixty messages
+ * a second into seven, which is what the server's budget is counting.
+ */
+function sendInput(inp: Input): void {
+  sent.push(inp);
+  if (sent.length > MAX_INPUTS_PER_BATCH) sent.shift();
+  unsent++;
+  if (!net) return;
+  if (net.buffered > 0 && unsent < 9) return;
+  const n = Math.min(MAX_INPUTS_PER_BATCH, Math.max(BATCH_TICKS, unsent));
+  net.send({ t: "input", batch: sent.slice(-n) });
+  unsent = 0;
+}
+
+/** Try to get back into the same match, the same seat, after a drop. */
+function reconnect(): void {
+  if (!rejoin || phase === "over") return;
+  if (reconnectTries >= BACKOFF_MS.length) {
+    phase = "gone";
+    hud.reconnecting(null);
+    hud.message("Connection lost. Reload to rejoin.");
+    return;
+  }
+  phase = "reconnecting";
+  hud.reconnecting(reconnectTries + 1);
+  const wait = BACKOFF_MS[reconnectTries++];
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    const r = rejoin!;
+    lastKick = null;
+    net = new Net(serverUrl, async (challenge) => r.sign(challenge.nonce), handlers);
+  }, wait);
+}
+
 /** Free play: a guest key made up now, or a dev seat in a dev build. */
 function startFree(): void {
   let keys: ReturnType<typeof guestKeypair>;
@@ -204,7 +298,9 @@ function startFree(): void {
     // server offered with the challenge, so the signature covers the id of
     // the match it actually gets rather than a matchmaking alias.
     const matchId = devSeat ? DEV_MATCH_ID : challenge.freeMatchId;
-    return matchId ? signLocally(matchId, challenge.nonce, keys) : null;
+    if (!matchId) return null;
+    rejoin = { matchId, sign: async (nonce) => signLocally(matchId, nonce, keys) };
+    return signLocally(matchId, challenge.nonce, keys);
   }, handlers);
 }
 
@@ -217,8 +313,8 @@ function startFree(): void {
 function startHolders(matchId: string, wallet: string, mint: string | null): void {
   holders = { matchId, wallet };
   hud.message("Signing in to the lobby...");
-  net = new Net(serverUrl, async (challenge) => {
-    const signed = await native.signJoin(matchId, challenge.nonce);
+  const sign = async (nonce: string): Promise<SignedJoin> => {
+    const signed = await native.signJoin(matchId, nonce);
     if (signed.wallet !== wallet) {
       throw new Error("the wallet that signed is not the one that staked");
     }
@@ -226,7 +322,9 @@ function startHolders(matchId: string, wallet: string, mint: string | null): voi
       matchId, wallet: signed.wallet, sig: signed.signature,
       ...(mint ? { mint } : {}),
     };
-  }, handlers);
+  };
+  rejoin = { matchId, sign };
+  net = new Net(serverUrl, async (challenge) => sign(challenge.nonce), handlers);
 }
 
 const handlers: NetHandlers = {
@@ -236,6 +334,15 @@ const handlers: NetHandlers = {
   },
 
   onAccepted(msg) {
+    if (renderer && predictor && msg.slot === slot) {
+      // Back in after a drop: same seat, same world. Keep the renderer and
+      // the prediction, and pick up from the next snapshot.
+      reconnectTries = 0;
+      hud.reconnecting(null);
+      phase = "waiting";
+      hud.message("");
+      return;
+    }
     menu.hide();
     slot = msg.slot;
     spreadCommit = msg.spreadCommit;
@@ -294,6 +401,7 @@ const handlers: NetHandlers = {
       myReload = me.r;
       if (me.a === 1 && deathTick !== null) {
         deathTick = null;
+        deathCam.stop();
         hud.death(null);
         sfx.respawn();
       }
@@ -345,15 +453,32 @@ const handlers: NetHandlers = {
   },
 
   onKick(reason) {
+    lastKick = reason;
+    if (phase === "reconnecting" && reason === "no such match") {
+      // The round finished while we were away.
+      phase = "gone";
+      hud.reconnecting(null);
+      hud.message("The match ended while you were away.");
+      return;
+    }
+    if (RETRYABLE.has(reason) && rejoin) return; // the close that follows retries
     phase = "gone";
+    hud.reconnecting(null);
     hud.message(`Disconnected: ${reason}`);
   },
 
   onClose() {
-    if (phase !== "over") {
-      phase = "gone";
-      hud.message("Connection lost. Reload to rejoin.");
+    if (phase === "over") return;
+    // A kick already said why, and it was not one worth retrying.
+    if (lastKick !== null && !RETRYABLE.has(lastKick)) return;
+    // Only a seat we had can be got back. A drop before the first join is
+    // just a failed connection.
+    if (rejoin && renderer) {
+      reconnect();
+      return;
     }
+    phase = "gone";
+    hud.message("Connection lost. Reload to rejoin.");
   },
 };
 
@@ -419,17 +544,35 @@ function onHit(h: HitEvent, now: number): void {
     const r = remotes.get(h.victim);
     if (r && renderer) {
       const p = renderer.project(r.x, r.y + HEAD_TOP + 0.1, r.z);
-      if (p.onScreen) hud.damageNumber(h.damage, h.head, p.sx, p.sy);
+      if (p.onScreen && SHOW_DAMAGE) hud.damageNumber(h.damage, h.head, p.sx, p.sy);
     }
   }
 
   if (h.victim === slot) {
     if (h.lethal) {
       deathTick = h.tick;
-      hud.killedBy(h.shooter, h.weapon);
+      const killerHp = lastSnap?.players.find((q) => q.s === h.shooter)?.h ?? null;
+      hud.killedBy(h.shooter, h.weapon, h.shooter === slot ? null : killerHp);
       sfx.death();
+      if (predictor) {
+        const me = predictor.me;
+        deathCam.start({
+          x: me.x, y: me.y, z: me.z,
+          yaw: yawToRadians(quantYaw(controls.intent.yaw)),
+          pitch: (quantPitch(controls.intent.pitch) / 32767) * PITCH_LIMIT,
+        }, h.shooter, now);
+      }
     } else {
       sfx.hurt();
+    }
+    // Which way it came from, against where we are looking now.
+    const from = remotes.get(h.shooter) ?? lastSnap?.players.find((q) => q.s === h.shooter);
+    if (from && predictor && h.shooter !== slot) {
+      const me = predictor.me;
+      const bearing = Math.atan2(-(from.x - me.x), -(from.z - me.z));
+      let rel = bearing - yawToRadians(quantYaw(controls.intent.yaw));
+      rel = Math.atan2(Math.sin(rel), Math.cos(rel));
+      hud.damageFrom(rel);
     }
   }
 
@@ -444,6 +587,50 @@ function onHit(h: HitEvent, now: number): void {
       else if (predictor) {
         renderer.burst(predictor.me.x, predictor.me.y, predictor.me.z, h.victim);
       }
+    }
+  }
+}
+
+/**
+ * Footsteps, ours and everyone's we can see moving, one per stride on the
+ * ground. Nothing here is sent: it is the drawn positions, heard.
+ */
+function footsteps(x: number, y: number, z: number, yaw: number, dt: number): void {
+  if (!predictor || phase !== "playing" || dt <= 0) return;
+  const me = predictor.me;
+  const grounded = me.vy === 0 && onGround(me.x, me.y, me.z);
+  const speed = Math.hypot(me.vx, me.vz);
+  if (me.alive && grounded && speed > 1) {
+    myStride += speed * dt;
+    if (myStride >= STRIDE) {
+      myStride = 0;
+      sfx.step(surfaceAt(Math.floor(x + HALF_X), Math.round(y), Math.floor(z + HALF_Z)));
+    }
+  } else {
+    // A first step comes quickly from standing.
+    myStride = STRIDE * 0.7;
+  }
+
+  for (const [s, r] of remotes) {
+    if (s === slot) continue;
+    const last = strides.get(s);
+    if (!last || !r.alive) {
+      strides.set(s, { x: r.x, y: r.y, z: r.z, walked: 0 });
+      continue;
+    }
+    const moved = Math.hypot(r.x - last.x, r.z - last.z);
+    // On the ground: level from last frame, and not a respawn's jump.
+    const level = Math.abs(r.y - last.y) < 0.05 && Number.isInteger(Math.round(r.y * 1000) / 1000);
+    if (moved < 2 && level) last.walked += moved;
+    last.x = r.x; last.y = r.y; last.z = r.z;
+    if (last.walked >= STRIDE) {
+      last.walked = 0;
+      const dx = r.x - x;
+      const dz = r.z - z;
+      const dist = Math.hypot(dx, dz, r.y - y);
+      if (dist > 30) continue;
+      const pan = dist > 0.5 ? (dx * Math.cos(yaw) - dz * Math.sin(yaw)) / dist : 0;
+      sfx.step(surfaceAt(Math.floor(r.x + HALF_X), Math.round(r.y), Math.floor(r.z + HALF_Z)), dist, pan * 0.8);
     }
   }
 }
@@ -540,9 +727,7 @@ function tick(now: number): void {
     }
   }
 
-  sent.push(inp);
-  if (sent.length > BATCH_TICKS) sent.shift();
-  net?.send({ t: "input", batch: sent.slice() });
+  sendInput(inp);
   seq++;
 }
 
@@ -641,7 +826,10 @@ function frame(): void {
       devCamera.yaw = Math.atan2(fx, fz);
     }
   }
-  renderer.draw(now, devCamera ?? { x, y, z, yaw, pitch }, slot, remotes, {
+  footsteps(x, y, z, yaw, dt);
+  const killer = deathCam.active ? remotes.get(deathCam.killer) : undefined;
+  const dead = deathCam.pose(now, dt, killer && killer.alive ? killer : null);
+  renderer.draw(now, devCamera ?? dead ?? { x, y, z, yaw, pitch }, slot, remotes, {
     weapon: myWeapon,
     // The server's countdown, as a fraction of the whole reload, so the
     // animation finishes when the magazine is actually full.

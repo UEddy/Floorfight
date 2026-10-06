@@ -99,29 +99,42 @@ function spec(
 export const BLOOM_GAP = 15;
 
 export const WEAPONS: readonly WeaponSpec[] = [
-  // Six body shots or three heads. 1.5 second reload.
-  // Moving or holding the trigger opens the rifle up to about four degrees,
-  // so tapping from a standstill is how it holds a lane.
+  // Five body shots or three heads, at 100 health. Was 18 a shot, six to the
+  // body: 20 brings the body kill to five, under half a second held on
+  // target, which on a hall this open is what makes the rifle the gun that
+  // wins a straight fight across the nave. The head multiplier comes down
+  // from 2 to 1.75 so the head kill stays at three rather than dropping to
+  // two at 40 a shot.
   // Range is the length of the hall and more, so the nave's long lines are
   // the rifle's to hold.
-  // It climbs about half a degree a shot held down, to five degrees, and
-  // walks side to side as it goes: pulling down against it is the skill.
-  spec(W_RIFLE, "Rifle", 30, 90, 7, 18, 2, 60, 1, true, 140, 40, 8, 48,
+  // It climbs about a degree a shot held down, to five degrees, and walks
+  // side to side as it goes: pulling down against it is the skill.
+  spec(W_RIFLE, "Rifle", 30, 90, 7, 20, 1.75, 60, 1, true, 140, 40, 8, 48,
     { kick: 0.017, kickMax: 0.09, sway: 9, settle: 0.003 }),
   // 100 damage to the head: one shot, and the only weapon in the game that
-  // can do it. Three to the body, at five rounds a second at best.
+  // can do it. Three to the body, at under five rounds a second. Unchanged:
+  // it is the gun where the head shot decides everything, so a miss at the
+  // head costs two more pulls at the body and the person aiming well wins.
   // The one shot head kill wants a still shooter: running, the pistol is
   // three times as wide.
   // A sharp three degree flip a shot that has mostly settled by the next.
   spec(W_PISTOL, "Pistol", 12, 75, 13, 40, 2.5, 14, 1, false, 140, 30, 10, 20,
     { kick: 0.05, kickMax: 0.1, sway: 6, settle: 0.006 }),
-  // Eight pellets of 14: everything lands at touching distance, and the shot
-  // stops dead at sixteen blocks. The nave's lines run eighty and more, so
-  // the range limit is what keeps this a weapon for the market, the garden
+  // Two hits to kill up close, never one. Was eight pellets of 14 with a
+  // 1.5 head multiplier in an 18 degree cone: 112 damage at touching
+  // distance (a kill in one) and under 40 a shot from four blocks out
+  // (useless at the distance a shotgun is for). Now eight pellets of 11 with
+  // no head bonus, so a whole pattern is 88 and nothing kills in one, in a
+  // cone of 8.8 degrees, which keeps the whole pattern on a body to about
+  // three blocks and two hits a kill to about five (scripts/pattern.ts).
+  // The pump is quicker, 36 ticks from 45, so two hits take 0.6 s rather
+  // than 0.75 and it still wins the fight it is built for.
+  // It stops dead at sixteen blocks. The nave's lines run eighty and more,
+  // so the range is what keeps this a weapon for the market, the garden
   // hedges and the stairs rather than one more way to hold a long lane.
   // The pattern is already the spread. Moving does not widen it.
   // A five degree heave, settled well before the pump is done.
-  spec(W_SHOTGUN, "Shotgun", 6, 150, 45, 14, 1.5, 420, 8, false, 16, 0, 0, 0,
+  spec(W_SHOTGUN, "Shotgun", 6, 150, 36, 11, 1, 200, 8, false, 16, 0, 0, 0,
     { kick: 0.09, kickMax: 0.12, sway: 14, settle: 0.006 }),
 ];
 

@@ -201,3 +201,42 @@ export class ConnectionLimits {
     if (this.live > 0) this.live--;
   }
 }
+
+/**
+ * Messages a socket may send: a token bucket, refilled continuously at
+ * MAX_MSGS_PER_SECOND and holding up to MAX_MSG_BURST.
+ *
+ * It replaced a counter reset to 90 once a second, which is what kicked a
+ * phone on mobile data mid match. A client sends 61 messages a second (an
+ * input every tick and a pong), and 4G does not deliver them evenly: a cell
+ * handover stalls the socket for a second or two, then everything queued in
+ * that time arrives at once. Under the old counter a one second stall was
+ * kicked about half the time and anything from a second and a half up
+ * always was (see the stall test in limits.test.ts). The bucket lets that
+ * backlog through and still caps the sustained rate at 90 a second, so the
+ * worst a client can do with the burst allowance is send 300 small messages
+ * once, which the per message size cap keeps to about a megabyte.
+ */
+export class MessageBudget {
+  private tokens: number;
+  private last: number;
+
+  constructor(
+    readonly rate: number,
+    readonly burst: number,
+    now: number,
+  ) {
+    this.tokens = burst;
+    this.last = now;
+  }
+
+  /** Spend one token. False means the socket is over its budget. */
+  take(now: number): boolean {
+    const dt = now - this.last;
+    this.last = now;
+    if (dt > 0) this.tokens = Math.min(this.burst, this.tokens + (dt / 1000) * this.rate);
+    if (this.tokens < 1) return false;
+    this.tokens -= 1;
+    return true;
+  }
+}

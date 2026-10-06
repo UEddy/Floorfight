@@ -33,6 +33,7 @@ import type { RosterEntry } from "../../shared/protocol";
 import { T, atlas, tileUV } from "./textures";
 import { ViewModel } from "./viewmodel";
 import { SKY_RADIUS, addProps } from "./props";
+import { arcade, runner } from "./surfaces";
 import { SKY, SKY_FLOOR, WARM, lanternsSeenFrom, skyAt, warmAt } from "./lighting";
 import { Characters, HAIR, SKIN, scheme } from "./characters";
 
@@ -120,14 +121,6 @@ function cellHash(ix: number, iy: number, iz: number): number {
   return (h ^ (h >>> 15)) >>> 0;
 }
 
-/**
- * Where the floor is carpeted: a runner down the middle of the nave, and one
- * across it between the fountain and the engines. Flagstones in the arcades
- * under the galleries, boards everywhere else.
- */
-const runner = (ix: number, iz: number) =>
-  (ix >= 46 && ix <= 49 && iz >= 8) || (iz >= 67 && iz <= 68 && ix >= 8 && ix <= GRID_X - 9);
-const arcade = (ix: number, iz: number) => ix <= 6 || ix >= GRID_X - 7 || iz <= 6;
 
 const isIron = (ix: number, iy: number, iz: number) => blockAt(ix, iy, iz) === M_IRON;
 

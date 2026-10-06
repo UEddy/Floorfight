@@ -113,6 +113,11 @@ export class Net {
     };
   }
 
+  /** Bytes the browser is still holding for this socket, not yet sent. */
+  get buffered(): number {
+    return this.ws.bufferedAmount;
+  }
+
   send(msg: ClientMsg): void {
     if (this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(msg));
   }

@@ -51,6 +51,8 @@
       #hitmarker i:nth-child(2) { transform: rotate(135deg) translateY(-12px); }
       #hitmarker i:nth-child(3) { transform: rotate(225deg) translateY(-12px); }
       #hitmarker i:nth-child(4) { transform: rotate(315deg) translateY(-12px); }
+      /* A head shot is gold and bigger, so it reads at a glance from a body hit. */
+      #hitmarker.head { transform: scale(1.35); }
       #hitmarker.head i { background: #ffd23a; }
       /* A kill is a red X: the four arms double in length and square up. */
       #hitmarker.kill { width: 54px; height: 54px; margin: -27px 0 0 -27px; }
@@ -118,18 +120,36 @@
         12% { opacity: 1; transform: translate(-50%, -50%) scale(1); }
         70% { opacity: 1; } 100% { opacity: 0; } }
 
-      #killedby { left: 50%; top: 56%; transform: translate(-50%, -50%); text-align: center;
-        font: 14px/1.5 var(--mono); background: var(--panel); padding: 8px 14px; border-radius: 6px; }
+      /* Low on the screen: the death camera puts the killer in the middle. */
+      #killedby { left: 50%; top: 78%; transform: translate(-50%, -50%); text-align: center;
+        font: 15px/1.5 var(--mono); background: var(--panel); padding: 8px 16px; border-radius: 6px;
+        animation: slidein 320ms ease-out; }
       #killedby:empty { display: none; }
       #killedby b { color: var(--kill); }
+      #killedby .left { display: block; font-size: 12px; opacity: 0.8; }
+      @keyframes slidein { from { opacity: 0; transform: translate(-50%, -30%); } }
+      body.dead #crosshair, body.dead #hitmarker { display: none; }
 
       /* Death: the edges of the screen go red and a countdown sits in it. */
       #tint { inset: 0; opacity: 0; transition: opacity 220ms ease-out;
-        background: radial-gradient(ellipse at center, rgba(120, 0, 0, 0) 35%, rgba(150, 10, 10, 0.72) 100%); }
+        background: radial-gradient(ellipse at center, rgba(120, 0, 0, 0) 45%, rgba(150, 10, 10, 0.6) 100%); }
       #tint.show { opacity: 1; }
-      #respawn { left: 50%; top: 50%; transform: translate(-50%, -50%); font: 700 72px/1 var(--mono);
+      #respawn { left: 50%; top: 22%; transform: translate(-50%, -50%); font: 700 56px/1 var(--mono);
         color: rgba(255, 255, 255, 0.92); text-shadow: 0 4px 18px #000; }
       #respawn:empty { display: none; }
+
+      /* Where the damage came from: an arc round the crosshair, turned to
+         face the shooter, fading over most of a second. */
+      #dmgdir { left: 50%; top: 50%; width: 0; height: 0; }
+      #dmgdir div { position: absolute; left: -110px; top: -110px; width: 220px; height: 220px;
+        border-radius: 50%; border: 7px solid transparent; border-top-color: rgba(255, 48, 32, 0.9);
+        filter: drop-shadow(0 0 4px rgba(0, 0, 0, 0.6)); animation: dmgdir 900ms ease-out forwards; }
+      @keyframes dmgdir { 0% { opacity: 1; } 60% { opacity: 0.8; } 100% { opacity: 0; } }
+
+      #reconnect { left: 50%; top: 16px; transform: translateX(-50%); padding: 6px 14px; border-radius: 16px;
+        background: rgba(20, 16, 34, 0.85); color: #fff; font: 600 14px/1.2 var(--mono); display: none; }
+      #reconnect.show { display: block; animation: pulse 1s ease-in-out infinite alternate; }
+      @keyframes pulse { from { opacity: 0.65; } to { opacity: 1; } }
 
       #dmg div { position: absolute; font: 700 20px/1 var(--mono); color: #fff; text-shadow: 0 2px 6px #000;
         animation: rise 900ms ease-out forwards; }
@@ -305,6 +325,8 @@
     <div id="elim" class="hud"></div>
     <div id="killedby" class="hud"></div>
     <div id="dmg" class="hud"></div>
+    <div id="dmgdir" class="hud"></div>
+    <div id="reconnect" class="hud"></div>
     <div id="plates" class="hud"></div>
     <div id="stick" class="hud"><i></i></div>
     <!-- Icons drawn here, original and inline, so there is nothing to load. -->

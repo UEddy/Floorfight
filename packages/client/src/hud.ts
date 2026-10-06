@@ -54,6 +54,8 @@ export class Hud {
   private ammoEl = $("ammo");
   private weaponsEl = $("weapons");
   private dmg = $("dmg");
+  private dmgDir = $("dmgdir");
+  private reconnectEl = $("reconnect");
   private plates = $("plates");
   private debugEl = $("debug");
   private over = $("over");
@@ -116,6 +118,28 @@ export class Hud {
     while (this.dmg.children.length > 24) this.dmg.firstElementChild?.remove();
   }
 
+  /**
+   * We were hit. `relative` is the bearing of the shooter from where we are
+   * looking, in radians, positive to the left, the way yaw turns.
+   */
+  damageFrom(relative: number): void {
+    const el = document.createElement("div");
+    el.style.transform = `rotate(${-relative}rad)`;
+    this.dmgDir.append(el);
+    window.setTimeout(() => el.remove(), 950);
+    while (this.dmgDir.children.length > 4) this.dmgDir.firstElementChild?.remove();
+  }
+
+  /** The reconnecting pill: the attempt number, or null to take it down. */
+  reconnecting(attempt: number | null): void {
+    if (attempt === null) {
+      this.reconnectEl.classList.remove("show");
+      return;
+    }
+    this.reconnectEl.textContent = `Reconnecting... ${attempt > 1 ? `(try ${attempt})` : ""}`;
+    this.reconnectEl.classList.add("show");
+  }
+
   /** We killed someone. */
   eliminated(slot: number): void {
     this.elim.textContent = `Eliminated ${this.who(slot)}`;
@@ -126,10 +150,16 @@ export class Hud {
     this.elim.classList.add("show");
   }
 
-  /** We died. Shows who did it and what with, until the respawn clears it. */
-  killedBy(slot: number, weapon: number): void {
+  /**
+   * We died. Shows who did it, what with, and how much health they had
+   * left, which is the number that says whether it was close, until the
+   * respawn clears it.
+   */
+  killedBy(slot: number, weapon: number, hpLeft: number | null = null): void {
+    const hp = hpLeft !== null && hpLeft > 0
+      ? `<span class="left">${Math.round(hpLeft)} hp left</span>` : "";
     this.killedByEl.innerHTML =
-      `Killed by <b>${this.who(slot)}</b> &middot; ${weaponName(weapon)}`;
+      `Killed by <b>${this.who(slot)}</b> &middot; ${weaponName(weapon)}${hp}`;
   }
 
   /**
@@ -137,6 +167,7 @@ export class Hud {
    * comes off.
    */
   death(secondsLeft: number | null): void {
+    document.body.classList.toggle("dead", secondsLeft !== null);
     if (secondsLeft === null) {
       this.tint.classList.remove("show");
       this.respawnEl.textContent = "";

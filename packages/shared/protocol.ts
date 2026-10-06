@@ -23,14 +23,17 @@ export const PROTOCOL_VERSION = 7;
  * spread, so a v4 log replayed by this build would not reproduce its match.
  * 6 refuses a lag compensated hit on a victim who is behind cover at the
  * tick the shot is resolved. 7 is the 96 by 96 hall, respawning away from
- * enemies, rifle and pistol range long enough for it, and recoil.
+ * enemies, rifle and pistol range long enough for it, and recoil. 8 rewinds
+ * up to half a second and retunes the weapons.
  */
-export const LOG_VERSION = 7;
+export const LOG_VERSION = 8;
 
 /** Abuse limits. Exceed any of these and the connection is closed. */
 export const MAX_MSG_BYTES = 4096;
 export const MAX_INPUTS_PER_BATCH = 12;
 export const MAX_MSGS_PER_SECOND = 90;
+/** Messages a socket may send at once after a stall. See MessageBudget. */
+export const MAX_MSG_BURST = 300;
 export const NONCE_TTL_MS = 30_000;
 
 /* ------------------------------------------------------------ quantise --- */

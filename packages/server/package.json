@@ -10,7 +10,9 @@
     "test": "tsx --test test/*.test.ts",
     "replay": "tsx src/replay.ts",
     "measure": "tsx scripts/measure.ts",
-    "topdown": "tsx scripts/topdown.ts"
+    "topdown": "tsx scripts/topdown.ts",
+    "weapons": "tsx scripts/weapons.ts && tsx scripts/pattern.ts",
+    "golden": "tsx test/replay.ts --golden"
   },
   "dependencies": {
     "@solana/web3.js": "1.99.0",

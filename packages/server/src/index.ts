@@ -6,6 +6,7 @@ import nacl from "tweetnacl";
 import {
   MAX_INPUTS_PER_BATCH,
   MAX_MSGS_PER_SECOND,
+  MAX_MSG_BURST,
   MAX_MSG_BYTES,
   NONCE_TTL_MS,
   PROTOCOL_VERSION,
@@ -33,6 +34,7 @@ import {
   MAX_ROOMS,
   clientIp,
   limitFromEnv,
+  MessageBudget,
 } from "./limits";
 
 /**
@@ -401,10 +403,30 @@ const wss = new WebSocketServer({ server: http, maxPayload: MAX_MSG_BYTES });
 http.listen(PORT, HOST);
 
 wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
+  let room: Room | null = null;
+  let slot = -1;
+  let mySeat: Seat | null = null;
+  /** Set while this socket waits in a holders lobby. */
+  let inLobby: { matchId: string; member: Member } | null = null;
+
+  /**
+   * Every close the server starts goes through here, and every one is logged
+   * with the reason and the seat, so a player who says they were dropped can
+   * be matched to a line in the journal. The reason also goes to the client,
+   * which shows it rather than a generic "connection lost".
+   */
+  let kicked: string | null = null;
   const kick = (reason: string) => {
+    if (kicked === null) {
+      kicked = reason;
+      console.warn(`[close] ${where()}: kicked, ${reason}`);
+    }
     try { ws.send(JSON.stringify({ t: "kick", reason })); } catch { /* closing */ }
-    ws.close();
+    ws.close(4000, reason.slice(0, 100));
   };
+  const where = () => room
+    ? `match ${room.matchId} slot ${slot} from ${ip}`
+    : inLobby ? `lobby ${inLobby.matchId} from ${ip}` : `unjoined from ${ip}`;
 
   /*
    * Who is this, and are they allowed another socket?
@@ -437,13 +459,7 @@ wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
     used: false,
   };
 
-  let room: Room | null = null;
-  let slot = -1;
-  let mySeat: Seat | null = null;
-  /** Set while this socket waits in a holders lobby. */
-  let inLobby: { matchId: string; member: Member } | null = null;
-  let budget = MAX_MSGS_PER_SECOND;
-  const refill = setInterval(() => { budget = MAX_MSGS_PER_SECOND; }, 1000);
+  const budget = new MessageBudget(MAX_MSGS_PER_SECOND, MAX_MSG_BURST, Date.now());
 
   /*
    * A socket that never joins is a socket holding a slot for nothing. Ten
@@ -473,7 +489,7 @@ wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
   }));
 
   ws.on("message", (raw) => {
-    if (budget-- <= 0) return kick("too many messages");
+    if (!budget.take(Date.now())) return kick("too many messages");
 
     let msg: ClientMsg;
     try {
@@ -493,11 +509,17 @@ wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
 
     if (msg.t === "input") {
       if (!Array.isArray(msg.batch)) return kick("malformed input");
-      if (msg.batch.length > MAX_INPUTS_PER_BATCH) return kick("oversized batch");
+      if (msg.batch.length > MAX_INPUTS_PER_BATCH) {
+        room.rejectBatch(slot, msg.batch.length);
+        return kick(`oversized batch of ${msg.batch.length}`);
+      }
       // Anything that is not a finite number would poison the simulation, so
       // the whole batch is discarded rather than partially applied.
       for (const inp of msg.batch) {
-        if (!isWellFormedInput(inp)) return kick("malformed input");
+        if (!isWellFormedInput(inp)) {
+          room.rejectBatch(slot, msg.batch.length);
+          return kick("malformed input");
+        }
       }
       room.acceptInputs(slot, msg.batch);
       return;
@@ -512,8 +534,14 @@ wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
     return kick("unknown message");
   });
 
-  ws.on("close", () => {
-    clearInterval(refill);
+  ws.on("close", (code: number, why: Buffer) => {
+    // Closes the server did not start: the phone went away, the network
+    // dropped it, or the page closed it. The code says which, roughly: 1000
+    // or 1001 is the page, 1006 is a connection that died without a close
+    // frame, which on mobile data is the usual one.
+    if (kicked === null && (room || inLobby)) {
+      console.warn(`[close] ${where()}: closed by peer, code ${code}${why.length ? ` ${why.toString()}` : ""}`);
+    }
     clearJoinTimer();
     release();
     if (inLobby && lobbies) lobbies.remove(inLobby.matchId, inLobby.member);
