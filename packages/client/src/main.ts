@@ -66,6 +66,7 @@ const controls = new Controls(
   () => sfx.start(),
 );
 const hud = new Hud(seat);
+hud.onWeaponTap((i) => controls.select(i));
 
 type Phase = "connecting" | "waiting" | "playing" | "over" | "gone";
 let phase: Phase = "connecting";
@@ -145,6 +146,7 @@ const frameTimes: number[] = [];
 const fpsWindow: number[] = [];
 let fpsNow = 0;
 let onePercentLow = 0;
+let lowAt = 0;
 
 function recordFrame(now: number, dtMs: number): void {
   frameTimes.push(dtMs);
@@ -152,7 +154,10 @@ function recordFrame(now: number, dtMs: number): void {
   fpsWindow.push(now);
   while (fpsWindow.length > 0 && now - fpsWindow[0] > 1000) fpsWindow.shift();
   fpsNow = fpsWindow.length;
-  if (frameTimes.length >= 50) {
+  // Twice a second, not every frame: sorting a thousand numbers sixty times
+  // a second is garbage for the collector to stop the game for.
+  if (frameTimes.length >= 50 && now - lowAt > 500) {
+    lowAt = now;
     const slowest = [...frameTimes].sort((a, b) => b - a);
     const n = Math.max(1, Math.round(slowest.length * 0.01));
     let sum = 0;
@@ -657,7 +662,7 @@ function frame(): void {
       hud.message("");
     }
 
-    hud.netStats(
+    if (DEBUG) hud.netStats(
       `seat ${slot}  view ${interp.viewTick(now)}  server ${Math.floor(serverTick)}  ` +
       `unacked ${predictor.pendingCount}`,
     );
@@ -666,6 +671,7 @@ function frame(): void {
       `1% low   ${onePercentLow.toFixed(0)}`,
       `draws    ${renderer.drawCalls}`,
       `tris     ${renderer.triangles}`,
+      `res      ${renderer.pixelRatio.toFixed(2)}x`,
       `ping     ${rtt} ms`,
       `unacked  ${predictor.pendingCount}`,
     ] : null);

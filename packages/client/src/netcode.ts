@@ -184,11 +184,17 @@ export class Interpolator {
     this.snaps.push({ tick, players });
     if (this.snaps.length > 64) this.snaps.shift();
 
-    // Track the server clock from snapshot arrivals. Jitter is smoothed out,
-    // a large jump (tab was hidden, long stall) resets it.
+    // Track the server clock from snapshot arrivals. A snapshot can only
+    // ever arrive late, never early, so the earliest arrivals are the honest
+    // ones: the estimate rises quickly towards an early sample and sinks
+    // only slowly towards a late one. Averaging them instead would let every
+    // delayed packet nudge the clock, and other players would speed up and
+    // slow down with the network. A large jump (tab hidden, long stall)
+    // resets it.
     const sample = tick - nowMs / TICK_MS;
     if (this.offset === null || Math.abs(sample - this.offset) > 10) this.offset = sample;
-    else this.offset += (sample - this.offset) * 0.05;
+    else if (sample > this.offset) this.offset += (sample - this.offset) * 0.2;
+    else this.offset += (sample - this.offset) * 0.01;
   }
 
   get ready(): boolean {

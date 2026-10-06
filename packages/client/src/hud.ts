@@ -14,6 +14,16 @@ export function shortWallet(w: string): string {
 }
 
 /** Where a nameplate should be drawn, worked out by the renderer. */
+/** Weapon silhouettes for the touch weapon bar, original, in order of WEAPONS. */
+const WEAPON_ICONS: readonly string[] = [
+  // Rifle: stock, receiver, magazine, barrel.
+  `<svg class="ico" viewBox="0 0 40 22"><path d="M2 9h6l2-2h18v2h10v2H28l-1 2h-4l-1 5h-4l1-5h-3l-2 2h-3l-1-2H8L4 14H2z"/></svg>`,
+  // Pistol.
+  `<svg class="ico" viewBox="0 0 40 22"><path d="M10 6h22v5H22l-1 2h-3l-2 6h-6l2-8h-2z"/></svg>`,
+  // Shotgun: long barrel, pump, stock.
+  `<svg class="ico" viewBox="0 0 40 22"><path d="M1 10l7-2h31v2H27v3h-8v-2h-4l-2 2H9L4 15H1z"/></svg>`,
+];
+
 export interface Plate {
   slot: number;
   hp: number;
@@ -191,22 +201,43 @@ export class Hud {
       return;
     }
     const s = Math.max(0, Math.ceil(secondsLeft));
+    // Once a second, not once a frame: a DOM write is a style recalculation,
+    // and sixty of them a second for a number that has not changed is the
+    // sort of thing that makes a phone's frame time stutter.
+    if (s === this.clockKey) return;
+    this.clockKey = s;
     this.timer.textContent = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
     this.timer.classList.toggle("low", s <= 10);
   }
+  private clockKey = -1;
 
   health(hp: number, alive: boolean): void {
+    const key = alive ? hp : -1;
+    if (key === this.hpKey) return;
+    this.hpKey = key;
     this.hp.textContent = alive ? String(hp) : "dead";
     this.hp.classList.toggle("hurt", alive && hp <= MAX_HP * 0.34);
   }
+  private hpKey = -2;
 
   /* ------------------------------------------------------------ weapons --- */
 
   private buildWeaponBar(): void {
     this.weaponsEl.innerHTML = WEAPONS
-      .map((w, i) => `<div data-w="${i}"><span class="key">${i + 1}</span>${w.name.toUpperCase()}` +
-        `<span class="a">-</span></div>`)
+      .map((w, i) => `<div data-w="${i}">${WEAPON_ICONS[i] ?? ""}<span class="key">${i + 1}</span>` +
+        `<span class="nm">${w.name.toUpperCase()}</span><span class="a">-</span></div>`)
       .join("");
+  }
+
+  /** Tapping a weapon slot asks for that weapon. Touch only. */
+  onWeaponTap(pick: (index: number) => void): void {
+    for (const el of Array.from(this.weaponsEl.children) as HTMLElement[]) {
+      el.addEventListener("touchstart", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        pick(Number(el.dataset.w));
+      }, { passive: false });
+    }
   }
 
   /**
@@ -259,16 +290,21 @@ export class Hud {
         el.style.display = "none";
         continue;
       }
-      el.style.display = "block";
-      el.style.left = `${Math.round(p.sx)}px`;
-      el.style.top = `${Math.round(p.sy)}px`;
-      const nm = el.querySelector(".nm") as HTMLElement;
-      nm.textContent = this.who(p.slot);
-      nm.style.color = hex(SLOT_COLORS[p.slot % SLOT_COLORS.length]);
-      const bar = el.querySelector(".bar i") as HTMLElement;
+      if (el.style.display !== "block") el.style.display = "block";
+      // Moved with a transform, which the compositor does on its own, rather
+      // than left and top, which lay the page out again every frame.
+      el.style.transform = `translate3d(${p.sx.toFixed(1)}px, ${p.sy.toFixed(1)}px, 0) translate(-50%, -100%)`;
       const frac = Math.max(0, Math.min(1, p.hp / MAX_HP));
-      bar.style.width = `${(frac * 100).toFixed(0)}%`;
-      bar.className = frac <= 0.34 ? "low" : "";
+      const key = `${p.slot}:${Math.round(frac * 100)}`;
+      if (el.dataset.k !== key) {
+        el.dataset.k = key;
+        const nm = el.querySelector(".nm") as HTMLElement;
+        nm.textContent = this.who(p.slot);
+        nm.style.color = hex(SLOT_COLORS[p.slot % SLOT_COLORS.length]);
+        const bar = el.querySelector(".bar i") as HTMLElement;
+        bar.style.width = `${(frac * 100).toFixed(0)}%`;
+        bar.className = frac <= 0.34 ? "low" : "";
+      }
     }
   }
 
@@ -289,27 +325,40 @@ export class Hud {
   }
 
   netStats(text: string): void {
+    if (text === this.netKey) return;
+    this.netKey = text;
     this.net.textContent = text;
   }
+  private netKey = "";
 
+  /**
+   * The movement stick. While a thumb is on it, it sits where the thumb
+   * landed; otherwise a faint one rests at the bottom left so a new player
+   * can see where to put a thumb. Touch devices only.
+   */
   stickAt(s: { ox: number; oy: number; x: number; y: number } | null): void {
-    if (!s) {
-      this.stick.style.display = "none";
+    if (!matchMedia("(pointer: coarse)").matches) {
+      if (this.stickKey !== "off") { this.stickKey = "off"; this.stick.style.display = "none"; }
       return;
     }
+    const rest = { ox: 96 + 0, oy: innerHeight - 118, x: 0, y: 0 };
+    const at = s ?? rest;
+    const dx = s ? s.x - s.ox : 0;
+    const dy = s ? s.y - s.oy : 0;
+    const len = Math.hypot(dx, dy);
+    // Clamp the knob to the ring so a long drag does not pull it outside.
+    const k = len > 40 ? 40 / len : 1;
+    const key = `${s ? 1 : 0}:${at.ox}:${at.oy}:${Math.round(dx * k)}:${Math.round(dy * k)}`;
+    if (key === this.stickKey) return;
+    this.stickKey = key;
     this.stick.style.display = "block";
-    this.stick.style.left = `${s.ox}px`;
-    this.stick.style.top = `${s.oy}px`;
+    this.stick.classList.toggle("idle", !s);
+    this.stick.style.left = `${at.ox}px`;
+    this.stick.style.top = `${at.oy}px`;
     const knob = this.stick.firstElementChild as HTMLElement | null;
-    if (knob) {
-      // Clamp the knob to the ring so a long drag does not pull it outside.
-      const dx = s.x - s.ox;
-      const dy = s.y - s.oy;
-      const len = Math.hypot(dx, dy);
-      const k = len > 40 ? 40 / len : 1;
-      knob.style.transform = `translate(${(dx * k).toFixed(0)}px, ${(dy * k).toFixed(0)}px)`;
-    }
+    if (knob) knob.style.transform = `translate3d(${(dx * k).toFixed(0)}px, ${(dy * k).toFixed(0)}px, 0)`;
   }
+  private stickKey = "";
 
   /**
    * The end of round card.

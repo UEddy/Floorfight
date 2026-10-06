@@ -391,6 +391,26 @@ export class Renderer {
   private lastEye = { x: 0, z: 0 };
   private moving = 0;
   private bobPhase = 0;
+
+  /*
+   * Dynamic resolution.
+   *
+   * Smooth matters more than sharp. A phone that cannot hold 60 frames a
+   * second at its native resolution stutters, and a stutter is felt in the
+   * aim far more than a few fewer pixels are seen. So the renderer watches
+   * its own frame times and trades resolution for frame rate: down a step
+   * when the last second averaged under 55 fps, back up a step after three
+   * good seconds in a row. Changing the ratio reallocates the drawing
+   * buffer, which costs a frame, so it never changes more than once every
+   * two seconds.
+   */
+  private ratio = 1;
+  private maxRatio = 1;
+  private frameSum = 0;
+  private frameCount = 0;
+  private goodSeconds = 0;
+  private lastRatioChange = 0;
+  private static readonly MIN_RATIO = 0.6;
   private shake = 0;
   private chunks: THREE.InstancedMesh;
   private chunkState: Chunk[] = [];
@@ -409,7 +429,11 @@ export class Renderer {
 
   constructor(canvas: HTMLCanvasElement, private slots: number) {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
-    this.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    // Start a phone at a resolution it can usually hold, and let the scaler
+    // below move it from there. A desktop starts at its full ratio, capped.
+    this.maxRatio = Math.min(devicePixelRatio, 2);
+    this.ratio = matchMedia("(pointer: coarse)").matches ? Math.min(this.maxRatio, 1.5) : this.maxRatio;
+    this.renderer.setPixelRatio(this.ratio);
     this.renderer.shadowMap.enabled = false;
 
     // Dusk haze, the colour of the sky low down through the glass. It softens
@@ -665,6 +689,33 @@ export class Renderer {
     this.muzzles.instanceMatrix.needsUpdate = true;
   }
 
+  /** The pixel ratio being rendered at, for the debug overlay. */
+  get pixelRatio(): number {
+    return this.ratio;
+  }
+
+  private scaleResolution(dt: number, nowMs: number): void {
+    if (dt <= 0 || dt > 0.25) return; // a tab switch or a stall, not a frame
+    this.frameSum += dt;
+    this.frameCount++;
+    if (this.frameSum < 1) return;
+    const fps = this.frameCount / this.frameSum;
+    this.frameSum = 0;
+    this.frameCount = 0;
+    if (fps >= 58) this.goodSeconds++;
+    else this.goodSeconds = 0;
+    if (nowMs - this.lastRatioChange < 2000) return;
+    let next = this.ratio;
+    if (fps < 55) next = Math.max(Renderer.MIN_RATIO, this.ratio - 0.2);
+    else if (this.goodSeconds >= 3) next = Math.min(this.maxRatio, this.ratio + 0.1);
+    if (Math.abs(next - this.ratio) < 0.01) return;
+    this.ratio = next;
+    this.lastRatioChange = nowMs;
+    this.goodSeconds = 0;
+    this.renderer.setPixelRatio(next);
+    this.renderer.setSize(innerWidth, innerHeight, false);
+  }
+
   /** Draw calls this frame, for the HUD's budget readout. */
   get drawCalls(): number {
     return this.renderer.info.render.calls;
@@ -682,8 +733,10 @@ export class Renderer {
     remotes: Map<number, RemoteView>,
     held: { weapon: number; reload: number | null; alive: boolean; grounded: boolean },
   ): void {
-    const dt = this.lastDraw === 0 ? 0 : Math.min(0.1, (nowMs - this.lastDraw) / 1000);
+    const rawDt = this.lastDraw === 0 ? 0 : (nowMs - this.lastDraw) / 1000;
+    const dt = Math.min(0.1, rawDt);
     this.lastDraw = nowMs;
+    this.scaleResolution(rawDt, nowMs);
 
     // Head bob while walking, and a shake when we fire. Both move the
     // camera's position by a few centimetres and roll it, and neither turns
