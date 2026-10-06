@@ -28,7 +28,7 @@ import { Menu } from "./menu";
 import * as native from "./native";
 import { BATCH_TICKS, Interpolator, Predictor, type RemoteView } from "./netcode";
 import { Controls } from "./input";
-import { Renderer } from "./render";
+import { Renderer, hallTriangles } from "./render";
 import { Hud, type Plate } from "./hud";
 import { Sfx } from "./audio";
 
@@ -759,6 +759,7 @@ if (import.meta.env.DEV) {
         remotes: Object.fromEntries(remotes),
         drawCalls: renderer?.drawCalls ?? 0,
         triangles: renderer?.triangles ?? 0,
+        hallTriangles,
         fps: fpsNow,
         onePercentLow,
         ping: rtt,

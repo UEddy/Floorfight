@@ -77,6 +77,12 @@ else the header is ignored completely. When the header is a list the
 leftmost, which is the usual way this gets written, would let any client pick
 its own bucket by sending a header.
 
+`npm run measure` in `packages/server` starts the server the way the droplet
+runs it (production, a 256 MB heap), fills four rooms with signing guests for
+forty seconds and reports resident memory and the largest snapshot. On the
+96 block hall: 97 MB idle, 119 MB loaded, snapshots at most 861 bytes for six
+players (the 48 block hall measured 104 MB idle, 105 to 125 MB loaded).
+
 Twenty rooms is a ceiling, not a capacity claim. Twenty full rooms is 120
 players at 60 Hz and about 8 MB of match log objects each, against a 256 MB
 heap on 1 vCPU. CPU or memory will complain first.
@@ -98,8 +104,8 @@ anyone can run it against somebody else's match.
 ## Weapons
 
 Three, in `shared/weapons.ts`: an automatic rifle, a semi-automatic pistol
-that kills with one head shot, and an eight pellet shotgun whose range stops
-well short of the hall's longest sightline. Magazine, reload, fire interval,
+that kills with one head shot, and an eight pellet shotgun that stops dead at
+sixteen blocks. The rifle and pistol reach 140, past the hall's longest line. Magazine, reload, fire interval,
 damage, head multiplier, spread, pellet count and range all live in that
 table, and the server is the only thing that acts on it.
 
@@ -115,6 +121,39 @@ know the pattern in advance, and the server cannot pick one afterwards to suit
 the result. The client checks the reveal against its own recorded commitment
 and says so on the end of round card. Free rooms use a fixed public salt:
 there is nothing to win and nobody to convince.
+
+## The Hall
+
+`shared/map.ts`, authored by hand as box, air and stair ops, 96 by 96 blocks
+and 24 high. The map id is sha256 of the grid bytes, so any edit to a block
+changes it, and a log from another layout refuses to replay.
+
+An open exhibition hall rather than a maze: a central nave about 40 blocks
+wide with a fountain court in its middle, a bandstand at the north end and a
+court of engines at the south, iron columns down both sides of the nave, a
+market of stalls in the west aisle and a garden of hedges in the east. Three
+galleries (west, north, east) one storey up, each reached by six block wide
+staircases, with six block wide covered arcades under the side two. Five
+combat zones are named in `ZONES`.
+
+The layout rules are tests, not intentions (`server/test/mapcheck.ts` and the
+map tests in `sim.test.ts`):
+
+- no pocket narrower than four blocks anywhere a player can stand, and the
+  arcades six wide the whole way;
+- every level, zone and spawn reachable on foot without jumping;
+- at least twelve spawns (there are fourteen), none in sight of another, each
+  with cover within five blocks and a fight within six seconds' walk at full
+  speed;
+- long lines down and across the nave stay open.
+
+Respawn (`pickSpawn` in `sim.ts`) prefers a spawn no living enemy can see,
+then the one farthest from the nearest enemy. It is part of the sim and runs
+in the replay, so it reads only the world state.
+
+`npm run topdown -- out.png` in `packages/server` draws the plan straight from
+the grid, with spawns and zones marked. `docs/screenshots/map-v2/` holds that
+plan and the shots views.
 
 ## Trust boundary
 
@@ -182,17 +221,23 @@ Measured: the greybox test held 60 fps with a 60 fps 1% low on a Galaxy S24 at
 full quality, 31 draw calls. That scene was a fraction of the real game, so the
 headroom was real but unearned.
 
-The Hall replaces it and is counted, not measured: 16485 solid blocks reduce to
-36668 triangles once hidden faces are dropped, in one merged mesh that samples
-a single procedural texture atlas, with sky and lantern light baked into its
+The Hall is counted, not measured. Its exposed block faces are 55296
+triangles; a greedy mesher merges runs of faces that share a tile and a flat
+baked light (or light that only varies across the run), which brings the hall
+to about 39.7k, split into 32 by 32 chunks so the ones behind the camera are
+culled. The merge is lossless: faces inside a lantern's pool or a corner's
+occlusion stay single, which is why it is not a bigger cut. Everything
+samples one procedural texture atlas, with sky and lantern light baked into
 vertex colours. With the sign strip, the sky dome, the glass roof, the props,
 the lantern glows, the instanced character parts, the view model, the death
-chunks, the tracers and the remote muzzle flashes, a six player frame is about
-23 draw calls and 51k triangles, read off the renderer by `npm run shots` in
-headless Chromium. It does not grow with the map or the player count.
+chunks, the tracers and the remote muzzle flashes, a six player frame is
+29 to 32 draw calls and 57k to 63k triangles, read off the renderer by
+`npm run shots` in headless Chromium. The 48 block hall before it was 22
+draw calls and 51k triangles.
 
 `npm run shots` in `packages/client` plays five seconds against bots and saves
-screenshots from fixed places in the Hall. Use it to look at a visual change
+screenshots from fixed places in the Hall, printing the draw calls and
+triangles at each. Use it to look at a visual change
 before shipping it. Its frame rate is SwiftShader's and means nothing.
 
 Frame rate on device is still unmeasured, on either phone. `?debug=1` puts fps,
@@ -322,16 +367,17 @@ Flag these rather than deciding alone.
 ## Status
 
 Done: deterministic sim core with height, gravity, jumping and three weapons,
-block grid collision and grid hitscan, wire protocol v7 with horizontal acceleration and honest crosshair bloom, The Hall as authored
-map data identified by the hash of its own blocks, merged block renderer with
+block grid collision and grid hitscan, wire protocol v7 with horizontal acceleration and honest crosshair bloom, The Hall (96 by 96,
+open nave, three galleries, fourteen spawns) as authored map data identified
+by the hash of its own blocks, respawn away from enemies, bots that hunt, merged block renderer with
 hit feedback, damage numbers, death chunks, tracers and synthesized sound,
 touch controls, server tick loop and join handshake, free and staked room
 types with server side bots, Anchor escrow program with 20 LiteSVM tests
 covering the attack cases, the payout paths and the holders flow (the app's
 create transaction, the lobby's lock rule against the real program, and
-create, join, lock, settle and claim end to end), 127 server tests covering
-replay determinism, weapon behaviour, the map id, the map's sightline and
-reachability rules, the bot rules, the holders lobby and API, and the NFT
+create, join, lock, settle and claim end to end), 133 server tests covering
+replay determinism, weapon behaviour, the map id, the map's spawn, width,
+openness and reachability rules, respawn placement, the bot rules, the holders lobby and API, and the NFT
 image fetch's SSRF limits.
 
 Holders matches, wired: a mode screen (Free or Holders), connect through the

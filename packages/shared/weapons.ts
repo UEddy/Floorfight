@@ -86,16 +86,18 @@ export const WEAPONS: readonly WeaponSpec[] = [
   // Six body shots or three heads. 1.5 second reload.
   // Moving or holding the trigger opens the rifle up to about four degrees,
   // so tapping from a standstill is how it holds a lane.
-  spec(W_RIFLE, "Rifle", 30, 90, 7, 18, 2, 60, 1, true, 90, 40, 8, 48),
+  // Range is the length of the hall and more, so the nave's long lines are
+  // the rifle's to hold.
+  spec(W_RIFLE, "Rifle", 30, 90, 7, 18, 2, 60, 1, true, 140, 40, 8, 48),
   // 100 damage to the head: one shot, and the only weapon in the game that
   // can do it. Three to the body, at five rounds a second at best.
   // The one shot head kill wants a still shooter: running, the pistol is
   // three times as wide.
-  spec(W_PISTOL, "Pistol", 12, 75, 13, 40, 2.5, 14, 1, false, 90, 30, 10, 20),
+  spec(W_PISTOL, "Pistol", 12, 75, 13, 40, 2.5, 14, 1, false, 140, 30, 10, 20),
   // Eight pellets of 14: everything lands at touching distance, and the shot
-  // stops dead at sixteen blocks. The hall's longest sightline is about
-  // twenty one, so the range limit is what keeps this a weapon for the booth
-  // lanes and the stairwells rather than one more way to hold a long lane.
+  // stops dead at sixteen blocks. The nave's lines run eighty and more, so
+  // the range limit is what keeps this a weapon for the market, the garden
+  // hedges and the stairs rather than one more way to hold a long lane.
   // The pattern is already the spread. Moving does not widen it.
   spec(W_SHOTGUN, "Shotgun", 6, 150, 45, 14, 1.5, 420, 8, false, 16, 0, 0, 0),
 ];

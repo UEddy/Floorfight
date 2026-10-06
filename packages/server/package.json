@@ -8,7 +8,9 @@
     "start": "tsx src/index.ts",
     "check": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts",
-    "replay": "tsx src/replay.ts"
+    "replay": "tsx src/replay.ts",
+    "measure": "tsx scripts/measure.ts",
+    "topdown": "tsx scripts/topdown.ts"
   },
   "dependencies": {
     "@solana/web3.js": "1.99.0",

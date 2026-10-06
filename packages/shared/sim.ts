@@ -48,7 +48,7 @@ import {
 
 export {
   GRID_X, GRID_Y, GRID_Z, HALF_X, HALF_Z, MAP_ID, SPAWNS,
-  LEVEL_GROUND, LEVEL_STAGE, LEVEL_GALLERY, LEVEL_GIRDER,
+  LEVEL_GROUND, LEVEL_STAGE, LEVEL_GALLERY,
   blockAt, solidAt, cellCentreX, cellCentreZ,
 } from "./map";
 
@@ -550,6 +550,53 @@ export function exposedNow(ox: number, oy: number, oz: number, v: PlayerState): 
   return false;
 }
 
+/**
+ * Where a player comes back in: a spawn none of the living enemies can see,
+ * as far as possible from the nearest of them. If every spawn is in someone's
+ * sight, the farthest one. Ties go to whichever comes first in an order that
+ * rotates with the slot and the death count, so two players dying at once
+ * do not get the same answer and a player is not sent back to the same spot
+ * every time.
+ *
+ * Deterministic: grid rays and exact arithmetic over state the log already
+ * contains, so a replay picks the same spawn the server did.
+ */
+export function pickSpawn(world: WorldState, slot: number): number {
+  const me = world.players[slot];
+  const n = SPAWNS.length;
+  const start = ((slot * 5 + me.deaths * 7) % n + n) % n;
+  let best = start;
+  let bestHidden = false;
+  let bestDist = -1;
+  for (let k = 0; k < n; k++) {
+    const i = (start + k) % n;
+    const s = SPAWNS[i];
+    const ey = s.y + EYE_HEIGHT;
+    let nearest = Infinity;
+    let hidden = true;
+    for (let j = 0; j < world.players.length; j++) {
+      const e = world.players[j];
+      if (j === slot || !e || !e.alive) continue;
+      const dx = s.x - e.x;
+      const dy = ey - (e.y + EYE_HEIGHT);
+      const dz = s.z - e.z;
+      const d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 < nearest) nearest = d2;
+      if (hidden) {
+        const d = Math.sqrt(d2);
+        if (d === 0 || rayGrid(e.x, e.y + EYE_HEIGHT, e.z, dx / d, dy / d, dz / d, d) >= d) hidden = false;
+      }
+    }
+    // Hidden beats visible; then the farther from the nearest enemy.
+    if ((hidden && !bestHidden) || (hidden === bestHidden && nearest > bestDist)) {
+      best = i;
+      bestHidden = hidden;
+      bestDist = nearest;
+    }
+  }
+  return best;
+}
+
 function record(world: WorldState): void {
   const f = world.history[world.tick % HISTORY_TICKS];
   f.tick = world.tick;
@@ -594,7 +641,7 @@ export function step(
 
     if (!p.alive) {
       if (tick >= p.respawnAt) {
-        const s = SPAWNS[(slot + p.deaths) % SPAWNS.length];
+        const s = SPAWNS[pickSpawn(world, slot)];
         p.x = s.x; p.y = s.y; p.z = s.z; p.vy = 0; p.vx = 0; p.vz = 0;
         p.streak = 0;
         p.hp = MAX_HP; p.alive = true;
