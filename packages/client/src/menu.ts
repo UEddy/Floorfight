@@ -1,0 +1,328 @@
+/**
+ * The screens before and after a round: choosing a mode, the holders flow,
+ * the lobby, and a holders match's results.
+ *
+ * Free is the game as it has always been: a guest key made up on this page
+ * load, a free room, bots after a few seconds.
+ *
+ * Holders needs the Floorfight app, because the money moves through the
+ * wallet the app holds. The page asks the app for intents only (see
+ * native.ts): connect, create at a tier index, join a match id, sign a join,
+ * claim or refund. Every amount a person approves is shown by the app from
+ * its own tier list or from the chain, never from here. What this page shows
+ * is for orientation, and says where its numbers come from.
+ */
+
+import { STAKE_TIERS } from "../../shared/tiers";
+import type { LobbyView } from "../../shared/protocol";
+import * as native from "./native";
+
+const $ = (id: string) => document.getElementById(id) as HTMLElement;
+
+/** Lamports as SOL, trimmed. Display only. */
+export function sol(lamports: string | bigint): string {
+  const n = BigInt(lamports);
+  const whole = n / 1_000_000_000n;
+  const frac = (n % 1_000_000_000n).toString().padStart(9, "0").replace(/0+$/, "");
+  return frac ? `${whole}.${frac}` : `${whole}`;
+}
+
+function esc(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+}
+
+function short(w: string): string {
+  return `${w.slice(0, 4)}...${w.slice(-4)}`;
+}
+
+async function getJson<T>(path: string): Promise<T> {
+  const r = await fetch(path, { headers: { Accept: "application/json" } });
+  const body = await r.json().catch(() => ({})) as T & { error?: string };
+  if (!r.ok) throw new Error(body.error ?? `HTTP ${r.status}`);
+  return body;
+}
+
+export interface Nft { id: string; name: string; collection: string | null; image: string | null }
+
+export interface MenuHandlers {
+  /** Free play, as before. */
+  free(): void;
+  /** Enter a holders match: the caller connects and signs the join. */
+  holders(matchId: string, wallet: string, mint: string | null): void;
+}
+
+interface OpenMatch { matchId: string; stake: string; count: number; maxPlayers: number; joinDeadline: number }
+
+export class Menu {
+  private el = $("menu");
+  private wallet: string | null = null;
+  private mint: string | null = null;
+  private tier = 0;
+
+  constructor(private h: MenuHandlers) {}
+
+  hide(): void {
+    this.el.classList.remove("show");
+  }
+
+  /** The first screen: Free or Holders. */
+  showModes(): void {
+    const inApp = native.hasNative();
+    this.el.innerHTML = `
+      <div class="card modes">
+        <h1>Floorfight</h1>
+        <p class="sub">Six players, three minutes, one hall.</p>
+        <button class="mode" data-m="free">
+          <b>Free</b><span>Play now as a guest. No wallet, nothing staked.</span>
+        </button>
+        <button class="mode" data-m="holders" ${inApp ? "" : "disabled"}>
+          <b>Holders</b><span>${inApp
+            ? "Stake devnet SOL with your wallet. Top three split the pot."
+            : "Needs the Floorfight Android app, which holds your wallet."}</span>
+        </button>
+      </div>`;
+    this.el.classList.add("show");
+    (this.el.querySelector('[data-m="free"]') as HTMLButtonElement).onclick = () => {
+      this.hide();
+      this.h.free();
+    };
+    (this.el.querySelector('[data-m="holders"]') as HTMLButtonElement).onclick = () => {
+      void this.showHolders();
+    };
+  }
+
+  /** Holders: wallet, head, tier, open matches. */
+  async showHolders(): Promise<void> {
+    this.el.innerHTML = `
+      <div class="card holders">
+        <div class="row head"><h1>Holders</h1><button class="link" data-a="back">Back</button></div>
+        <div class="wallet"></div>
+        <div class="nfts"></div>
+        <div class="tiers">${STAKE_TIERS.map((t, i) =>
+          `<button data-tier="${i}" class="${i === this.tier ? "on" : ""}">${esc(t.label)}</button>`).join("")}</div>
+        <div class="list"><p class="dim">Loading open matches...</p></div>
+        <button class="primary" data-a="create">Create a match at ${esc(STAKE_TIERS[this.tier].label)}</button>
+        <p class="note">Devnet. Amounts are confirmed by the app before your wallet opens.</p>
+        <p class="err"></p>
+      </div>`;
+    this.el.classList.add("show");
+    (this.el.querySelector('[data-a="back"]') as HTMLButtonElement).onclick = () => this.showModes();
+    for (const b of this.el.querySelectorAll<HTMLButtonElement>("[data-tier]")) {
+      b.onclick = () => {
+        this.tier = Number(b.dataset.tier);
+        void this.showHolders();
+      };
+    }
+    (this.el.querySelector('[data-a="create"]') as HTMLButtonElement).onclick = () => void this.create();
+    this.renderWallet();
+    void this.loadMatches();
+  }
+
+  private err(e: unknown): void {
+    const p = this.el.querySelector(".err");
+    if (p) p.textContent = e ? (e as Error).message : "";
+  }
+
+  private renderWallet(): void {
+    const box = this.el.querySelector(".wallet");
+    if (!box) return;
+    if (!this.wallet) {
+      box.innerHTML = `<button class="primary" data-a="connect">Connect wallet</button>`;
+      (box.querySelector("button") as HTMLButtonElement).onclick = async () => {
+        this.err(null);
+        try {
+          this.wallet = await native.connect();
+          this.renderWallet();
+        } catch (e) {
+          this.err(e);
+        }
+      };
+      return;
+    }
+    box.innerHTML = `<p>Wallet <b>${esc(short(this.wallet))}</b></p>`;
+    void this.loadNfts();
+  }
+
+  /**
+   * The head picker. The list is the server's, from the chain's indexer, and
+   * picking one is a request: the server checks ownership again at join and
+   * anything it cannot confirm plays with the default face.
+   */
+  private async loadNfts(): Promise<void> {
+    const box = this.el.querySelector(".nfts");
+    if (!box || !this.wallet) return;
+    box.innerHTML = `<p class="dim">Looking for your NFTs...</p>`;
+    try {
+      const { items } = await getJson<{ items: Nft[] }>(`/api/nfts/${this.wallet}`);
+      if (items.length === 0) {
+        box.innerHTML = `<p class="dim">No NFTs found. You will play with the default face.</p>`;
+        return;
+      }
+      box.innerHTML = `<p class="dim">Pick a head</p><div class="grid">${items.slice(0, 24).map((n) => `
+        <button data-mint="${esc(n.id)}" class="${n.id === this.mint ? "on" : ""}" title="${esc(n.name)}">
+          ${n.image ? `<img src="/api/nft-img/${esc(n.id)}" alt="" loading="lazy">` : ""}
+          <span>${esc(n.name)}</span>
+        </button>`).join("")}</div>`;
+      for (const b of box.querySelectorAll<HTMLButtonElement>("[data-mint]")) {
+        b.onclick = () => {
+          this.mint = this.mint === b.dataset.mint ? null : b.dataset.mint ?? null;
+          for (const o of box.querySelectorAll("[data-mint]")) {
+            o.classList.toggle("on", (o as HTMLElement).dataset.mint === this.mint);
+          }
+        };
+      }
+    } catch (e) {
+      box.innerHTML = `<p class="dim">NFT heads unavailable (${esc((e as Error).message)}). Default face.</p>`;
+    }
+  }
+
+  private async loadMatches(): Promise<void> {
+    const box = this.el.querySelector(".list");
+    if (!box) return;
+    try {
+      const { matches } = await getJson<{ matches: OpenMatch[] }>(`/api/matches?tier=${this.tier}`);
+      if (matches.length === 0) {
+        box.innerHTML = `<p class="dim">No open matches at ${esc(STAKE_TIERS[this.tier].label)}. Create one.</p>`;
+        return;
+      }
+      const now = Date.now() / 1000;
+      box.innerHTML = matches.map((m) => `
+        <div class="match">
+          <span>${m.count} of ${m.maxPlayers} in, ${Math.max(0, Math.floor((m.joinDeadline - now) / 60))} min left</span>
+          <button data-join="${esc(m.matchId)}">Join</button>
+        </div>`).join("");
+      for (const b of box.querySelectorAll<HTMLButtonElement>("[data-join]")) {
+        b.onclick = () => void this.join(b.dataset.join!);
+      }
+    } catch (e) {
+      box.innerHTML = `<p class="dim">Could not list matches: ${esc((e as Error).message)}</p>`;
+    }
+  }
+
+  private async ensureWallet(): Promise<string> {
+    if (!this.wallet) {
+      this.wallet = await native.connect();
+      this.renderWallet();
+    }
+    return this.wallet;
+  }
+
+  private async create(): Promise<void> {
+    this.err(null);
+    try {
+      const wallet = await this.ensureWallet();
+      const { matchId } = await native.createMatch(this.tier);
+      this.h.holders(matchId, wallet, this.mint);
+    } catch (e) {
+      this.err(e);
+    }
+  }
+
+  private async join(matchId: string): Promise<void> {
+    this.err(null);
+    try {
+      const wallet = await this.ensureWallet();
+      await native.escrow("join", matchId);
+      this.h.holders(matchId, wallet, this.mint);
+    } catch (e) {
+      this.err(e);
+    }
+  }
+
+  /* ------------------------------------------------------------ lobby --- */
+
+  showLobby(v: LobbyView): void {
+    const here = v.present.filter(Boolean).length;
+    const left = Math.max(0, v.joinDeadline - Math.floor(Date.now() / 1000));
+    const mmss = `${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}`;
+    const status = v.phase === "locking"
+      ? "Locking the match and opening the hall..."
+      : v.phase === "expired"
+        ? "The join window closed with fewer than two players. Your stake can be refunded."
+        : v.count < 2
+          ? "Waiting for a second player to join."
+          : `Starts when everyone here is connected, or with ${v.lockBefore} seconds of the window left.`;
+    this.el.innerHTML = `
+      <div class="card lobby">
+        <h1>Lobby</h1>
+        <p class="sub">Match ${esc(v.matchId)} at ${esc(sol(v.stake))} SOL each</p>
+        <div class="seats">${Array.from({ length: v.maxPlayers }, (_, i) => {
+          const cls = i >= v.count ? "empty" : v.present[i] ? "here" : "away";
+          const label = i >= v.count ? "open" : v.present[i] ? "here" : "staked, not here";
+          return `<div class="${cls}"><b>${i + 1}</b><span>${label}</span></div>`;
+        }).join("")}</div>
+        <p>${v.count} staked, ${here} here. Window closes in ${mmss}.</p>
+        <p class="dim">${esc(status)}</p>
+        <p class="note">No bots in a holders match. Anyone who is not here when it starts stands still.</p>
+      </div>`;
+    this.el.classList.add("show");
+  }
+
+  /* ---------------------------------------------------------- results --- */
+
+  /**
+   * The holders half of the end of round card. Polls the match account
+   * through /api/match until it settles (or its settle window lapses), then
+   * offers Claim or Refund through the app.
+   */
+  showResults(matchId: string, wallet: string): void {
+    const box = $("holders-result");
+    box.innerHTML = `<p class="dim">Waiting for the result on chain...</p>`;
+    box.style.display = "block";
+    let done = false;
+    const poll = async () => {
+      if (done) return;
+      try {
+        const m = await getJson<{
+          state: string; players: string[]; placements: number[]; payouts: string[];
+          claimed: number; settleDeadline: number; count: number; stake: string;
+        }>(`/api/match/${matchId}`);
+        const slot = m.players.indexOf(wallet);
+        const place = m.placements.indexOf(slot);
+        const claimed = slot >= 0 && (m.claimed & (1 << slot)) !== 0;
+        const now = Date.now() / 1000;
+        const refundable = m.state === "Refunding" || (m.state === "Locked" && now > m.settleDeadline);
+        const log = `<a href="/logs/${encodeURIComponent(matchId)}.json" target="_blank" rel="noopener">Match log</a>`;
+        let line: string;
+        let action: "claim" | "refund" | null = null;
+        if (m.state === "Settled") {
+          if (place >= 0) {
+            line = `Place ${place + 1}. Payout <b>${sol(m.payouts[place])} SOL</b>${claimed ? ", claimed." : "."}`;
+            if (!claimed) action = "claim";
+          } else {
+            line = "Settled. You did not place this time.";
+          }
+          done = true;
+        } else if (refundable) {
+          line = `Not settled in time. Refund <b>${sol(m.stake)} SOL</b>${claimed ? ", claimed." : "."}`;
+          if (!claimed) action = "refund";
+          done = true;
+        } else {
+          line = "Waiting for the resolver to settle on chain...";
+        }
+        box.innerHTML = `<p>${line}</p>${action
+          ? `<button class="primary" data-a="${action}">${action === "claim" ? "Claim" : "Refund"}</button>`
+          : ""}<p class="dim">${log}. Anyone can replay it with npm run replay.</p><p class="err"></p>`;
+        const b = box.querySelector<HTMLButtonElement>("[data-a]");
+        if (b && action) {
+          const which = action;
+          b.onclick = async () => {
+            b.disabled = true;
+            try {
+              const { signature } = await native.escrow(which, matchId);
+              box.querySelector(".err")!.textContent = "";
+              b.outerHTML = `<p>Done. Transaction ${esc(short(signature))}</p>`;
+            } catch (e) {
+              b.disabled = false;
+              box.querySelector(".err")!.textContent = (e as Error).message;
+            }
+          };
+        }
+      } catch (e) {
+        box.innerHTML = `<p class="dim">Could not read the match: ${esc((e as Error).message)}</p>`;
+      }
+      if (!done) setTimeout(() => void poll(), 4000);
+    };
+    void poll();
+  }
+}

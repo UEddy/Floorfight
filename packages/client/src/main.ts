@@ -21,7 +21,9 @@ import { fromHex, sha256Hex } from "../../shared/sha256";
 import { quantAxis, quantPitch, quantYaw, type SnapshotPlayer } from "../../shared/protocol";
 import { DEV_MATCH_ID } from "../../shared/dev";
 import { devKeypair, guestKeypair } from "./keys";
-import { Net } from "./net";
+import { Net, signLocally, type NetHandlers } from "./net";
+import { Menu } from "./menu";
+import * as native from "./native";
 import { BATCH_TICKS, Interpolator, Predictor, type RemoteView } from "./netcode";
 import { Controls } from "./input";
 import { Renderer } from "./render";
@@ -157,24 +159,67 @@ function recordFrame(now: number, dtMs: number): void {
   }
 }
 
-let keys;
-try {
-  keys = devSeat ? devKeypair(seat) : guestKeypair();
-} catch (e) {
-  hud.message((e as Error).message);
-  throw e;
+/**
+ * The holders match being played, if this is one: its on-chain id and the
+ * wallet that staked into it. Null in free play.
+ */
+let holders: { matchId: string; wallet: string } | null = null;
+
+const menu = new Menu({
+  free: () => startFree(),
+  holders: (matchId, wallet, mint) => startHolders(matchId, wallet, mint),
+});
+
+let net: Net | null = null;
+
+/** Free play: a guest key made up now, or a dev seat in a dev build. */
+function startFree(): void {
+  let keys: ReturnType<typeof guestKeypair>;
+  try {
+    keys = devSeat ? devKeypair(seat) : guestKeypair();
+  } catch (e) {
+    hud.message((e as Error).message);
+    throw e;
+  }
+  hud.message("Connecting...");
+  net = new Net(serverUrl, async (challenge) => {
+    // A dev seat asks for the dev room by name. A guest takes the room the
+    // server offered with the challenge, so the signature covers the id of
+    // the match it actually gets rather than a matchmaking alias.
+    const matchId = devSeat ? DEV_MATCH_ID : challenge.freeMatchId;
+    return matchId ? signLocally(matchId, challenge.nonce, keys) : null;
+  }, handlers);
 }
 
-hud.message("Connecting...");
+/**
+ * A holders match. The join is signed by the wallet, through the app: the
+ * page passes the match id and the nonce and gets back a signature over a
+ * message the app built itself. Until the match locks the server keeps the
+ * socket in the lobby; then it moves it into the room and the game starts.
+ */
+function startHolders(matchId: string, wallet: string, mint: string | null): void {
+  holders = { matchId, wallet };
+  hud.message("Signing in to the lobby...");
+  net = new Net(serverUrl, async (challenge) => {
+    const signed = await native.signJoin(matchId, challenge.nonce);
+    if (signed.wallet !== wallet) {
+      throw new Error("the wallet that signed is not the one that staked");
+    }
+    return {
+      matchId, wallet: signed.wallet, sig: signed.signature,
+      ...(mint ? { mint } : {}),
+    };
+  }, handlers);
+}
 
-const net = new Net(serverUrl, (challenge) => {
-  // A dev seat asks for the dev room by name. A guest takes the room the
-  // server offered with the challenge, so the signature covers the id of the
-  // match it actually gets rather than a matchmaking alias.
-  const matchId = devSeat ? DEV_MATCH_ID : challenge.freeMatchId;
-  return matchId ? { matchId, keys } : null;
-}, {
+const handlers: NetHandlers = {
+  onLobby(view) {
+    hud.message("");
+    menu.showLobby(view);
+  },
+
   onAccepted(msg) {
+    menu.hide();
     slot = msg.slot;
     spreadCommit = msg.spreadCommit;
     hud.setRoster(msg.roster);
@@ -272,7 +317,8 @@ const net = new Net(serverUrl, (challenge) => {
     }
 
     hud.showOver(msg.standings, msg.logHash, spread, () => location.reload());
-    net.close();
+    if (holders) menu.showResults(holders.matchId, holders.wallet);
+    net?.close();
     console.log(`[arena] round over, log hash ${msg.logHash}`, msg.standings);
   },
 
@@ -287,7 +333,14 @@ const net = new Net(serverUrl, (challenge) => {
       hud.message("Connection lost. Reload to rejoin.");
     }
   },
-});
+};
+
+/*
+ * Free straight away for a dev seat or ?mode=free, which is how the
+ * screenshot script and two-tab testing skip the menu. Otherwise the menu.
+ */
+if (devSeat || params.get("mode") === "free") startFree();
+else menu.showModes();
 
 /* ------------------------------------------------------------ feedback --- */
 
@@ -421,7 +474,7 @@ function tick(now: number): void {
 
   sent.push(inp);
   if (sent.length > BATCH_TICKS) sent.shift();
-  net.send({ t: "input", batch: sent.slice() });
+  net?.send({ t: "input", batch: sent.slice() });
   seq++;
 }
 
@@ -588,6 +641,8 @@ if (import.meta.env.DEV) {
     reload(on: boolean) { controls.botReload = on; },
     weapon(n: number) { controls.cycle(n - 1 - myWeapon); },
     camera(pose: typeof devCamera) { devCamera = pose; },
+    /** The menu, so the screenshot script can photograph its screens. */
+    menu,
     /**
      * A camera pose a few blocks from the closest live opponent, looking at
      * them, from whichever side has a clear line. For the screenshot script.

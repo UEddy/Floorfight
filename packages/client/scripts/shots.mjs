@@ -87,7 +87,9 @@ async function main() {
   run("npx", ["tsx", "src/index.ts"], {
     PORT: String(SERVER_PORT), FREE_FILL_MS: "300", LOG_DIR: logs,
   }, resolve("../server"));
-  run("npx", ["vite", "--port", String(WEB_PORT), "--strictPort"], {}, resolve("."));
+  run("npx", ["vite", "--port", String(WEB_PORT), "--strictPort"], {
+    FLOORFIGHT_API: `http://127.0.0.1:${SERVER_PORT}`,
+  }, resolve("."));
   await waitFor(`http://127.0.0.1:${WEB_PORT}/`);
   console.log("servers up");
   await sleep(1500);
@@ -102,7 +104,7 @@ async function main() {
   });
   page.on("pageerror", (e) => console.error("[page]", e.message));
   page.on("console", (m) => { if (m.type() === "error") console.error("[console]", m.text()); });
-  await page.goto(`http://127.0.0.1:${WEB_PORT}/?server=ws://127.0.0.1:${SERVER_PORT}`);
+  await page.goto(`http://127.0.0.1:${WEB_PORT}/?mode=free&server=ws://127.0.0.1:${SERVER_PORT}`);
 
   console.log("page loaded, waiting for the round");
   await page.waitForFunction(() => window.arena?.state().phase === "playing", null, { timeout: 30000 });
@@ -170,10 +172,74 @@ async function main() {
   await page.screenshot({ path: join(OUT, "7-reload.png") });
 
   const s = await page.evaluate(() => window.arena.peek());
+  await page.close();
+  await menus(browser);
   console.log(`draw calls ${s.drawCalls}, triangles ${s.triangles}`);
   await browser.close();
   stopAll();
   console.log(`screenshots in ${OUT}`);
+}
+
+/**
+ * The menus. The mode screen as a plain browser sees it (holders disabled),
+ * then the holders screens as the app would show them.
+ *
+ * There is no wallet and no chain here, so for those this page gets a stub
+ * bridge that answers connect with a made up address, and canned replies for
+ * /api/matches and /api/nfts. The pictures are of the real page's layout;
+ * the matches, the NFTs and the lobby numbers in them are invented.
+ */
+async function menus(browser) {
+  const url = `http://127.0.0.1:${WEB_PORT}/?server=ws://127.0.0.1:${SERVER_PORT}`;
+  const opts = { viewport: { width: W, height: H }, deviceScaleFactor: 1, isMobile: true, hasTouch: true };
+
+  const plain = await browser.newPage(opts);
+  await plain.goto(url);
+  await plain.waitForSelector("#menu.show");
+  await plain.screenshot({ path: join(OUT, "8-modes-browser.png") });
+  await plain.close();
+
+  const page = await browser.newPage(opts);
+  await page.addInitScript(() => {
+    window.ReactNativeWebView = {
+      postMessage(raw) {
+        const req = JSON.parse(raw);
+        const reply = req.t === "connect"
+          ? { id: req.id, ok: true, t: "connect", wallet: "Ff1ghtDemo1111111111111111111111111111111111" }
+          : { id: req.id, ok: false, error: "stub bridge" };
+        setTimeout(() => dispatchEvent(new MessageEvent("floorfight-native", { data: JSON.stringify(reply) })), 50);
+      },
+    };
+  });
+  const now = Math.floor(Date.now() / 1000);
+  await page.route("**/api/matches?*", (r) => r.fulfill({ json: { tier: 0, stake: "10000000", matches: [
+    { matchId: "1844674407370955161", stake: "10000000", count: 3, maxPlayers: 6, joinDeadline: now + 420 },
+    { matchId: "922337203685477580", stake: "10000000", count: 1, maxPlayers: 6, joinDeadline: now + 540 },
+  ] } }));
+  await page.route("**/api/nfts/*", (r) => r.fulfill({ json: { items: [
+    { id: "Face1111111111111111111111111111111111111111", name: "Blue Visitor", collection: null, image: "x" },
+    { id: "Face2222222222222222222222222222222222222222", name: "Ember Clerk", collection: null, image: "x" },
+    { id: "Face3333333333333333333333333333333333333333", name: "Fern Usher", collection: null, image: "x" },
+  ] } }));
+  await page.route("**/api/nft-img/*", (r) => {
+    const n = Number(/Face(\d)/.exec(r.request().url())?.[1] ?? 1) - 1;
+    return r.fulfill({ path: resolve("scripts/fixtures", `face${n}.png`), contentType: "image/png" });
+  });
+  await page.goto(url);
+  await page.waitForSelector("#menu.show");
+  await page.screenshot({ path: join(OUT, "8-modes-app.png") });
+  await page.click('[data-m="holders"]');
+  await page.click('[data-a="connect"]');
+  await page.waitForSelector("#menu .grid img");
+  await page.click('[data-mint^="Face2"]');
+  await sleep(400);
+  await page.screenshot({ path: join(OUT, "9-holders.png") });
+  await page.evaluate((now) => window.arena.menu.showLobby({
+    t: "lobby", matchId: "1844674407370955161", phase: "waiting", count: 3, maxPlayers: 6,
+    stake: "10000000", joinDeadline: now + 263, present: [true, true, false], lockBefore: 60,
+  }), now);
+  await page.screenshot({ path: join(OUT, "10-lobby.png") });
+  await page.close();
 }
 
 main().catch((e) => {

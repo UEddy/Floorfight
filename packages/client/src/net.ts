@@ -4,6 +4,7 @@ import {
   PROTOCOL_VERSION,
   joinMessage,
   type ClientMsg,
+  type LobbyView,
   type ServerMsg,
 } from "../../shared/protocol";
 
@@ -13,18 +14,42 @@ export interface NetHandlers {
   onOver(msg: Extract<ServerMsg, { t: "over" }>): void;
   onKick(reason: string): void;
   onClose(): void;
+  /** Holders only: how the lobby stands, until the room opens. */
+  onLobby?(view: LobbyView): void;
+}
+
+/** A signed join, ready to send. */
+export interface SignedJoin {
+  matchId: string;
+  /** Base58 public key. */
+  wallet: string;
+  /** Base58 ed25519 signature over joinMessage(matchId, nonce). */
+  sig: string;
+  /** Holders: the NFT asked for. The server checks who owns it. */
+  mint?: string;
 }
 
 /**
- * Which match to join, and with which key, decided when the challenge lands.
- *
- * The challenge carries the free room this connection would be seated in, so
- * a guest cannot know which match it is joining until then. Returning null
- * means there is nothing to join.
+ * Which match to join, and the signature for it, decided when the challenge
+ * lands. Async, because a holder's signature comes from their wallet through
+ * the app. Returning null means there is nothing to join.
  */
 export type ResolveJoin = (challenge: {
   freeMatchId: string | null;
-}) => { matchId: string; keys: nacl.SignKeyPair } | null;
+  nonce: string;
+}) => Promise<SignedJoin | null>;
+
+/** Sign a join with a key held in this page: a guest, or a dev seat. */
+export function signLocally(matchId: string, nonce: string, keys: nacl.SignKeyPair): SignedJoin {
+  // The match id is inside the signed message, so this signature is good
+  // for this match and no other.
+  const text = new TextEncoder().encode(joinMessage(matchId, nonce));
+  return {
+    matchId,
+    wallet: bs58.encode(keys.publicKey),
+    sig: bs58.encode(nacl.sign.detached(text, keys.secretKey)),
+  };
+}
 
 /**
  * Socket plus join handshake. The client never picks its slot or asserts
@@ -55,25 +80,27 @@ export class Net {
             this.close();
             return;
           }
-          const choice = resolve({ freeMatchId: msg.freeMatchId });
-          if (!choice) {
-            handlers.onKick("no room available right now");
+          void resolve({ freeMatchId: msg.freeMatchId, nonce: msg.nonce }).then((choice) => {
+            if (!choice) {
+              handlers.onKick("no room available right now");
+              this.close();
+              return;
+            }
+            this.send({
+              t: "join",
+              v: PROTOCOL_VERSION,
+              matchId: choice.matchId,
+              wallet: choice.wallet,
+              sig: choice.sig,
+              ...(choice.mint ? { mint: choice.mint } : {}),
+            });
+          }, (e: unknown) => {
+            handlers.onKick((e as Error).message);
             this.close();
-            return;
-          }
-          // The match id is inside the signed message, so this signature is
-          // good for this match and no other.
-          const text = new TextEncoder().encode(joinMessage(choice.matchId, msg.nonce));
-          const sig = nacl.sign.detached(text, choice.keys.secretKey);
-          this.send({
-            t: "join",
-            v: PROTOCOL_VERSION,
-            matchId: choice.matchId,
-            wallet: bs58.encode(choice.keys.publicKey),
-            sig: bs58.encode(sig),
           });
           return;
         }
+        case "lobby": return handlers.onLobby?.(msg);
         case "accepted": return handlers.onAccepted(msg);
         case "snap": return handlers.onSnap(msg);
         case "over": return handlers.onOver(msg);
