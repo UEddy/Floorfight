@@ -46,7 +46,40 @@ test("a well formed escrow request is accepted for all three actions", () => {
   }
 });
 
+test("connect is accepted with nothing but an id", () => {
+  const req = parseRequest(JSON.stringify({ id: "c1", t: "connect" }));
+  assert.equal(req.t, "connect");
+});
+
+test("create is accepted with a tier index into this build's own list", () => {
+  for (const tier of [0, 1, 2]) {
+    const req = parseRequest(JSON.stringify({ id: "k", t: "escrow", action: "create", tier }));
+    assert.equal(req.t === "escrow" && req.action === "create" ? req.tier : -1, tier);
+  }
+});
+
 /* ------------------------------------------------------------- refused --- */
+
+test("create takes a tier and only a tier: no amount, no id, no count", () => {
+  const attempts: unknown[] = [
+    { id: "k", t: "escrow", action: "create", tier: 0, lamports: 1 },
+    { id: "k", t: "escrow", action: "create", tier: 0, stake: "10000000" },
+    { id: "k", t: "escrow", action: "create", tier: 0, matchId: "7" },
+    { id: "k", t: "escrow", action: "create", tier: 0, maxPlayers: 2 },
+    { id: "k", t: "escrow", action: "create", tier: 0, joinWindow: 3600 },
+    { id: "k", t: "escrow", action: "create" },
+    { id: "k", t: "escrow", action: "create", tier: 3 },
+    { id: "k", t: "escrow", action: "create", tier: -1 },
+    { id: "k", t: "escrow", action: "create", tier: 0.5 },
+    { id: "k", t: "escrow", action: "create", tier: "0" },
+    { id: "k", t: "escrow", action: "create", tier: 1e9 },
+    { id: "k", t: "escrow", action: "create", matchId: "7" },
+    { id: "c", t: "connect", wallet: "11111111111111111111111111111111" },
+    { id: "c", t: "connect", chain: "solana:mainnet" },
+  ];
+  for (const a of attempts) refusal(JSON.stringify(a));
+});
+
 
 test("there are exactly two requests, and nothing else is one of them", () => {
   // Every one of these is a request shape somebody might reach for, and the

@@ -11,7 +11,7 @@
  * them sign away 10 would have to change the chain to do it.
  */
 
-import { BorshAccountsCoder, BorshInstructionCoder, type Idl } from "@coral-xyz/anchor";
+import { BN, BorshAccountsCoder, BorshInstructionCoder, type Idl } from "@coral-xyz/anchor";
 import {
   Connection,
   PublicKey,
@@ -20,7 +20,14 @@ import {
   TransactionInstruction,
 } from "@solana/web3.js";
 import idlJson from "./idl/arena.json";
-import { CHAIN, PROGRAM_ID, RPC_URL } from "./config";
+import {
+  CHAIN,
+  HOLDERS_JOIN_WINDOW,
+  HOLDERS_MAX_PLAYERS,
+  PROGRAM_ID,
+  RPC_URL,
+  STAKE_TIERS,
+} from "./config";
 import type { EscrowAction } from "./bridge";
 
 const idl = idlJson as unknown as Idl;
@@ -116,7 +123,7 @@ function lower(s: string): string {
 /* -------------------------------------------------------- the actions --- */
 
 export interface Planned {
-  action: EscrowAction;
+  action: EscrowAction | "create";
   matchId: bigint;
   /** Lamports leaving the wallet (join) or coming back to it (claim, refund). */
   lamports: bigint;
@@ -124,7 +131,69 @@ export interface Planned {
   direction: "pay" | "receive";
   /** A line of plain English for the sheet, from the chain's own numbers. */
   detail: string;
-  build: (player: PublicKey) => TransactionInstruction;
+  /** Every instruction the transaction will carry, in order. */
+  build: (player: PublicKey) => TransactionInstruction[];
+}
+
+/* ------------------------------------------------------------- create --- */
+
+/**
+ * A random u64 match id, from the platform's secure random source.
+ *
+ * Random rather than counted because there is no counter to trust: two
+ * phones creating at once must not collide, and the id is the PDA seed, so
+ * a predictable one could be created first by somebody else. 2^64 makes a
+ * collision a non-event; if one ever happens the create simply fails on chain
+ * because the account exists, and nothing is lost.
+ */
+export function randomMatchId(): bigint {
+  const bytes = new Uint8Array(8);
+  crypto.getRandomValues(bytes);
+  let id = 0n;
+  for (const b of bytes) id = (id << 8n) | BigInt(b);
+  return id;
+}
+
+/**
+ * Plan a create: make a new match at a tier and take the first seat in it,
+ * in one transaction, so a creator is never left with an empty match they
+ * did not stake into.
+ *
+ * The tier is an index into this app's own list. The page never names an
+ * amount, a player count or a window: those are this build's constants.
+ */
+export function planCreate(tier: number, matchId: bigint = randomMatchId()): Planned {
+  const stake = STAKE_TIERS[tier];
+  if (stake === undefined) throw new Error(`there is no stake tier ${tier}`);
+  return {
+    action: "create",
+    matchId,
+    lamports: stake,
+    direction: "pay",
+    detail: `New match, ${HOLDERS_MAX_PLAYERS} seats, ${HOLDERS_JOIN_WINDOW / 60} minutes to fill`,
+    build: (player) => [
+      createMatchIx(player, matchId, stake),
+      joinIx(player, matchId),
+    ],
+  };
+}
+
+export function createMatchIx(creator: PublicKey, matchId: bigint, stake: bigint): TransactionInstruction {
+  return new TransactionInstruction({
+    programId,
+    keys: [
+      { pubkey: creator, isSigner: true, isWritable: true },
+      { pubkey: configPda(), isSigner: false, isWritable: false },
+      { pubkey: matchPda(matchId), isSigner: false, isWritable: true },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+    ],
+    data: instructions.encode("create_match", {
+      match_id: new BN(matchId.toString()),
+      stake: new BN(stake.toString()),
+      max_players: HOLDERS_MAX_PLAYERS,
+      join_window: new BN(HOLDERS_JOIN_WINDOW),
+    }),
+  });
 }
 
 /**
@@ -136,7 +205,7 @@ export interface Planned {
  * least be real.
  */
 export async function plan(
-  action: EscrowAction, matchId: bigint, nowSeconds: number,
+  action: EscrowAction, matchId: bigint, nowSeconds: number, wallet: string | null = null,
 ): Promise<Planned> {
   const m = await fetchMatch(matchId);
   if (!m) throw new Error(`no match ${matchId} on ${CHAIN}`);
@@ -151,7 +220,7 @@ export async function plan(
       lamports: m.stake,
       direction: "pay",
       detail: `Seat ${m.count + 1} of ${m.maxPlayers}`,
-      build: (player) => joinIx(player, matchId),
+      build: (player) => [joinIx(player, matchId)],
     };
   }
 
@@ -163,16 +232,26 @@ export async function plan(
     if (m.state !== "Settled") {
       throw new Error(`match ${matchId} is ${m.state.toLowerCase()}, so there is nothing to claim yet`);
     }
+    // With a connected wallet the exact payout is known: its slot, then that
+    // slot's place. Without one, the sheet shows what the match pays and the
+    // exact figure lands on chain.
+    const slot = wallet === null ? -1 : m.players.slice(0, m.count).findIndex((p) => p.toBase58() === wallet);
+    const place = slot < 0 ? -1 : m.placements.indexOf(slot);
+    if (wallet !== null && slot >= 0 && place < 0) {
+      throw new Error("this wallet did not place in that match, so it has no payout to claim");
+    }
+    if (place >= 0 && (m.claimed & (1 << slot)) !== 0) {
+      throw new Error("this wallet has already claimed its payout");
+    }
     return {
       action,
       matchId,
-      // The slot, and therefore the payout, depend on which wallet signs, and
-      // that is not known until the wallet authorises. The sheet shows the
-      // range the match pays, and the exact figure lands on chain.
-      lamports: m.payouts[0],
+      lamports: place >= 0 ? m.payouts[place] : m.payouts[0],
       direction: "receive",
-      detail: `Pot pays ${fmt(m.payouts[0])}, ${fmt(m.payouts[1])}, ${fmt(m.payouts[2])} SOL`,
-      build: (player) => claimIx(player, matchId),
+      detail: place >= 0
+        ? `Place ${place + 1} of ${m.count}`
+        : `Pot pays ${fmt(m.payouts[0])}, ${fmt(m.payouts[1])}, ${fmt(m.payouts[2])} SOL`,
+      build: (player) => [claimIx(player, matchId)],
     };
   }
 
@@ -191,7 +270,7 @@ export async function plan(
     lamports: m.stake,
     direction: "receive",
     detail: "Full stake back",
-    build: (player) => claimIx(player, matchId),
+    build: (player) => [claimIx(player, matchId)],
   };
 }
 
@@ -199,7 +278,7 @@ function fmt(lamports: bigint): string {
   return (Number(lamports) / 1_000_000_000).toFixed(4);
 }
 
-function joinIx(player: PublicKey, matchId: bigint): TransactionInstruction {
+export function joinIx(player: PublicKey, matchId: bigint): TransactionInstruction {
   return new TransactionInstruction({
     programId,
     keys: [
@@ -212,7 +291,7 @@ function joinIx(player: PublicKey, matchId: bigint): TransactionInstruction {
   });
 }
 
-function claimIx(player: PublicKey, matchId: bigint): TransactionInstruction {
+export function claimIx(player: PublicKey, matchId: bigint): TransactionInstruction {
   return new TransactionInstruction({
     programId,
     keys: [
@@ -233,6 +312,6 @@ export async function transactionFor(
     blockhash,
     lastValidBlockHeight,
   });
-  tx.add(planned.build(player));
+  tx.add(...planned.build(player));
   return tx;
 }

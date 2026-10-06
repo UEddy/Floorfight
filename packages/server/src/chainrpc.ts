@@ -22,6 +22,8 @@ import { Connection, Keypair, PublicKey, Transaction, TransactionInstruction } f
 import {
   IDL_ADDRESS,
   decodeMatch,
+  lockData,
+  openMatchFilters,
   settleData,
   type MatchAccount,
 } from "./chain";
@@ -207,4 +209,57 @@ export async function settleWithRetry(
     }
   }
   throw new Error(`could not settle match ${matchId}: ${lastError}`);
+}
+
+/* ------------------------------------------------------------ locking --- */
+
+export function lockInstruction(chain: ChainConfig, matchId: bigint): TransactionInstruction {
+  return new TransactionInstruction({
+    programId: chain.programId,
+    keys: [
+      { pubkey: chain.resolver.publicKey, isSigner: true, isWritable: false },
+      { pubkey: configPda(chain.programId), isSigner: false, isWritable: false },
+      { pubkey: matchPda(chain.programId, matchId), isSigner: false, isWritable: true },
+    ],
+    data: lockData(),
+  });
+}
+
+/**
+ * Lock a match the lobby has decided is ready. One attempt: the lobby polls
+ * again a few seconds later and decides afresh from the account, which is
+ * the right retry because the account may have changed (filled and locked
+ * itself, or passed its deadline) in between.
+ */
+export async function lockMatch(chain: ChainConfig, matchId: bigint): Promise<string> {
+  const tx = new Transaction().add(lockInstruction(chain, matchId));
+  const sig = await chain.connection.sendTransaction(tx, [chain.resolver], {
+    skipPreflight: false,
+    maxRetries: 3,
+  });
+  await chain.connection.confirmTransaction(sig, "confirmed");
+  return sig;
+}
+
+/* ------------------------------------------------------------ listing --- */
+
+/** Open matches at one stake, straight from the program's accounts. */
+export async function listOpenMatches(
+  chain: ChainConfig, stake: bigint,
+): Promise<{ address: string; account: MatchAccount }[]> {
+  const f = openMatchFilters(stake);
+  const found = await chain.connection.getProgramAccounts(chain.programId, {
+    commitment: "confirmed",
+    filters: [{ dataSize: f.dataSize }, ...f.memcmp.map((memcmp) => ({ memcmp }))],
+  });
+  const out: { address: string; account: MatchAccount }[] = [];
+  for (const { pubkey, account } of found) {
+    try {
+      out.push({ address: pubkey.toBase58(), account: decodeMatch(account.data) });
+    } catch {
+      // Not a Match after all. The filters make this unlikely; the decoder
+      // checking the discriminator makes it harmless.
+    }
+  }
+  return out;
 }

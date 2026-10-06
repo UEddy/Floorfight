@@ -69,7 +69,18 @@ export function isWellFormedInput(v: unknown): v is Input {
 /* -------------------------------------------------------------- client --- */
 
 export type ClientMsg =
-  | { t: "join"; v: number; matchId: string; wallet: string; sig: string }
+  | {
+      t: "join"; v: number; matchId: string; wallet: string; sig: string;
+      /**
+       * Holders only: the NFT the player wants on their head. A request, not
+       * a claim. The server asks the chain who owns it and puts it in the
+       * roster only if the answer is this wallet; anything else plays with
+       * the default face and is not an error. Not part of the signed
+       * message: the worst a tampered mint can do is change a face, and the
+       * ownership check catches that anyway.
+       */
+      mint?: string;
+    }
   | { t: "input"; batch: Input[] } // resends the last few ticks, server dedupes
   | { t: "pong"; id: number };
 
@@ -195,7 +206,32 @@ export type ServerMsg =
       spreadSalt: string;
     }
   | { t: "ping"; id: number }
-  | { t: "kick"; reason: string };
+  | { t: "kick"; reason: string }
+  | LobbyView;
+
+/** Fewer than this on chain and a holders match cannot be locked. */
+export const MIN_PLAYERS_TO_LOCK = 2;
+
+/**
+ * How a holders lobby stands, sent to everyone in it whenever it changes and
+ * at every poll. Every number is the chain's, read off the match account.
+ */
+export interface LobbyView {
+  t: "lobby";
+  matchId: string;
+  /** waiting, locking (lock sent, room opening), expired or over. */
+  phase: "waiting" | "locking" | "expired" | "over";
+  count: number;
+  maxPlayers: number;
+  /** Lamports per player, decimal. */
+  stake: string;
+  /** Unix seconds. */
+  joinDeadline: number;
+  /** One entry per joined slot: is that player connected in the lobby. */
+  present: boolean[];
+  /** Seconds before the deadline at which the match locks regardless. */
+  lockBefore: number;
+}
 
 export interface RosterEntry {
   slot: number;

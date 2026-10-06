@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import type { IncomingMessage } from "node:http";
+import { createServer, type IncomingMessage } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import bs58 from "bs58";
 import nacl from "tweetnacl";
@@ -19,6 +19,9 @@ import { devModeFromEnv, devRoster, devWarning } from "./dev";
 import { hasChainEnv, rosterFromMatch } from "./chain";
 import type { ChainConfig } from "./chainrpc";
 import { DEFAULT_LOG_DIR, finishMatch } from "./settlement";
+import { createApi } from "./api";
+import { Lobbies, type Member } from "./lobby";
+import type { MatchAccount } from "./chain";
 import { FREE_SEAT_OPEN, Room, type RoomKind, type Seat } from "./room";
 import {
   ConnectionLimits,
@@ -174,29 +177,28 @@ const opening = new Set<string>();
  * is no admin endpoint to secure and no list to keep in step with the chain.
  * The chain is the list.
  */
-async function ensureStakedRoom(matchId: string): Promise<Room | null> {
+async function ensureStakedRoom(
+  matchId: string, known?: MatchAccount,
+): Promise<Room | null> {
   if (!CHAIN || !rpc || !U64_RE.test(matchId)) return null;
   const existing = rooms.get(matchId);
   if (existing) return existing;
 
   const missedAt = missed.get(matchId);
-  if (missedAt !== undefined && Date.now() - missedAt < MISS_TTL_MS) return null;
+  if (!known && missedAt !== undefined && Date.now() - missedAt < MISS_TTL_MS) return null;
   if (opening.has(matchId)) return null;
 
   opening.add(matchId);
   try {
-    const account = await rpc.fetchMatch(CHAIN, BigInt(matchId));
+    const account = known ?? await rpc.fetchMatch(CHAIN, BigInt(matchId));
     if (!account) {
       if (missed.size >= MISS_MAX) missed.clear();
       missed.set(matchId, Date.now());
       return null;
     }
-    if (account.state !== "Locked") {
-      console.warn(`[match ${matchId}] is ${account.state}, not Locked: no room`);
-      if (missed.size >= MISS_MAX) missed.clear();
-      missed.set(matchId, Date.now());
-      return null;
-    }
+    // Not cached as a miss: an Open match is one the lobby is about to lock,
+    // and a refusal cached here would stop its room opening for ten seconds.
+    if (account.state !== "Locked") return null;
     // A second connection may have opened it while this one was on the RPC.
     const raced = rooms.get(matchId);
     if (raced) return raced;
@@ -216,16 +218,64 @@ async function ensureStakedRoom(matchId: string): Promise<Room | null> {
       `[match ${matchId}] opening staked room, ${roster.length} players, ` +
       `stake ${account.stake} lamports each`,
     );
-    return openRoom(matchId, roster, {
+    const room = openRoom(matchId, roster, {
       kind: "staked",
       startWhenSeated: roster.length,
       staked: { matchId: BigInt(matchId), count: account.count },
       onDone: () => { rooms.delete(matchId); },
     });
+
+    /*
+     * A staked room starts when everyone on the roster is connected. When the
+     * lobby locked on the deadline rule, some of them may never come, so after
+     * a grace period it starts with whoever is there. Never with bots: an
+     * absent player's slot stands still for the round. A room nobody ever
+     * joins is closed, and the match refunds on its settle deadline.
+     */
+    setTimeout(() => {
+      if (room.isStarted || room.isFinished) return;
+      if (room.seatedCount() > 0) {
+        console.warn(`[match ${matchId}] starting with ${room.seatedCount()} of ${roster.length} connected`);
+        room.start();
+      }
+    }, STAKED_START_GRACE_MS).unref();
+    setTimeout(() => {
+      if (room.isStarted || room.isFinished) return;
+      console.error(`[match ${matchId}] nobody came: closing the room, the match will refund`);
+      room.stop();
+      rooms.delete(matchId);
+    }, STAKED_ABANDON_MS).unref();
+    return room;
   } finally {
     opening.delete(matchId);
   }
 }
+
+/** How long a staked room waits for absent players before starting without them. */
+const STAKED_START_GRACE_MS = 20_000;
+/** How long a staked room with nobody in it stays open before it is closed. */
+const STAKED_ABANDON_MS = 5 * 60_000;
+
+/* ---------------------------------------------------------------- NFTs --- */
+
+/** Set in the NFT step. Null means no NFT endpoints and default faces. */
+const NFTS: null = null;
+
+/* ------------------------------------------------------------- lobbies --- */
+
+/**
+ * The holders lobby. Only on a server with a chain: without one there is no
+ * Open match to wait for. See lobby.ts for the lock rule.
+ */
+const lobbies = CHAIN && rpc
+  ? new Lobbies({
+      fetchMatch: (id) => rpc!.fetchMatch(CHAIN!, id),
+      lockMatch: (id) => rpc!.lockMatch(CHAIN!, id),
+      openRoom: async (id) => (await ensureStakedRoom(id)) !== null,
+      nowSeconds: () => Math.floor(Date.now() / 1000),
+      log: (line) => console.log(line),
+    })
+  : null;
 
 /* ---------------------------------------------------------- free rooms --- */
 
@@ -314,7 +364,28 @@ interface Pending {
   used: boolean;
 }
 
-const wss = new WebSocketServer({ host: HOST, port: PORT, maxPayload: MAX_MSG_BYTES });
+/**
+ * One port for both: the read only /api endpoints over HTTP, and the game
+ * socket as an upgrade on the same server. Caddy proxies /api and /ws here.
+ */
+const api = createApi({
+  chain: CHAIN && rpc
+    ? {
+        listOpen: async (stake) => (await rpc!.listOpenMatches(CHAIN!, stake)).map((m) => m.account),
+        fetchMatch: (id) => rpc!.fetchMatch(CHAIN!, id),
+      }
+    : undefined,
+  nfts: NFTS ?? undefined,
+});
+const http = createServer((req, res) => {
+  void api(req, res).then((handled) => {
+    if (handled) return;
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("not found");
+  });
+});
+const wss = new WebSocketServer({ server: http, maxPayload: MAX_MSG_BYTES });
+http.listen(PORT, HOST);
 
 wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
   const kick = (reason: string) => {
@@ -356,6 +427,8 @@ wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
   let room: Room | null = null;
   let slot = -1;
   let mySeat: Seat | null = null;
+  /** Set while this socket waits in a holders lobby. */
+  let inLobby: { matchId: string; member: Member } | null = null;
   let budget = MAX_MSGS_PER_SECOND;
   const refill = setInterval(() => { budget = MAX_MSGS_PER_SECOND; }, 1000);
 
@@ -398,7 +471,7 @@ wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
     if (typeof msg !== "object" || msg === null) return kick("malformed message");
 
     if (msg.t === "join") {
-      if (room) return kick("already joined");
+      if (room || inLobby) return kick("already joined");
       void handleJoin(msg).catch(() => kick("join failed"));
       return;
     }
@@ -430,6 +503,8 @@ wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
     clearInterval(refill);
     clearJoinTimer();
     release();
+    if (inLobby && lobbies) lobbies.remove(inLobby.matchId, inLobby.member);
+    inLobby = null;
     if (room && mySeat) room.unseat(slot, mySeat);
   });
 
@@ -473,7 +548,12 @@ wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
     // A staked room opens the first time one of its participants asks for it,
     // and only if the chain says the match is Locked.
     const target = rooms.get(msg.matchId) ?? await ensureStakedRoom(msg.matchId);
-    if (!target) return kick("no such match");
+    if (!target) {
+      // Not a room yet. If it is an Open holders match this wallet has staked
+      // into, the socket waits in the lobby until the match locks.
+      if (await enterLobby(msg)) return;
+      return kick("no such match");
+    }
 
     let entry: RosterEntry | undefined;
     if (target.kind === "free") {
@@ -486,19 +566,67 @@ wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
       // seat, whatever it signs, and its slot is the one the chain gave it.
       entry = target.roster.find((r) => r.wallet === msg.wallet);
       if (!entry) return kick("not a participant in this match");
+      // Cosmetic only, and deliberately non-fatal. A wallet that does not
+      // hold the mint it asks for plays as the default character rather than
+      // being refused a seat it paid for.
+      Object.assign(entry, await verifyCharacter(msg.wallet, msg.mint));
     }
+    takeSeat(target, entry);
+  }
 
-    // Cosmetic only, and deliberately non-fatal. A wallet that no longer holds
-    // the mint it registered plays as the default character rather than being
-    // refused a seat it paid for.
-    entry.collection = await verifyCharacter(msg.wallet, entry.mint);
+  /**
+   * Put a signed socket in the lobby of an Open match its wallet is in. The
+   * account is read here, not trusted from anywhere: the wallet has to be in
+   * the first `count` players on chain.
+   */
+  async function enterLobby(msg: Extract<ClientMsg, { t: "join" }>): Promise<boolean> {
+    if (!lobbies || !CHAIN || !rpc || !U64_RE.test(msg.matchId)) return false;
+    let account: MatchAccount | null;
+    try {
+      account = await rpc.fetchMatch(CHAIN, BigInt(msg.matchId));
+    } catch {
+      return false;
+    }
+    if (!account || account.state !== "Open") return false;
+    if (!account.players.slice(0, account.count).includes(msg.wallet)) {
+      kick("not a participant in this match");
+      return true;
+    }
+    // Checked now, while the socket waits, so the room can seat it at once.
+    const character = await verifyCharacter(msg.wallet, msg.mint);
+    const matchId = msg.matchId;
+    const member: Member = {
+      wallet: msg.wallet,
+      send: (view) => { if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(view)); },
+      close: (reason) => kick(reason),
+      enter: (id) => {
+        inLobby = null;
+        const r = rooms.get(id);
+        const entry = r?.roster.find((e) => e.wallet === msg.wallet);
+        if (!r || !entry) return kick("the room did not open");
+        Object.assign(entry, character);
+        takeSeat(r, entry);
+      },
+    };
+    if (!lobbies.add(matchId, account, member)) {
+      kick("too many lobbies open, try again shortly");
+      return true;
+    }
+    inLobby = { matchId, member };
+    // Waiting in a lobby is not idling on the handshake: it can take
+    // minutes, and the socket has already signed.
+    clearJoinTimer();
+    return true;
+  }
 
+  /** Seat this socket in a room, on the roster entry it was given. */
+  function takeSeat(target: Room, entry: RosterEntry): void {
     room = target;
     slot = entry.slot;
 
     const seat: Seat = {
       slot,
-      wallet: msg.wallet,
+      wallet: entry.wallet,
       queue: [],
       ack: -1,
       lastSeenTick: 0,
@@ -532,21 +660,20 @@ wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
 /**
  * Resolve which character a wallet may wear.
  *
- * Returns the verified collection address, or null for the default skin. The
- * client's claim is never taken at face value: ownership is read from the
- * chain here, and the result is what the roster carries into the match log.
- *
- * Stub until the RPC endpoint is wired. Returning null is the safe default,
- * because the failure mode is a plain character rather than a wrong one.
+ * Returns the roster fields for the head: a verified mint and its collection,
+ * or nulls for the default face. The client's request is never taken at face
+ * value: ownership is checked server side, and the result is what the roster
+ * carries into the match log. Never throws, because the failure mode has to
+ * be a plain face rather than a refused seat.
  */
 async function verifyCharacter(
   _wallet: string,
-  _mint: string | null,
-): Promise<string | null> {
-  return null;
+  _mint: string | undefined,
+): Promise<{ mint: string | null; collection: string | null }> {
+  return { mint: null, collection: null };
 }
 
-wss.on("listening", () => {
+http.on("listening", () => {
   console.log(`floorfight server listening on ${HOST}:${PORT}`);
   console.log(
     `caps: ${LIMIT_PER_IP} sockets per address, ${LIMIT_TOTAL} in total, ` +

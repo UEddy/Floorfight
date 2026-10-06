@@ -53,3 +53,22 @@ export const MAX_PROTOCOL_VERSION = 99;
 
 /** Lamports in one SOL, for the amounts shown on the confirmation sheet. */
 export const LAMPORTS_PER_SOL = 1_000_000_000;
+
+/**
+ * Stake tiers for holders matches, in lamports, devnet.
+ *
+ * This list is the authority on what a create costs. The page asks for a tier
+ * by its index and nothing else; this side looks the amount up here, builds
+ * the transaction and shows the amount on the confirmation sheet before the
+ * wallet opens. packages/shared/tiers.ts has the same amounts for the server
+ * and the page's labels, and test/tiers.test.ts fails if the two differ.
+ */
+export const STAKE_TIERS: readonly bigint[] = [
+  10_000_000n,  // 0.01 SOL
+  50_000_000n,  // 0.05 SOL
+  100_000_000n, // 0.1 SOL
+];
+
+/** Every holders match this app creates: six seats, ten minutes to join. */
+export const HOLDERS_MAX_PLAYERS = 6;
+export const HOLDERS_JOIN_WINDOW = 600;

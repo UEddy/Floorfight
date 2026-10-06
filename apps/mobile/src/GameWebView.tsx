@@ -12,8 +12,8 @@ import {
   type Reply,
   type Request,
 } from "./bridge";
-import { plan, transactionFor, type Planned } from "./escrow";
-import { currentWallet, signAndSend, signMessage } from "./wallet";
+import { plan, planCreate, transactionFor, type Planned } from "./escrow";
+import { connectWallet, currentWallet, signAndSend, signMessage } from "./wallet";
 import { Confirm } from "./Confirm";
 
 /**
@@ -43,10 +43,14 @@ export function GameWebView() {
   /**
    * One request from the page.
    *
-   * Parsed strictly, then handled. There are two branches and no default: an
-   * unknown request never reaches here because parseRequest refuses it.
+   * Parsed strictly, then handled. There is no default branch: an unknown
+   * request never reaches here because parseRequest refuses it.
    */
   const handle = useCallback(async (req: Request) => {
+    if (req.t === "connect") {
+      reply({ id: req.id, ok: true, t: "connect", wallet: await connectWallet() });
+      return;
+    }
     if (req.t === "signJoin") {
       // The message is built here, from validated parts, and checked against
       // the template again before it goes near the wallet.
@@ -60,7 +64,11 @@ export function GameWebView() {
     // then put it in front of the person. The wallet opens only if they say
     // yes, in onApprove below.
     const now = Math.floor(Date.now() / 1000);
-    const planned = await plan(req.action, BigInt(req.matchId), now);
+    const planned = req.action === "create"
+      // The tier is looked up in this app's own list and the match id is
+      // generated here. Nothing about the amount came from the page.
+      ? planCreate(req.tier)
+      : await plan(req.action, BigInt(req.matchId), now, currentWallet());
     setPending({ planned, id: req.id });
   }, [reply]);
 
@@ -91,7 +99,8 @@ export function GameWebView() {
     void signAndSend((player) => transactionFor(p.planned, player))
       .then((signature) => {
         reply({
-          id: p.id, ok: true, t: "escrow", action: p.planned.action, signature,
+          id: p.id, ok: true, t: "escrow", action: p.planned.action,
+          matchId: p.planned.matchId.toString(), signature,
         });
       })
       .catch((e) => fail(p.id, e));
