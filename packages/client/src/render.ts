@@ -15,7 +15,6 @@ import {
   GRID_X,
   GRID_Y,
   GRID_Z,
-  MATERIAL_COUNT,
   M_BOOTH,
   M_BOOTH2,
   M_BRICK,
@@ -34,6 +33,7 @@ import {
   solidAt,
 } from "../../shared/map";
 import type { RemoteView } from "./netcode";
+import { T, atlas, tileUV } from "./textures";
 
 /** Chunks a body bursts into, and how many the pool holds. */
 const CHUNKS_PER_DEATH = 26;
@@ -63,34 +63,23 @@ export const SLOT_COLORS = [0xff4d3d, 0x3da5ff, 0x4fe08a, 0xffd23a, 0xc46bff, 0x
 /**
  * The Hall, in blocks.
  *
- * Saturated flat colour, no textures on the geometry, and all the light baked
- * into vertex colours at build time: a face angle term so edges read, plus
- * corner occlusion so the lanes between booths have depth. Nothing in the
- * scene is lit at runtime, which is why the whole hall costs one draw call per
- * material.
+ * Every block face samples one 16 pixel tile out of a single atlas (see
+ * textures.ts), and all the light is baked into vertex colours at build time:
+ * a face angle term so edges read, plus corner occlusion so the lanes between
+ * booths have depth. Nothing in the scene is lit at runtime, and because every
+ * material now shares the one atlas, the whole hall is a single draw call.
  *
  * Draw call budget (CLAUDE.md says under 150, and the floor is a Galaxy S10):
- *   up to 9 merged material meshes, 1 sign strip, 3 instanced player meshes,
- *   a gun and a muzzle flash. Around 15, and it does not grow with the size
- *   of the map.
+ *   1 hall mesh, 1 sign strip, 3 instanced player meshes, a gun and a muzzle
+ *   flash, the death chunks, the tracers and remote muzzle flashes. Around
+ *   ten, and it does not grow with the size of the map.
  */
-const PALETTE: Record<number, number> = {
-  [M_FLOOR]: 0xb5652f,
-  [M_BRICK]: 0x9e2b3c,
-  [M_BOOTH]: 0x18907d,
-  [M_BOOTH2]: 0xe0a21c,
-  [M_STAIR]: 0xf2602c,
-  [M_GALLERY]: 0x2f6ddf,
-  [M_IRON]: 0x37456b,
-  [M_STAGE]: 0x7b2fa0,
-  [M_TRIM]: 0xffc426,
-};
 
 /** Per face brightness. Flat colour with no angle term reads as a fog bank. */
-const FACE_SHADE = [0.74, 0.74, 1.0, 0.42, 0.86, 0.86]; // +x -x +y -y +z -z
+const FACE_SHADE = [0.78, 0.78, 1.0, 0.5, 0.9, 0.9]; // +x -x +y -y +z -z
 
 /** Vertex brightness by how many of its three neighbours are solid. */
-const AO_SHADE = [1.0, 0.82, 0.66, 0.5];
+const AO_SHADE = [1.0, 0.8, 0.64, 0.48];
 
 /**
  * The six faces, as an outward normal and two in-plane axes chosen so that
@@ -118,46 +107,131 @@ function occludes(ix: number, iy: number, iz: number): boolean {
   return solidAt(ix, iy, iz);
 }
 
+/** Cheap integer hash for picking tile variants. Cosmetic only. */
+function cellHash(ix: number, iy: number, iz: number): number {
+  let h = (ix * 73856093) ^ (iy * 19349663) ^ (iz * 83492791);
+  h = Math.imul(h ^ (h >>> 13), 0x5bd1e995);
+  return (h ^ (h >>> 15)) >>> 0;
+}
+
+/** Floor columns and rows that are lanes between the booth bays. */
+const LANE_X = new Set([14, 15, 21, 22, 28, 29, 35, 36]);
+const LANE_Z = new Set([15, 21, 22, 28, 29, 35, 36]);
+
+const isIron = (ix: number, iy: number, iz: number) => blockAt(ix, iy, iz) === M_IRON;
+
 /**
- * Build one merged mesh per material.
+ * Which tile a face shows. `f` is the face index: 2 is the top, 3 the bottom,
+ * anything else a side.
+ */
+function tileFor(m: number, f: number, ix: number, iy: number, iz: number): number {
+  const top = f === 2;
+  const bottom = f === 3;
+  const h = cellHash(ix, iy, iz);
+  switch (m) {
+    case M_FLOOR:
+      if (!top) return T.STONE;
+      // Carpet runners down the aisles, the way an exhibition lays them, and
+      // bare boards under and round the booths.
+      if (LANE_X.has(ix) || LANE_Z.has(iz)) return h % 5 === 0 ? T.CARPET_WORN : T.CARPET;
+      return h % 3 === 0 ? T.PLANK_WORN : T.PLANK;
+    case M_BRICK:
+      if (top || bottom) return T.STONE_CAP;
+      // A plinth of cut stone at the foot of every wall, brick above it, and
+      // damp moss only near the floor.
+      if (iy <= 1) return T.STONE;
+      return iy <= 4 && h % 4 === 0 ? T.BRICK_MOSS : T.BRICK;
+    case M_BOOTH: {
+      if (top || bottom) return T.CANVAS;
+      return ((ix / 7) | 0) % 2 === 0 ? T.FABRIC_A : T.FABRIC_A2;
+    }
+    case M_BOOTH2: {
+      if (top || bottom) return T.CANVAS;
+      if (iy >= 4) return T.FABRIC_B2;
+      return ((iz / 7) | 0) % 2 === 0 ? T.FABRIC_B : T.CRATE;
+    }
+    case M_STAIR:
+      return top ? T.STAIR : T.STAIR_SIDE;
+    case M_GALLERY:
+      return top || bottom ? T.DECK : T.DECK_SIDE;
+    case M_IRON: {
+      if (top || bottom) return T.IRON_TOP;
+      // One block thick is a truss and shows its lattice. Anything thicker is
+      // a pier and shows riveted plate.
+      const thin = (!isIron(ix - 1, iy, iz) && !isIron(ix + 1, iy, iz)) ||
+        (!isIron(ix, iy, iz - 1) && !isIron(ix, iy, iz + 1));
+      return thin ? T.IRON : T.IRON_RIVET;
+    }
+    case M_STAGE:
+      if (top || bottom) return T.STAGE_TOP;
+      return iy <= 4 ? T.VELVET : T.STAGE_TOP;
+    case M_TRIM:
+      return top || bottom ? T.TRIM_TOP : T.TRIM;
+    default:
+      return T.STONE;
+  }
+}
+
+/**
+ * Texture coordinate across a side face, so that u runs left to right for a
+ * viewer standing in front of it and v always runs up. Without this half the
+ * walls in the hall would show their bricks lying on their side.
+ */
+function faceUV(f: number, lx: number, ly: number, lz: number): [number, number] {
+  switch (f) {
+    case 0: return [1 - lz, ly];
+    case 1: return [lz, ly];
+    case 4: return [lx, ly];
+    case 5: return [1 - lx, ly];
+    default: return [lx, 1 - lz];
+  }
+}
+
+/**
+ * Build the hall as one merged mesh.
  *
  * Only faces with air on the far side are emitted, which throws away every
  * interior face in the hall: the piers, the walls and the booth masses are
  * solid runs of cells and only their skins survive. That is the difference
  * between about sixty thousand triangles and about a million.
  */
-function buildGrid(): THREE.Mesh[] {
-  const pos: number[][] = [];
-  const col: number[][] = [];
-  for (let m = 0; m < MATERIAL_COUNT; m++) { pos.push([]); col.push([]); }
+function buildGrid(): THREE.Mesh {
+  const P: number[] = [];
+  const C: number[] = [];
+  const U: number[] = [];
 
   for (let iy = 0; iy < GRID_Y; iy++) {
     for (let iz = 0; iz < GRID_Z; iz++) {
       for (let ix = 0; ix < GRID_X; ix++) {
         const m = blockAt(ix, iy, iz);
         if (m === AIR) continue;
-        const base = new THREE.Color(PALETTE[m] ?? 0xcccccc);
         const ox = blockMinX(ix);
         const oz = blockMinZ(iz);
-        const P = pos[m];
-        const C = col[m];
 
         for (let f = 0; f < 6; f++) {
           const { n, a, b } = FACES[f];
           if (occludes(ix + n[0], iy + n[1], iz + n[2])) continue;
           const shade = FACE_SHADE[f];
+          const [u0, v0, u1, v1] = tileUV(tileFor(m, f, ix, iy, iz));
 
-          // Position and brightness of the four corners, then two triangles.
+          // Position, brightness and texture coordinate of the four corners,
+          // then two triangles.
           const vx: number[] = [];
           const vy: number[] = [];
           const vz: number[] = [];
           const vk: number[] = [];
+          const vu: number[] = [];
+          const vv: number[] = [];
           for (const [sa, sb] of CORNERS) {
             const ha = sa - 0.5;
             const hb = sb - 0.5;
-            vx.push(0.5 + 0.5 * n[0] + a[0] * ha + b[0] * hb);
-            vy.push(0.5 + 0.5 * n[1] + a[1] * ha + b[1] * hb);
-            vz.push(0.5 + 0.5 * n[2] + a[2] * ha + b[2] * hb);
+            const lx = 0.5 + 0.5 * n[0] + a[0] * ha + b[0] * hb;
+            const ly = 0.5 + 0.5 * n[1] + a[1] * ha + b[1] * hb;
+            const lz = 0.5 + 0.5 * n[2] + a[2] * ha + b[2] * hb;
+            vx.push(lx); vy.push(ly); vz.push(lz);
+            const [tu, tv] = faceUV(f, lx, ly, lz);
+            vu.push(u0 + (u1 - u0) * tu);
+            vv.push(v0 + (v1 - v0) * tv);
 
             const du = sa ? 1 : -1;
             const dv = sb ? 1 : -1;
@@ -173,27 +247,26 @@ function buildGrid(): THREE.Mesh[] {
           }
           for (const i of TRIS) {
             P.push(ox + vx[i], iy + vy[i], oz + vz[i]);
-            C.push(base.r * vk[i], base.g * vk[i], base.b * vk[i]);
+            C.push(vk[i], vk[i], vk[i]);
+            U.push(vu[i], vv[i]);
           }
         }
       }
     }
   }
 
-  const meshes: THREE.Mesh[] = [];
-  for (let m = 0; m < MATERIAL_COUNT; m++) {
-    if (pos[m].length === 0) continue;
-    const g = new THREE.BufferGeometry();
-    g.setAttribute("position", new THREE.Float32BufferAttribute(pos[m], 3));
-    g.setAttribute("color", new THREE.Float32BufferAttribute(col[m], 3));
-    g.computeBoundingSphere();
-    // Flat, unlit, vertex coloured. The shading is already in the colours, so
-    // there is no normal attribute and no light to evaluate per fragment.
-    const mesh = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ vertexColors: true, fog: true }));
-    mesh.frustumCulled = false;
-    meshes.push(mesh);
-  }
-  return meshes;
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(P, 3));
+  g.setAttribute("color", new THREE.Float32BufferAttribute(C, 3));
+  g.setAttribute("uv", new THREE.Float32BufferAttribute(U, 2));
+  g.computeBoundingSphere();
+  // Unlit and vertex coloured. The shading is already in the colours, so
+  // there is no normal attribute and no light to evaluate per fragment.
+  const mesh = new THREE.Mesh(
+    g, new THREE.MeshBasicMaterial({ map: atlas(), vertexColors: true, fog: true }),
+  );
+  mesh.frustumCulled = false;
+  return mesh;
 }
 
 /**
@@ -326,7 +399,7 @@ export class Renderer {
     this.camera.rotation.order = "YXZ";
     this.scene.add(this.camera);
 
-    for (const mesh of buildGrid()) this.scene.add(mesh);
+    this.scene.add(buildGrid());
     const signs = buildSigns();
     if (signs) this.scene.add(signs);
 
