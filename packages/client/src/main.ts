@@ -83,6 +83,13 @@ const active = new Set<number>();
 let myWeapon = 0;
 let myMag = WEAPONS[0].mag;
 let myReload = 0;
+/**
+ * When the current reload started, back-dated from the server's countdown.
+ * Snapshots come at 20 Hz, so animating straight off the countdown would
+ * move the hands in visible steps. This only smooths the drawing: the
+ * countdown itself is still the server's.
+ */
+let reloadStartedAt = 0;
 let rtt = 0;
 
 /** Tick we were killed on, for the respawn countdown, or null if alive. */
@@ -165,6 +172,7 @@ const net = new Net(serverUrl, (challenge) => {
     hud.setRoster(msg.roster);
     predictor = new Predictor(msg.roster.length, slot);
     renderer = new Renderer(canvas, msg.roster.length);
+    renderer.setLocalSlot(slot);
     // Face the middle of the hall from the spawn, which is where the clock
     // tower is and where the action tends to be.
     const me = createWorld(msg.roster.length).players[slot];
@@ -201,7 +209,11 @@ const net = new Net(serverUrl, (challenge) => {
         sfx.swap();
         controls.syncWeapon(me.g);
       }
-      if (myReload === 0 && me.r > 0) sfx.reload((me.r / TICK_HZ) * 1000);
+      if (myReload === 0 && me.r > 0) {
+        sfx.reload((me.r / TICK_HZ) * 1000);
+        const full = (WEAPONS[me.g] ?? WEAPONS[0]).reloadTicks;
+        reloadStartedAt = now - ((full - me.r) / TICK_HZ) * 1000;
+      }
       myWeapon = me.g;
       myMag = me.m;
       myReload = me.r;
@@ -407,7 +419,7 @@ function tick(now: number): void {
 /** Our own flash, tracer and report, drawn from where the camera is aiming. */
 function ownShot(now: number, range: number): void {
   if (!renderer || !predictor) return;
-  renderer.muzzleFlash(now);
+  renderer.muzzleFlash();
   sfx.shot(myWeapon, 0);
 
   const yaw = quantYaw(controls.intent.yaw);
@@ -477,7 +489,17 @@ function frame(): void {
       else if (r) r.alive = false;
     }
   }
-  renderer.draw(now, devCamera ?? { x, y, z, yaw, pitch }, slot, remotes);
+  const spec = WEAPONS[myWeapon] ?? WEAPONS[0];
+  renderer.draw(now, devCamera ?? { x, y, z, yaw, pitch }, slot, remotes, {
+    weapon: myWeapon,
+    // The server's countdown, as a fraction of the whole reload, so the
+    // animation finishes when the magazine is actually full.
+    reload: myReload > 0
+      ? Math.min(0.999, (now - reloadStartedAt) / ((spec.reloadTicks / TICK_HZ) * 1000))
+      : null,
+    alive: me.alive,
+    grounded: me.vy === 0,
+  });
 
   // Nameplates, after the draw so the camera matrices are current.
   plates.length = 0;
@@ -543,6 +565,7 @@ if (import.meta.env.DEV) {
     move(mx: number, my: number) { controls.botMove = { x: mx, y: my }; },
     fire(on: boolean) { controls.botFire = on; },
     jump(on: boolean) { controls.botJump = on; },
+    reload(on: boolean) { controls.botReload = on; },
     weapon(n: number) { controls.cycle(n - 1 - myWeapon); },
     camera(pose: typeof devCamera) { devCamera = pose; },
     /**

@@ -54,6 +54,7 @@ export class Controls {
   botMove: { x: number; y: number } | null = null;
   botFire = false;
   botJump = false;
+  botReload = false;
 
   constructor(
     private canvas: HTMLCanvasElement,
@@ -237,7 +238,7 @@ export class Controls {
     // three levels tall, so jump has to be a key that is easy to hold.
     i.jump = this.touchJump || this.botJump ||
       this.keys.has("Space") || this.keys.has("KeyJ");
-    i.reload = this.touchReload || this.keys.has("KeyR");
+    i.reload = this.touchReload || this.botReload || this.keys.has("KeyR");
     // One press, one request: the bit is consumed here so holding the button
     // does not cycle through every weapon in the game.
     i.weapon = this.pendingWeapon;

@@ -113,7 +113,13 @@ async function main() {
   let heading = start ? Math.atan2(start.x, start.z) : 0;
   let last = start;
   const t0 = Date.now();
+  let shot = false;
   while (Date.now() - t0 < 5000) {
+    // Taken part way through, while the bots have had less time to find us.
+    if (!shot && Date.now() - t0 > 2500) {
+      await page.screenshot({ path: join(OUT, "0-playing.png") });
+      shot = true;
+    }
     const t = (Date.now() - t0) / 1000;
     const me = await page.evaluate(() => window.arena.state().me);
     if (me && last && Math.hypot(me.x - last.x, me.z - last.z) < 0.15) heading += 1.3;
@@ -124,7 +130,6 @@ async function main() {
     }, [heading, t]);
     await sleep(150);
   }
-  await page.screenshot({ path: join(OUT, "0-playing.png") });
   await page.evaluate(() => { window.arena.fire(false); window.arena.move(0, 0); });
 
   // The fixed views are for looking at the hall, so the death overlay, if the
@@ -143,6 +148,22 @@ async function main() {
     await sleep(500);
     await page.screenshot({ path: join(OUT, "5-opponent.png") });
   }
+
+  // The view model, from the player's own eye: each weapon at rest, and the
+  // rifle half way through a reload.
+  await page.evaluate(() => { window.arena.camera(null); window.arena.fire(false); window.arena.move(0, 0); });
+  await page.waitForFunction(() => window.arena.state().me?.alive, null, { timeout: 10000 }).catch(() => {});
+  for (const [w, name] of [[2, "pistol"], [3, "shotgun"], [1, "rifle"]]) {
+    await page.evaluate((w) => window.arena.weapon(w), w);
+    await sleep(900);
+    await page.screenshot({ path: join(OUT, `6-${name}.png`) });
+  }
+  await page.evaluate(() => window.arena.fire(true));
+  await sleep(250);
+  await page.evaluate(() => { window.arena.fire(false); window.arena.reload(true); });
+  await sleep(550);
+  await page.evaluate(() => window.arena.reload(false));
+  await page.screenshot({ path: join(OUT, "7-reload.png") });
 
   const s = await page.evaluate(() => window.arena.peek());
   console.log(`draw calls ${s.drawCalls}, triangles ${s.triangles}`);

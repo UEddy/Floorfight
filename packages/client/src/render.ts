@@ -34,6 +34,7 @@ import {
 } from "../../shared/map";
 import type { RemoteView } from "./netcode";
 import { T, atlas, tileUV } from "./textures";
+import { ViewModel } from "./viewmodel";
 
 /** Chunks a body bursts into, and how many the pool holds. */
 const CHUNKS_PER_DEATH = 26;
@@ -366,8 +367,9 @@ export class Renderer {
   private bodies: THREE.InstancedMesh;
   private heads: THREE.InstancedMesh;
   private visors: THREE.InstancedMesh;
-  private flash: THREE.Mesh;
-  private flashUntil = 0;
+  private view = new ViewModel();
+  private lastEye = { x: 0, z: 0 };
+  private moving = 0;
   private chunks: THREE.InstancedMesh;
   private chunkState: Chunk[] = [];
   private tracers: THREE.LineSegments;
@@ -468,20 +470,12 @@ export class Renderer {
     }
     this.scene.add(this.muzzles);
 
-    // First person gun and muzzle flash, parented to the camera.
-    const gun = new THREE.Mesh(
-      new THREE.BoxGeometry(0.045, 0.06, 0.3),
-      new THREE.MeshBasicMaterial({ color: 0x241f1a }),
-    );
-    gun.position.set(0.16, -0.15, -0.42);
-    this.camera.add(gun);
-    this.flash = new THREE.Mesh(
-      new THREE.SphereGeometry(0.035, 8, 6),
-      new THREE.MeshBasicMaterial({ color: 0xffe08a }),
-    );
-    this.flash.position.set(0.16, -0.13, -0.6);
-    this.flash.visible = false;
-    this.camera.add(this.flash);
+    // The hall, then the view model on top of it with depth cleared. Two
+    // render calls, so the clear between them is ours to make.
+    this.renderer.autoClear = false;
+    // Counted over the whole frame rather than per render call, so the debug
+    // overlay's draw call figure covers both passes.
+    this.renderer.info.autoReset = false;
 
     this.resize();
     addEventListener("resize", () => this.resize());
@@ -493,10 +487,17 @@ export class Renderer {
     this.renderer.setSize(w, h, false);
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
+    this.view.resize(w / h);
   }
 
-  muzzleFlash(nowMs: number): void {
-    this.flashUntil = nowMs + 50;
+  /** Our own shot: the view model kicks and flashes. */
+  muzzleFlash(): void {
+    this.view.fired();
+  }
+
+  /** The local player's colour, for the sleeves. */
+  setLocalSlot(slot: number): void {
+    this.view.setSleeve(SLOT_COLORS[slot % SLOT_COLORS.length]);
   }
 
   /** Somebody else fired: show a flash at their hands for a moment. */
@@ -659,13 +660,25 @@ export class Renderer {
     eye: { x: number; y: number; z: number; yaw: number; pitch: number },
     localSlot: number,
     remotes: Map<number, RemoteView>,
+    held: { weapon: number; reload: number | null; alive: boolean; grounded: boolean },
   ): void {
     this.camera.position.set(eye.x, eye.y + EYE_HEIGHT, eye.z);
     this.camera.rotation.set(eye.pitch, eye.yaw, 0);
-    this.flash.visible = nowMs < this.flashUntil;
 
     const dt = this.lastDraw === 0 ? 0 : Math.min(0.1, (nowMs - this.lastDraw) / 1000);
     this.lastDraw = nowMs;
+
+    // Horizontal speed off the drawn eye, smoothed, for the bob. A respawn is
+    // a jump of many blocks in one frame and is ignored.
+    if (dt > 0) {
+      const v = Math.hypot(eye.x - this.lastEye.x, eye.z - this.lastEye.z) / dt;
+      if (v < 30) this.moving += (v - this.moving) * Math.min(1, dt * 12);
+    }
+    this.lastEye.x = eye.x;
+    this.lastEye.z = eye.z;
+    this.view.update(
+      dt, held.weapon, held.reload, this.moving, eye.yaw, eye.pitch, held.alive, held.grounded,
+    );
 
     for (let i = 0; i < this.slots; i++) {
       const r = remotes.get(i);
@@ -703,6 +716,10 @@ export class Renderer {
     this.visors.instanceMatrix.needsUpdate = true;
 
     this.advance(dt, nowMs);
+    this.renderer.info.reset();
+    this.renderer.clear();
     this.renderer.render(this.scene, this.camera);
+    this.renderer.clearDepth();
+    this.renderer.render(this.view.scene, this.view.camera);
   }
 }

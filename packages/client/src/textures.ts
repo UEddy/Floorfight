@@ -19,7 +19,7 @@ export const TILE = 16;
 const CELL = 32;
 const PAD = (CELL - TILE) / 2;
 const COLS = 8;
-const ROWS = 4;
+const ROWS = 5;
 export const ATLAS_W = CELL * COLS;
 export const ATLAS_H = CELL * ROWS;
 
@@ -32,7 +32,9 @@ export const T = {
   CANVAS: 16, STAIR: 17, STAIR_SIDE: 18, DECK: 19,
   DECK_SIDE: 20, VELVET: 21, STAGE_TOP: 22, TRIM: 23,
   TRIM_TOP: 24, FABRIC_A2: 25, FABRIC_B2: 26, CRATE: 27,
-  GLASS: 28,
+  GLASS: 28, SKIN: 29, CLOTH: 30, GUNMETAL: 31,
+  GUNWOOD: 32, ACCENT: 33, POLYMER: 34, BOOT: 35,
+  HAIR: 36, FACE: 37, LEATHER: 38,
 } as const;
 
 type RGB = [number, number, number];
@@ -304,6 +306,55 @@ function glass(t: Tile): void {
   for (let i = 2; i < 6; i++) t.set(i + 2, i, hex(0xffffff));
 }
 
+/** Skin: flat, with a little warmth at the edges so a fist reads as a fist. */
+function skin(t: Tile): void {
+  const base = hex(0xe8b08a);
+  t.fill(base, 0.05);
+  for (let i = 0; i < 16; i++) { t.mul(i, 15, 0.86); t.mul(15, i, 0.9); }
+  for (let i = 0; i < 4; i++) t.mul(Math.floor(t.r() * 16), Math.floor(t.r() * 16), 0.94);
+}
+
+/**
+ * Cloth, drawn near white so a per player colour multiplied over it keeps
+ * the weave. Sleeves and shirts are this tile tinted.
+ */
+function cloth(t: Tile): void {
+  const base: RGB = [236, 236, 236];
+  t.fill(base, 0.06);
+  for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) if ((x + y * 3) % 5 === 0) t.mul(x, y, 0.9);
+  for (let x = 0; x < 16; x++) { t.mul(x, 0, 0.82); t.mul(x, 15, 0.78); }
+  // A seam and a pocket line.
+  for (let y = 2; y < 15; y++) t.mul(7, y, 0.88);
+  for (let x = 2; x < 6; x++) t.mul(x, 5, 0.85);
+}
+
+function metal(t: Tile, base: RGB): void {
+  t.fill(base, 0.06);
+  const lite = shade(base, 1.35);
+  const dark = shade(base, 0.7);
+  for (let i = 0; i < 16; i++) { t.set(i, 0, lite); t.set(i, 15, dark); }
+  for (let i = 0; i < 6; i++) t.set(2 + i * 2, 4, lite);
+  for (let y = 7; y < 13; y++) for (let x = 3; x < 13; x += 3) t.set(x, y, dark);
+}
+
+function hair(t: Tile): void {
+  const base = hex(0x3b2a20);
+  t.fill(base, 0.2);
+  for (let i = 0; i < 24; i++) t.mul(Math.floor(t.r() * 16), Math.floor(t.r() * 16), 1.3);
+}
+
+/** The default face, used when a player has no verified NFT to wear. */
+function face(t: Tile): void {
+  skin(t);
+  const eye = hex(0x22262e);
+  const white = hex(0xf8f8f8);
+  t.rect(3, 6, 3, 3, white); t.rect(10, 6, 3, 3, white);
+  t.rect(4, 7, 2, 2, eye); t.rect(11, 7, 2, 2, eye);
+  t.rect(3, 4, 3, 1, hex(0x5a3a26)); t.rect(10, 4, 3, 1, hex(0x5a3a26));
+  t.rect(6, 12, 4, 1, hex(0xb0644a));
+  t.rect(0, 0, 16, 3, hex(0x3b2a20), 0.2);
+}
+
 /* ------------------------------------------------------------ atlas --- */
 
 const DRAW: Record<number, (t: Tile) => void> = {
@@ -336,6 +387,16 @@ const DRAW: Record<number, (t: Tile) => void> = {
   [T.FABRIC_B2]: (t) => fabric(t, hex(0xe8467a), hex(0xfbe9f0), true),
   [T.CRATE]: (t) => crate(t, hex(0xb98a4e)),
   [T.GLASS]: glass,
+  [T.SKIN]: skin,
+  [T.CLOTH]: cloth,
+  [T.GUNMETAL]: (t) => metal(t, hex(0x3a3f47)),
+  [T.GUNWOOD]: (t) => planks(t, hex(0x8a5a32), false),
+  [T.ACCENT]: (t) => metal(t, hex(0xf07a2a)),
+  [T.POLYMER]: (t) => metal(t, hex(0x9aa0a8)),
+  [T.BOOT]: (t) => metal(t, hex(0x3a2c24)),
+  [T.HAIR]: hair,
+  [T.FACE]: face,
+  [T.LEATHER]: (t) => planks(t, hex(0x6a4630), true),
 };
 
 /**
