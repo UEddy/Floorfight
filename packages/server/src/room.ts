@@ -79,6 +79,11 @@ export interface Seat {
   close: (reason: string) => void;
   /** Set on a bot's seat. Everything below the queue ignores it. */
   bot?: true;
+  /**
+   * Inputs at or below this tick were dropped from a full queue, so a resend
+   * of one is stale rather than new. Optional: a fresh seat has none.
+   */
+  floor?: number;
   /** Outstanding ping id, when it was sent, and the last measured round trip. */
   pingId: number;
   pingSentAt: number;
@@ -119,6 +124,20 @@ export class Room {
   private claimedSeat: boolean[];
   /** Consecutive ticks each slot's queue has been above BUFFER_TARGET. */
   private overTarget: number[];
+  /** Slots that have had a person seated in them at least once. */
+  private claimedOnce: boolean[];
+  /**
+   * Per slot counters for the end of match log line, next to the sim's own
+   * (world.stats): applied inputs with the trigger down, and inputs that
+   * never reached the sim, by reason.
+   */
+  readonly counters = {
+    fireTicks: [] as number[],
+    stale: [] as number[],
+    overflow: [] as number[],
+    malformed: [] as number[],
+    reconnects: [] as number[],
+  };
   private log: MatchLog;
   private timer: NodeJS.Timeout | null = null;
   private nextTickAt = 0;
@@ -166,6 +185,10 @@ export class Room {
     this.bots = new Array(roster.length).fill(null);
     this.claimedSeat = new Array(roster.length).fill(false);
     this.overTarget = new Array(roster.length).fill(0);
+    this.claimedOnce = new Array(roster.length).fill(false);
+    for (const k of Object.keys(this.counters) as (keyof typeof this.counters)[]) {
+      this.counters[k] = new Array(roster.length).fill(0);
+    }
     this.onFinish = onFinish;
     this.startWhenSeated = startWhenSeated;
     this.fillWithBots = fillWithBots && kind === "free";
@@ -195,6 +218,8 @@ export class Room {
     this.bots[seat.slot] = null;
 
     const existing = this.seats[seat.slot];
+    if (this.started && this.claimedOnce[seat.slot]) this.counters.reconnects[seat.slot]++;
+    this.claimedOnce[seat.slot] = true;
     if (existing && !existing.bot) {
       // A second socket for the same wallet. Keep the new one and drop the old,
       // so a player whose phone dropped can rejoin, but never run two at once.
@@ -375,13 +400,45 @@ export class Room {
     if (!seat || this.finished) return;
     seat.lastSeenTick = this.world.tick;
 
+    const floor = Math.max(seat.ack, seat.floor ?? -1);
     for (const inp of batch) {
-      if (inp.tick <= seat.ack) continue;
-      if (seat.queue.length >= BUFFER_MAX) break;
+      // Resends of what has already been applied are normal: every batch
+      // repeats the last few ticks. Only count them when they are not.
+      if (inp.tick <= floor) continue;
       if (seat.queue.some((q) => q.tick === inp.tick)) continue;
       seat.queue.push(inp);
     }
     seat.queue.sort((a, b) => a.tick - b.tick);
+    // After a stall on mobile data a second of inputs can land at once. Keep
+    // the newest: they are what the player is doing now, and playing out a
+    // second of old movement would leave them that far behind themselves.
+    while (seat.queue.length > BUFFER_MAX) {
+      seat.floor = seat.queue.shift()!.tick;
+      this.counters.overflow[slot]++;
+    }
+  }
+
+  /** A batch the socket layer refused as malformed, for the counters. */
+  rejectBatch(slot: number, size: number): void {
+    if (slot >= 0 && slot < this.roster.length) this.counters.malformed[slot] += size;
+  }
+
+  /** The end of match counters, one entry per slot. */
+  report(): Record<string, unknown>[] {
+    const st = this.world.stats;
+    return this.roster.map((r, slot) => ({
+      slot,
+      who: this.bots[slot] || r.wallet === FREE_SEAT_BOT ? "bot" : "player",
+      shotsRequested: this.counters.fireTicks[slot],
+      shotsAccepted: st.shots[slot],
+      hits: st.hits[slot],
+      rewindClamped: st.rewindClamped[slot],
+      coverRefused: st.coverRefused[slot],
+      rejectedInputs: this.counters.overflow[slot] + this.counters.malformed[slot],
+      overflow: this.counters.overflow[slot],
+      malformed: this.counters.malformed[slot],
+      reconnects: this.counters.reconnects[slot],
+    }));
   }
 
   /**
@@ -461,6 +518,7 @@ export class Room {
       if (!seat) continue;
 
       if (!seat.bot && tick - seat.lastSeenTick > TIMEOUT_TICKS) {
+        console.warn(`[close] match ${this.matchId} slot ${slot}: timed out, no input for ${TIMEOUT_TICKS} ticks`);
         seat.close("timed out");
         this.seats[slot] = null;
         continue;
@@ -477,6 +535,7 @@ export class Room {
         used = seat.queue.shift()!;
         seat.ack = used.tick;
       }
+      if (used && used.fire === 1) this.counters.fireTicks[slot]++;
       inputs[slot] = used;
     }
 
@@ -568,6 +627,12 @@ export class Room {
         t: "over", tick: this.world.tick, standings, logHash: hash, spreadSalt: salt,
       });
     }
+    // One line per match: how the shooting went, from the server's side.
+    // Shots requested are applied inputs with the trigger down, so for an
+    // automatic they outnumber shots by the fire interval; the ones to
+    // watch are rewindClamped and coverRefused against hits, and
+    // rejectedInputs and reconnects.
+    console.log(`[match] ${this.matchId} over at tick ${this.world.tick}: ${JSON.stringify(this.report())}`);
     this.onFinish(this.log, hash);
   }
 

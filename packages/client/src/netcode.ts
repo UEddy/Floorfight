@@ -217,7 +217,7 @@ export class Interpolator {
    * A snapshot stamped S is sent after step() has advanced world.tick to S,
    * so the positions in it are the history frame recorded for tick S - 1.
    * The rewind target is therefore the rendered snapshot tick minus one.
-   * The server clamps whatever we send to its 250 ms rewind limit.
+   * The server clamps whatever we send to its 500 ms rewind limit.
    */
   viewTick(nowMs: number): number {
     return Math.round(this.renderTick(nowMs)) - 1;

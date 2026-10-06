@@ -1,4 +1,5 @@
 import { W_PISTOL, W_RIFLE, W_SHOTGUN } from "../../shared/weapons";
+import type { Surface } from "./surfaces";
 
 /**
  * All the sound in the game, synthesized, and built to sound like real
@@ -31,6 +32,11 @@ import { W_PISTOL, W_RIFLE, W_SHOTGUN } from "../../shared/weapons";
  *   - Punch. What the shooter feels more than hears: a short sub bass thump
  *     under their own shot, and the slap of the nearest walls a few tens of
  *     milliseconds after it, which is most of what makes a shot sound close.
+ *   - Footsteps. A heel strike and a scuff, voiced by what is underfoot:
+ *     boards knock and ring a little, flagstones click, the carpet runner
+ *     barely makes a sound, iron rings. Other people's steps carry across
+ *     the hall the way their shots do, quieter with distance, panned and
+ *     dulled, so you can hear somebody coming up behind you.
  *   - Mechanism. The bolt or slide cycling, brass casings tinkling onto the
  *     boards a moment later, the shotgun's pump, and reloads with a release,
  *     a magazine out and clattering on the floor, a fresh one in and seated,
@@ -308,6 +314,41 @@ export function renderPunch(sr: number, from: number, to: number, ms: number): F
   return out;
 }
 
+/** How each surface sounds underfoot. */
+const STEP: Record<Surface, {
+  thumpHz: number; thump: number; scuffHz: number; scuffQ: number; scuff: number;
+  ringHz: number; ring: number; ms: number; level: number;
+}> = {
+  wood: { thumpHz: 110, thump: 0.9, scuffHz: 700, scuffQ: 1.1, scuff: 0.5, ringHz: 240, ring: 0.25, ms: 70, level: 1 },
+  stone: { thumpHz: 140, thump: 0.5, scuffHz: 2600, scuffQ: 1.4, scuff: 0.8, ringHz: 0, ring: 0, ms: 45, level: 0.85 },
+  carpet: { thumpHz: 90, thump: 0.6, scuffHz: 380, scuffQ: 0.7, scuff: 0.3, ringHz: 0, ring: 0, ms: 50, level: 0.35 },
+  metal: { thumpHz: 120, thump: 0.5, scuffHz: 1800, scuffQ: 2, scuff: 0.5, ringHz: 920, ring: 0.5, ms: 110, level: 0.8 },
+  grass: { thumpHz: 80, thump: 0.4, scuffHz: 1400, scuffQ: 0.5, scuff: 0.6, ringHz: 0, ring: 0, ms: 60, level: 0.45 },
+};
+
+/** One footstep on one surface. */
+export function renderStep(sr: number, seed: number, surface: Surface): Float32Array {
+  const m = STEP[surface];
+  const r = rng(seed);
+  const tau = (m.ms / 1000) * (0.85 + r() * 0.3);
+  const n = Math.floor((tau * 4 + 0.02) * sr);
+  const out = new Float32Array(n);
+  // The scuff: a little filtered noise, starting a hair after the heel.
+  const lag = Math.floor((0.008 + r() * 0.01) * sr);
+  for (let i = lag; i < n; i++) out[i] = (r() * 2 - 1) * Math.exp(-((i - lag) / sr) / (tau * 0.6));
+  biquad(out, sr, "bandpass", m.scuffHz * (0.9 + r() * 0.2), m.scuffQ);
+  for (let i = 0; i < n; i++) out[i] *= m.scuff;
+  // The heel: a short low knock, and for boards and iron a ring after it.
+  for (let i = 0; i < n; i++) {
+    const t = i / sr;
+    out[i] += m.thump * Math.sin(2 * Math.PI * m.thumpHz * t) * Math.exp(-t / (tau * 0.4));
+    if (m.ring > 0) out[i] += m.ring * Math.sin(2 * Math.PI * m.ringHz * t + 1) * Math.exp(-t / tau);
+  }
+  normalise(out, 0.9 * m.level);
+  fadeEdges(out, sr, 1);
+  return out;
+}
+
 /** Punch for each weapon: Hz from, Hz to, decay ms, level. */
 const PUNCH: Record<number, [number, number, number, number]> = {
   [W_RIFLE]: [120, 46, 60, 0.6],
@@ -383,6 +424,7 @@ function renderHall(ctx: BaseAudioContext): AudioBuffer {
 interface Bank {
   shots: Record<number, AudioBuffer[]>;
   punches: Record<number, AudioBuffer>;
+  steps: Record<Surface, AudioBuffer[]>;
   casings: AudioBuffer[];
   hulls: AudioBuffer[];
   bolt: AudioBuffer[];
@@ -475,9 +517,14 @@ export class Sfx {
       const [from, to, ms] = PUNCH[w];
       punches[w] = mk(renderPunch(sr, from, to, ms));
     }
+    const steps = {} as Record<Surface, AudioBuffer[]>;
+    for (const surface of Object.keys(STEP) as Surface[]) {
+      steps[surface] = variants((s) => renderStep(sr, s + surface.length * 97, surface));
+    }
     return {
       shots,
       punches,
+      steps,
       casings: variants((s) => renderCasing(sr, s, false)),
       hulls: variants((s) => renderCasing(sr, s + 5, true)),
       bolt: variants((s) => renderClick(sr, s + 1, 18, 2800, 1.3, 3400)),
@@ -594,6 +641,24 @@ export class Sfx {
         delay, pan, cutoff: 400, send: 0,
       });
     }
+  }
+
+  /**
+   * A footstep. `distance` 0 is our own, quiet and dry. Anyone else's is
+   * placed like their gunshots: panned, quieter and duller with distance,
+   * and not at all past about thirty blocks, where it would only be noise.
+   */
+  step(surface: Surface, distance = 0, pan?: number): void {
+    if (!this.ready) return;
+    const buf = this.pick(this.bank!.steps[surface] ?? this.bank!.steps.wood);
+    const rate = 0.92 + Math.random() * 0.16;
+    if (distance <= 0.01) {
+      this.play(buf, 0.16, { send: 0.08, rate });
+      return;
+    }
+    if (distance > 30) return;
+    const gain = 0.32 / (1 + distance / 5);
+    this.play(buf, gain, { pan, cutoff: Math.max(900, 9000 - distance * 300), send: 0.2, rate });
   }
 
   /** Trigger pulled on an empty magazine. */

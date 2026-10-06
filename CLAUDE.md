@@ -66,6 +66,21 @@ sockets.
 - 20 live rooms, of which free play may use 16. The reserve is so a staked
   match, which has money in escrow, can always open.
 - 10 seconds to finish the join handshake, then the socket is closed.
+- 90 messages a second per socket, sustained, as a token bucket holding
+  300, so the backlog a phone sends after a mobile data stall gets through.
+  The old rule, a counter reset to 90 once a second, kicked a one second
+  4G stall about half the time and anything from a second and a half up
+  always; that was the "Connection lost" in the middle of a match. While a
+  socket is stalled the client also holds inputs back and sends them in
+  one message, up to nine at a time, rather than sixty a second.
+
+Every close the server starts is logged as `[close]` with the match, the
+slot, the address and the reason; closes from the other end are logged with
+their WebSocket code (1006 is a connection that died, the usual one on
+mobile data). The client shows a kick's reason instead of a generic "lost",
+and after a drop it reconnects on its own into the same match and the same
+seat, with a "Reconnecting" pill, for about half a minute: a guest signs
+again with the key it kept for the page, a holder's wallet is asked again.
 
 None of it stops a botnet. It stops the cheap things, and it makes the failure
 mode "that address is refused" rather than the kernel killing the process.
@@ -103,9 +118,18 @@ anyone can run it against somebody else's match.
 
 ## Weapons
 
-Three, in `shared/weapons.ts`: an automatic rifle, a semi-automatic pistol
-that kills with one head shot, and an eight pellet shotgun that stops dead at
-sixteen blocks. The rifle and pistol reach 140, past the hall's longest line. Magazine, reload, fire interval,
+Three, in `shared/weapons.ts`, at 100 health:
+
+| | damage | rounds/min | spread | mag | reload | body kill | head kill |
+|---|---|---|---|---|---|---|---|
+| Rifle | 20, head 35 | 514 | 2.6 deg | 30 | 1.5 s | 5 (467 ms) | 3 (233 ms) |
+| Pistol | 40, head 100 | 277 | 0.6 deg | 12 | 1.25 s | 3 (433 ms) | 1 |
+| Shotgun | 8 x 11, no head bonus | 100 | 8.8 deg | 6 | 2.5 s | 2 up close (600 ms) | 2 |
+
+The shotgun never kills in one and kills in two out to about five blocks,
+and stops dead at sixteen. The rifle and pistol reach 140, past the hall's
+longest line. `npm run weapons` in `packages/server` prints this table from
+the code and the shotgun's damage by distance from the real sim. Magazine, reload, fire interval,
 damage, head multiplier, spread, pellet count and range all live in that
 table, and the server is the only thing that acts on it.
 
@@ -176,7 +200,13 @@ client assert an outcome, and adding one is not an acceptable shortcut.
 Everything else follows from that:
 
 - Hit registration is server side, with lag compensation rewinding to the
-  shooter's timestamp, clamped at 250 ms.
+  shooter's timestamp, clamped at 500 ms (see MAX_REWIND in `sim.ts` for why,
+  and for what that costs the player being shot). `test/lagcomp.test.ts`
+  plays a perfect aimer against a strafing target at 0, 150 and 250 ms round
+  trip; at the old 250 ms clamp the 250 ms player hit 18% of shots, now all.
+  Every match logs a `[match]` line at the end with, per slot, shots, hits,
+  shots whose rewind was clamped, hits refused because the victim was in
+  cover by then, rejected inputs and reconnects.
 - NFT character ownership is verified server side at join, through Helius DAS
   getAsset. A client claiming a mint it does not hold gets the default face,
   not an error. The mint is not part of the signed join message: the worst a
@@ -384,8 +414,11 @@ touch controls, server tick loop and join handshake, free and staked room
 types with server side bots, Anchor escrow program with 20 LiteSVM tests
 covering the attack cases, the payout paths and the holders flow (the app's
 create transaction, the lobby's lock rule against the real program, and
-create, join, lock, settle and claim end to end), 133 server tests covering
-replay determinism, weapon behaviour, the map id, the map's spawn, width,
+create, join, lock, settle and claim end to end), 145 server tests covering
+replay determinism against a pinned golden result (`test/golden.json`,
+regenerated only on purpose with `npm run golden`), lag compensation at
+mobile round trips, reconnecting into the same seat, the message budget
+under 4G stalls, weapon behaviour, the map id, the map's spawn, width,
 openness and reachability rules, respawn placement, the bot rules, the holders lobby and API, and the NFT
 image fetch's SSRF limits.
 

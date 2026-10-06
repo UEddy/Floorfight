@@ -119,8 +119,28 @@ export const RESPAWN_TICKS = 3 * TICK_HZ;
 /** Three minutes. */
 export const ROUND_TICKS = 180 * TICK_HZ;
 
-export const MAX_REWIND = 15;     // ticks, 250 ms
-export const HISTORY_TICKS = 20;  // ring size, must exceed MAX_REWIND
+/**
+ * The furthest back a shot may be resolved, in ticks: half a second.
+ *
+ * A client draws other players about seven ticks behind its estimate of the
+ * server clock, and its inputs sit a couple of ticks in the server's queue,
+ * so a shot needs to rewind its round trip plus about 150 ms. At the old
+ * 250 ms limit anything over a 100 ms round trip was clamped, and a perfect
+ * aimer on a 250 ms phone connection hit a strafing target 18% of the time
+ * (test/lagcomp.test.ts). Half a second covers round trips to about 350 ms,
+ * which is mobile data on a bad day.
+ *
+ * The cost is the other side's: a victim can be hit up to half a second
+ * after they moved, and a client may claim any view inside the window, so
+ * a low ping player could deliberately shoot at where someone was. That is
+ * bounded by exposedNow, which refuses the hit if no part of the victim is
+ * in the open from the shooter's eye at the tick the shot resolves, so
+ * nobody is shot through a wall they have already reached. Past half a
+ * second, the shooter's own connection is the problem, and the shot is
+ * resolved half a second back rather than refused.
+ */
+export const MAX_REWIND = 30;
+export const HISTORY_TICKS = 32;  // ring size, must exceed MAX_REWIND
 
 export const YAW_UNITS = 8192;
 export const PITCH_LIMIT = 1.45;
@@ -209,6 +229,23 @@ export interface WorldState {
    * from the log gets the same pattern the match had.
    */
   spread: SpreadSalt;
+  /**
+   * Counters for the server's end of match log line, per slot. Written by
+   * step and never read by it, so nothing the match does depends on them
+   * and a replay that ignores them still reproduces the match.
+   */
+  stats: ShotStats;
+}
+
+export interface ShotStats {
+  /** Rounds that left the gun. */
+  shots: number[];
+  /** Hit events, one per victim per shot. */
+  hits: number[];
+  /** Shots whose view tick was older than MAX_REWIND, and so was clamped. */
+  rewindClamped: number[];
+  /** Hits lag compensation found that exposedNow refused: cover by now. */
+  coverRefused: number[];
 }
 
 export interface Input {
@@ -282,7 +319,11 @@ export function createWorld(slots: number, salt: SpreadSalt = FREE_SALT): WorldS
       alive: new Uint8Array(slots),
     });
   }
-  return { tick: 0, players, history, spread: salt };
+  const zeros = () => new Array<number>(slots).fill(0);
+  return {
+    tick: 0, players, history, spread: salt,
+    stats: { shots: zeros(), hits: zeros(), rewindClamped: zeros(), coverRefused: zeros() },
+  };
 }
 
 /* ----------------------------------------------------------- collision --- */
@@ -822,6 +863,8 @@ export function step(
     const aimPitch = p.pitch + p.kick;
     recoilShot(p, spec, p.streak);
 
+    world.stats.shots[slot]++;
+    if ((inp!.view | 0) < tick - MAX_REWIND) world.stats.rewindClamped[slot]++;
     const view = clamp(inp!.view | 0, tick - MAX_REWIND, tick);
     const rewind = tick - view;
     const frame = frameAt(world, view);
@@ -862,12 +905,16 @@ export function step(
       // The victim may have died between the rewound frame and now. A shot
       // into the past does not kill someone twice.
       if (!victim.alive) continue;
-      // Lag compensation aims at where the shooter saw the victim, up to a
-      // quarter second ago. By now they may be round the corner, and a hit
+      // Lag compensation aims at where the shooter saw the victim, up to
+      // half a second ago. By now they may be round the corner, and a hit
       // then is a bullet through a wall from where they stand. So a hit
       // also needs some part of the victim to be in the open from the
       // shooter's eye at this tick.
-      if (!exposedNow(p.x, p.y + EYE_HEIGHT, p.z, victim)) continue;
+      if (!exposedNow(p.x, p.y + EYE_HEIGHT, p.z, victim)) {
+        world.stats.coverRefused[slot]++;
+        continue;
+      }
+      world.stats.hits[slot]++;
 
       victim.hp -= dealt[v];
       const lethal = victim.hp <= 0;

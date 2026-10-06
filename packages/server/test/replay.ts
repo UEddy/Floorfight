@@ -54,15 +54,15 @@ export function runMatch(seed: number, ticks: number, salt: Uint8Array = FREE_SA
   }
 
   const world = createWorld(SLOTS, saltSeeds(salt));
-  // Cluster the six of them in the open pocket on the stage, in each other's
+  // Cluster the six of them on the bandstand, in each other's
   // line of sight. The real spawns are deliberately far apart behind cover,
   // which is right for a match and useless here: a determinism check that
   // never resolves a shot never exercises rewind, hit registration or
   // scoring, and those are the parts most likely to drift.
   for (let i = 0; i < SLOTS; i++) {
     const p = world.players[i];
-    p.x = cellCentreX(22 + (i % 3));
-    p.z = cellCentreZ(10 + Math.floor(i / 3));
+    p.x = cellCentreX(51 + (i % 3));
+    p.z = cellCentreZ(19 + Math.floor(i / 3));
     p.y = LEVEL_STAGE;
     p.vy = 0;
   }
@@ -153,4 +153,19 @@ export const REPLAY_TICKS = 90 * TICK_HZ;
 if (process.argv[2] === "--print") {
   const r = runMatch(REPLAY_SEED, REPLAY_TICKS);
   console.log(JSON.stringify(r));
+}
+
+/**
+ * The golden replay: the scripted match's result under this build's rules,
+ * written down. Regenerate it with `npm run golden`, and only on purpose:
+ * a diff in it is a change in what the same inputs produce, which is a new
+ * LOG_VERSION and has to be in the commit that changes the rules.
+ */
+export const GOLDEN_PATH = new URL("./golden.json", import.meta.url);
+
+if (process.argv[2] === "--golden") {
+  const { writeFileSync } = await import("node:fs");
+  const r = runMatch(REPLAY_SEED, REPLAY_TICKS);
+  writeFileSync(GOLDEN_PATH, JSON.stringify({ logVersion: LOG_VERSION, mapId: MAP_ID, ...r }, null, 2) + "\n");
+  console.log(`wrote ${GOLDEN_PATH.pathname}`);
 }

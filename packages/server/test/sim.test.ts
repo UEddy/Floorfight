@@ -55,10 +55,12 @@ import {
   inWideSpace, key as cellKeyOf, nearestCover, pocketCells, reachable as walkable, sees, walkDistances,
 } from "./mapcheck";
 import { fromHex, sha256Hex, toHex } from "../../shared/sha256";
-import { REPLAY_SEED, REPLAY_TICKS, runMatch } from "./replay";
+import { GOLDEN_PATH, REPLAY_SEED, REPLAY_TICKS, runMatch } from "./replay";
+import { readFileSync } from "node:fs";
+import { averageDamage } from "../scripts/pattern";
 import { FREE_SEAT_BOT, FREE_SEAT_OPEN, Room } from "../src/room";
 import {
-  JOIN_MESSAGE_RE, PROTOCOL_VERSION, joinMessage,
+  JOIN_MESSAGE_RE, LOG_VERSION, PROTOCOL_VERSION, joinMessage,
   type MatchLog, type RosterEntry,
 } from "../../shared/protocol";
 import bs58 from "bs58";
@@ -134,6 +136,20 @@ test("the same inputs replay to the same match in a fresh process", () => {
   // scratch, so this also covers map construction and module load order.
   assert.equal(second.stateHash, first.stateHash);
   assert.equal(second.logHash, first.logHash);
+});
+
+test("the scripted match matches the golden replay", () => {
+  // Pinned rather than only compared with itself: a change to the sim that
+  // moves this result has to update test/golden.json (npm run golden) and
+  // LOG_VERSION in the same commit, so it cannot happen by accident.
+  const golden = JSON.parse(readFileSync(GOLDEN_PATH, "utf8"));
+  const now = runMatch(REPLAY_SEED, REPLAY_TICKS);
+  assert.equal(golden.logVersion, LOG_VERSION, "golden.json is from another LOG_VERSION");
+  assert.equal(golden.mapId, MAP_ID, "golden.json is from another map");
+  assert.equal(now.stateHash, golden.stateHash);
+  assert.equal(now.logHash, golden.logHash);
+  assert.equal(now.kills, golden.kills);
+  assert.equal(now.hits, golden.hits);
 });
 
 test("a different input stream produces a different match", () => {
@@ -610,7 +626,10 @@ test("every weapon has a coherent spec", () => {
     assert.ok(spec.mag > 0 && spec.reloadTicks > 0 && spec.fireInterval > 0);
     assert.ok(spec.damage > 0 && spec.pellets >= 1 && spec.range > 0);
     assert.equal(spec.headDamage, Math.round(spec.damage * spec.headMult));
-    assert.ok(spec.headDamage > spec.damage, "a head shot should hurt more");
+    // A head shot hurts more with every single bullet weapon. The shotgun
+    // has no head bonus on purpose, so no pattern can kill in one.
+    if (spec.pellets === 1) assert.ok(spec.headDamage > spec.damage, "a head shot should hurt more");
+    else assert.ok(spec.headDamage >= spec.damage);
   });
   assert.equal(WEAPONS[W_RIFLE].auto, true);
   assert.equal(WEAPONS[W_PISTOL].auto, false);
@@ -945,6 +964,22 @@ test("a weapon swap and a respawn both start with no recoil", () => {
   step(w, [{ ...input({ weapon: W_SHOTGUN + 1 }), tick: w.tick, view: w.tick }], []);
   assert.equal(p.kick, 0);
   assert.equal(p.drift, 0);
+});
+
+test("the weapons meet their kill targets at full health", () => {
+  const rifle = WEAPONS[W_RIFLE];
+  const pistol = WEAPONS[W_PISTOL];
+  const shotgun = WEAPONS[W_SHOTGUN];
+  const toKill = (dmg: number) => Math.ceil(MAX_HP / dmg);
+  // Rifle: five or six to the body.
+  assert.ok([5, 6].includes(toKill(rifle.damage)), `rifle takes ${toKill(rifle.damage)} body shots`);
+  // Pistol: a head shot is the kill, the body takes three.
+  assert.equal(toKill(pistol.headDamage), 1);
+  assert.equal(toKill(pistol.damage), 3);
+  // Shotgun: never one hit, even with every pellet in the head, and two up close.
+  assert.ok(shotgun.headDamage * shotgun.pellets < MAX_HP, "a shotgun pattern can kill in one");
+  assert.ok(averageDamage(3, 60) * 2 >= MAX_HP, "two shotgun hits at three blocks should kill");
+  assert.ok(averageDamage(5, 60) * 2 >= MAX_HP, "and at five");
 });
 
 test("the round is three minutes and respawning takes three seconds", () => {

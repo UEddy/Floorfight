@@ -10,9 +10,12 @@ import assert from "node:assert/strict";
 import bs58 from "bs58";
 import nacl from "tweetnacl";
 import { WebSocket } from "ws";
-import { PROTOCOL_VERSION, joinMessage, type ServerMsg } from "../../shared/protocol";
+import {
+  MAX_MSGS_PER_SECOND, MAX_MSG_BURST, PROTOCOL_VERSION, joinMessage, type ServerMsg,
+} from "../../shared/protocol";
 import {
   ConnectionLimits,
+  MessageBudget,
   JOIN_DEADLINE_MS,
   MAX_CONNECTIONS,
   MAX_FREE_ROOMS,
@@ -24,6 +27,41 @@ import {
 import { startServer, type Server } from "./spawn";
 
 /* ------------------------------------------------------------- policy --- */
+
+/**
+ * A phone's message stream on mobile data: an input every 60 Hz tick and a
+ * pong a second, delivered on time except for one stall of `stallMs`, after
+ * which everything sent during it arrives at once. True if the budget lets
+ * every message through.
+ */
+function survivesStall(stallMs: number): boolean {
+  const arrivals: number[] = [];
+  const stallAt = 3000;
+  const late = (t: number) => (t >= stallAt && t < stallAt + stallMs ? stallAt + stallMs : t);
+  for (let i = 0; i < 10 * 60; i++) arrivals.push(late(i * (1000 / 60)));
+  for (let s = 0; s < 10; s++) arrivals.push(late(s * 1000 + 500));
+  arrivals.sort((a, b) => a - b);
+  const b = new MessageBudget(MAX_MSGS_PER_SECOND, MAX_MSG_BURST, 0);
+  return arrivals.every((t) => b.take(t));
+}
+
+test("a phone's stream survives a mobile data stall of up to four seconds", () => {
+  for (const ms of [500, 1000, 1500, 2000, 3000, 4000]) {
+    assert.ok(survivesStall(ms), `a ${ms} ms stall was kicked`);
+  }
+});
+
+test("the message budget still caps a flood", () => {
+  // 120 a second, steadily: past the burst allowance, refused.
+  const b = new MessageBudget(MAX_MSGS_PER_SECOND, MAX_MSG_BURST, 0);
+  let refusedAt = -1;
+  for (let i = 0; i < 120 * 30; i++) {
+    if (!b.take(i * (1000 / 120))) { refusedAt = i; break; }
+  }
+  assert.ok(refusedAt > 0, "a flood of 120 a second was never refused");
+  // The burst is spent at the 30 a second surplus over about ten seconds.
+  assert.ok(refusedAt < 120 * 12, `took ${refusedAt} messages to refuse`);
+});
 
 test("the caps are the ones the deployment asked for", () => {
   assert.equal(MAX_PER_IP, 8);
