@@ -266,7 +266,7 @@ const handlers: NetHandlers = {
         controls.syncWeapon(me.g);
       }
       if (myReload === 0 && me.r > 0) {
-        sfx.reload((me.r / TICK_HZ) * 1000);
+        sfx.reload((me.r / TICK_HZ) * 1000, me.g);
         const full = (WEAPONS[me.g] ?? WEAPONS[0]).reloadTicks;
         reloadStartedAt = now - ((full - me.r) / TICK_HZ) * 1000;
       }
@@ -337,6 +337,35 @@ const handlers: NetHandlers = {
     }
   },
 };
+
+/**
+ * Landscape on a phone browser.
+ *
+ * The page cannot rotate a phone by itself, but Android browsers allow a page
+ * that has gone fullscreen to lock its orientation, and fullscreen needs a
+ * tap. So the first tap anywhere asks for both. Where either is refused (an
+ * iPhone, a browser that says no, the app's WebView, which is already locked
+ * to landscape natively) nothing happens, and the overlay in index.html asks
+ * the person to turn the phone instead.
+ */
+function landscapeOnFirstTap(): void {
+  if (native.hasNative() || !matchMedia("(pointer: coarse)").matches) return;
+  const go = () => {
+    removeEventListener("pointerdown", go, true);
+    const el = document.documentElement;
+    const lock = () => {
+      const o = screen.orientation as ScreenOrientation & { lock?: (o: string) => Promise<void> };
+      return o?.lock ? o.lock("landscape") : Promise.resolve();
+    };
+    if (!document.fullscreenElement && el.requestFullscreen) {
+      el.requestFullscreen({ navigationUI: "hide" }).then(lock).catch(() => {});
+    } else {
+      lock().catch(() => {});
+    }
+  };
+  addEventListener("pointerdown", go, true);
+}
+landscapeOnFirstTap();
 
 /*
  * Free straight away for a dev seat or ?mode=free, which is how the
@@ -417,7 +446,14 @@ function shotByOther(p: SnapshotPlayer, now: number): void {
   const dist = predictor
     ? Math.hypot(p.x - predictor.me.x, p.e - predictor.me.y, p.z - predictor.me.z)
     : 0;
-  sfx.shot(p.g, dist);
+  // Which side of us it came from: the shooter's direction against the
+  // camera's right hand, (cos yaw, -sin yaw) in the sim's convention.
+  let pan = 0;
+  if (predictor && dist > 0.01) {
+    const yaw = controls.intent.yaw;
+    pan = ((p.x - predictor.me.x) * Math.cos(yaw) - (p.z - predictor.me.z) * Math.sin(yaw)) / dist;
+  }
+  sfx.shot(p.g, Math.max(0.5, dist), pan * 0.8);
 }
 
 /* ------------------------------------------------------------ ticking --- */
@@ -660,6 +696,8 @@ if (import.meta.env.DEV) {
     camera(pose: typeof devCamera) { devCamera = pose; },
     /** The menu, so the screenshot script can photograph its screens. */
     menu,
+    /** The sound engine, so a script can render it offline and listen. */
+    sfx,
     /** Put a mint on seats' faces, as a verified roster would. Drawing only. */
     faces(roster: RosterEntry[]) { renderer?.setRoster(roster); },
     /**

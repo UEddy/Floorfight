@@ -1,4 +1,24 @@
 import type { ExpoConfig } from "expo/config";
+import { withAndroidManifest, type ConfigPlugin } from "expo/config-plugins";
+
+/**
+ * Landscape, either way round.
+ *
+ * `orientation: "landscape"` becomes android:screenOrientation="landscape",
+ * which is one fixed direction: a player holding the phone the other way up
+ * sees the game upside down until they turn it. sensorLandscape is still
+ * only landscape, never portrait, but follows the phone between the two.
+ */
+const withSensorLandscape: ConfigPlugin = (c) =>
+  withAndroidManifest(c, (mod) => {
+    const app = mod.modResults.manifest.application?.[0];
+    for (const activity of app?.activity ?? []) {
+      if (activity.$["android:name"] === ".MainActivity") {
+        activity.$["android:screenOrientation"] = "sensorLandscape";
+      }
+    }
+    return mod;
+  });
 
 /**
  * Expo config.
@@ -10,7 +30,7 @@ import type { ExpoConfig } from "expo/config";
  * `eas init` writes the project id into extra.eas.projectId. It is not here
  * because it does not exist until an Expo account has created the project.
  */
-const config: ExpoConfig = {
+const base: ExpoConfig = {
   name: "Floorfight",
   slug: "floorfight",
   version: "0.1.0",
@@ -41,4 +61,4 @@ const config: ExpoConfig = {
   },
 };
 
-export default config;
+export default withSensorLandscape(base);
