@@ -3,7 +3,8 @@ import { HEAD_BOTTOM, HEAD_TOP, YAW_UNITS } from "../../shared/sim";
 import { W_PISTOL, W_RIFLE, W_SHOTGUN } from "../../shared/weapons";
 import { buildParts, type Part } from "./boxes";
 import type { RemoteView } from "./netcode";
-import { T, atlas, tileUV } from "./textures";
+import { ATLAS_H, ATLAS_W, T, atlas, atlasImage, tileUV } from "./textures";
+import type { RosterEntry } from "../../shared/protocol";
 import { probe } from "./lighting";
 
 /**
@@ -83,6 +84,9 @@ function gunParts(w: number): Part[] {
   ];
 }
 
+/** Pixels per face in the face atlas. */
+const FACE_PX = 128;
+
 /** Where the gun's grip sits relative to the right shoulder, arm raised. */
 const GRIP_FORWARD = 0.5;
 
@@ -96,8 +100,15 @@ export class Characters {
   private caps: THREE.InstancedMesh;
   private guns: THREE.InstancedMesh[] = [];
   private walk: Walk[] = [];
-  /** The material the head's front face uses. An NFT image goes here later. */
+  /**
+   * The material the head's front face uses. It samples a face atlas with
+   * one cell per seat: the default face, or the seat's verified NFT image.
+   * A per instance attribute picks the cell, so every face is still one draw
+   * call however many different NFTs are in the match.
+   */
   readonly faceMaterial: THREE.MeshBasicMaterial;
+  private faceCanvas: HTMLCanvasElement;
+  private faceTexture: THREE.CanvasTexture;
 
   private m = new THREE.Matrix4();
   private base = new THREE.Matrix4();
@@ -108,7 +119,35 @@ export class Characters {
 
   constructor(scene: THREE.Scene, private slots: number) {
     const mat = new THREE.MeshBasicMaterial({ map: atlas(), vertexColors: true, fog: true });
-    this.faceMaterial = new THREE.MeshBasicMaterial({ map: atlas(), vertexColors: true, fog: true });
+    this.faceCanvas = document.createElement("canvas");
+    this.faceCanvas.width = FACE_PX * slots;
+    this.faceCanvas.height = FACE_PX;
+    this.faceTexture = new THREE.CanvasTexture(this.faceCanvas);
+    this.faceTexture.colorSpace = THREE.SRGBColorSpace;
+    this.faceTexture.magFilter = THREE.NearestFilter;
+    this.faceTexture.minFilter = THREE.LinearMipmapLinearFilter;
+    for (let i = 0; i < slots; i++) this.drawDefaultFace(i);
+    this.faceMaterial = new THREE.MeshBasicMaterial({
+      map: this.faceTexture, vertexColors: true, fog: true,
+    });
+    // The front face's texture coordinates point at the FACE tile in the
+    // block atlas. Remap them into this seat's cell of the face atlas.
+    const [u0, v0, u1, v1] = tileUV(T.FACE);
+    this.faceMaterial.onBeforeCompile = (shader) => {
+      shader.uniforms.faceRect = { value: new THREE.Vector4(u0, v0, u1, v1) };
+      shader.uniforms.faceCells = { value: slots };
+      shader.vertexShader = shader.vertexShader
+        .replace("#include <common>", `#include <common>
+attribute float faceCell;
+uniform vec4 faceRect;
+uniform float faceCells;`)
+        .replace("#include <uv_vertex>", `#include <uv_vertex>
+#ifdef USE_MAP
+  vMapUv = vec2(
+    (faceCell + clamp((uv.x - faceRect.x) / (faceRect.z - faceRect.x), 0.0, 1.0)) / faceCells,
+    clamp((uv.y - faceRect.y) / (faceRect.w - faceRect.y), 0.0, 1.0));
+#endif`);
+    };
 
     // Each part is built hanging from its pivot, so its instance matrix is a
     // translation to the joint and a rotation about it.
@@ -138,6 +177,9 @@ export class Characters {
     this.legs = this.instanced(scene, leg, mat, slots * 2);
     this.torsos = this.instanced(scene, torso, mat, slots);
     this.arms = this.instanced(scene, arm, mat, slots * 2);
+    const cells = new Float32Array(slots);
+    for (let i = 0; i < slots; i++) cells[i] = i;
+    head.setAttribute("faceCell", new THREE.InstancedBufferAttribute(cells, 1));
     this.heads = this.instanced(scene, head, [mat, this.faceMaterial], slots);
     this.caps = this.instanced(scene, cap, mat, slots);
     for (const w of [W_RIFLE, W_PISTOL, W_SHOTGUN]) {
@@ -156,6 +198,49 @@ export class Characters {
       this.heads.setColorAt(i, c.set(0xffffff));
       for (const g of this.guns) g.setColorAt(i, c.set(0xffffff));
       this.walk.push({ x: 0, z: 0, y: 0, speed: 0, phase: 0, air: 0 });
+    }
+  }
+
+  /** The default face, scaled up from the block atlas, into a seat's cell. */
+  private drawDefaultFace(slot: number): void {
+    const ctx = this.faceCanvas.getContext("2d")!;
+    const [u0, v0, u1, v1] = tileUV(T.FACE);
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(
+      atlasImage(),
+      u0 * ATLAS_W, (1 - v1) * ATLAS_H, (u1 - u0) * ATLAS_W, (v1 - v0) * ATLAS_H,
+      slot * FACE_PX, 0, FACE_PX, FACE_PX,
+    );
+    this.faceTexture.needsUpdate = true;
+  }
+
+  /**
+   * Faces from the roster. A seat whose roster entry carries a mint is one
+   * the server verified at join; its image comes from this page's own origin
+   * (/api/nft-img), which is what lets WebGL use it without a cross origin
+   * taint. Anything that fails to load keeps the default face.
+   */
+  setFaces(roster: readonly RosterEntry[]): void {
+    for (const r of roster) {
+      if (r.slot < 0 || r.slot >= this.slots) continue;
+      this.drawDefaultFace(r.slot);
+      if (!r.mint || !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(r.mint)) continue;
+      const img = new Image();
+      img.decoding = "async";
+      img.onload = () => {
+        const ctx = this.faceCanvas.getContext("2d")!;
+        ctx.imageSmoothingEnabled = true;
+        // Centre crop to a square, so a portrait or landscape image is not
+        // squashed onto a square face.
+        const side = Math.min(img.naturalWidth, img.naturalHeight);
+        ctx.drawImage(
+          img,
+          (img.naturalWidth - side) / 2, (img.naturalHeight - side) / 2, side, side,
+          r.slot * FACE_PX, 0, FACE_PX, FACE_PX,
+        );
+        this.faceTexture.needsUpdate = true;
+      };
+      img.src = `/api/nft-img/${r.mint}`;
     }
   }
 

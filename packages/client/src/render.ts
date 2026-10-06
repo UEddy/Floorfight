@@ -27,6 +27,7 @@ import {
   solidAt,
 } from "../../shared/map";
 import type { RemoteView } from "./netcode";
+import type { RosterEntry } from "../../shared/protocol";
 import { T, atlas, tileUV } from "./textures";
 import { ViewModel } from "./viewmodel";
 import { addProps } from "./props";
@@ -502,6 +503,11 @@ export class Renderer {
     const angle = (units / YAW_UNITS) * Math.PI * 2;
     const half = (this.camera.fov * Math.PI) / 360;
     return (Math.tan(angle) / Math.tan(half)) * (innerHeight / 2);
+  }
+
+  /** Faces from the roster: verified NFT images, or the default face. */
+  setRoster(roster: readonly RosterEntry[]): void {
+    this.people.setFaces(roster);
   }
 
   /** The local player's colour, for the sleeves. */

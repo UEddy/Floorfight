@@ -148,10 +148,19 @@ async function main() {
   }
 
   // Closest live opponent, from a few blocks away, for the character model.
+  // Every other seat wears a fixture face, served the way /api/nft-img
+  // serves a verified NFT, so the head's NFT path is in the picture too.
+  await page.route("**/api/nft-img/*", (r) =>
+    r.fulfill({ path: resolve("scripts/fixtures", "face1.png"), contentType: "image/png" }));
+  await page.evaluate(() => window.arena.faces([1, 2, 3, 4, 5].map((slot) => ({
+    slot, wallet: "", collection: null, mint: "Face2222222222222222222222222222222222222222",
+  }))));
   const near = await page.evaluate(() => window.arena.nearestRemote?.() ?? null);
   if (near) {
+    // Straight after placing it: bots run at seven blocks a second, and a
+    // pause here photographs the spot they were standing in.
     await page.evaluate((v) => window.arena.camera(v), near);
-    await sleep(500);
+    await sleep(60);
     await page.screenshot({ path: join(OUT, "5-opponent.png") });
   }
 

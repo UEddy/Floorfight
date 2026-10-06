@@ -19,7 +19,8 @@ import { devModeFromEnv, devRoster, devWarning } from "./dev";
 import { hasChainEnv, rosterFromMatch } from "./chain";
 import type { ChainConfig } from "./chainrpc";
 import { DEFAULT_LOG_DIR, finishMatch } from "./settlement";
-import { createApi } from "./api";
+import { TtlCache, createApi } from "./api";
+import { nftsFromEnv, type NftService } from "./nft";
 import { Lobbies, type Member } from "./lobby";
 import type { MatchAccount } from "./chain";
 import { FREE_SEAT_OPEN, Room, type RoomKind, type Seat } from "./room";
@@ -258,8 +259,20 @@ const STAKED_ABANDON_MS = 5 * 60_000;
 
 /* ---------------------------------------------------------------- NFTs --- */
 
-/** Set in the NFT step. Null means no NFT endpoints and default faces. */
-const NFTS: null = null;
+/**
+ * NFT heads. Needs HELIUS_API_KEY in the environment; without it the NFT
+ * endpoints answer 503 and every holder plays with the default face. The key
+ * never leaves this process.
+ */
+let NFTS: NftService | null = null;
+try {
+  NFTS = nftsFromEnv(process.env);
+} catch (e) {
+  console.error((e as Error).message);
+  process.exit(1);
+}
+/** Ownership answers, for a minute, so a reconnect does not cost another DAS call. */
+const verified = new TtlCache<{ mint: string | null; collection: string | null }>(60_000, 2000);
 
 /* ------------------------------------------------------------- lobbies --- */
 
@@ -667,10 +680,15 @@ wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
  * be a plain face rather than a refused seat.
  */
 async function verifyCharacter(
-  _wallet: string,
-  _mint: string | undefined,
+  wallet: string,
+  mint: string | undefined,
 ): Promise<{ mint: string | null; collection: string | null }> {
-  return { mint: null, collection: null };
+  if (!NFTS || typeof mint !== "string" || mint.length === 0 || mint.length > 64) {
+    return { mint: null, collection: null };
+  }
+  const answer = await verified.get(`${wallet}:${mint}`, () => NFTS!.verify(wallet, mint));
+  if (answer.mint) console.log(`[nft] ${wallet} wears ${answer.mint}`);
+  return answer;
 }
 
 http.on("listening", () => {

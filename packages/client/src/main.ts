@@ -18,7 +18,9 @@ import {
 } from "../../shared/sim";
 import { BLOOM_GAP, WEAPONS } from "../../shared/weapons";
 import { fromHex, sha256Hex } from "../../shared/sha256";
-import { quantAxis, quantPitch, quantYaw, type SnapshotPlayer } from "../../shared/protocol";
+import {
+  quantAxis, quantPitch, quantYaw, type RosterEntry, type SnapshotPlayer,
+} from "../../shared/protocol";
 import { DEV_MATCH_ID } from "../../shared/dev";
 import { devKeypair, guestKeypair } from "./keys";
 import { Net, signLocally, type NetHandlers } from "./net";
@@ -226,6 +228,7 @@ const handlers: NetHandlers = {
     predictor = new Predictor(msg.roster.length, slot);
     renderer = new Renderer(canvas, msg.roster.length);
     renderer.setLocalSlot(slot);
+    renderer.setRoster(msg.roster);
     // Face the middle of the hall from the spawn, which is where the clock
     // tower is and where the action tends to be.
     const me = createWorld(msg.roster.length).players[slot];
@@ -516,6 +519,8 @@ let crossGap = 0;
  */
 let devCamera: {
   x: number; y: number; z: number; yaw: number; pitch: number; hideGun?: boolean;
+  /** Follow this seat, from in front of it, every frame. */
+  follow?: number;
 } | null = null;
 
 function frame(): void {
@@ -555,6 +560,18 @@ function frame(): void {
     }
   }
   const spec = WEAPONS[myWeapon] ?? WEAPONS[0];
+  if (devCamera?.follow !== undefined) {
+    const r = remotes.get(devCamera.follow);
+    if (r) {
+      const ry = yawToRadians(r.yaw);
+      const fx = -Math.sin(ry);
+      const fz = -Math.cos(ry);
+      devCamera.x = r.x + fx * 2.4;
+      devCamera.z = r.z + fz * 2.4;
+      devCamera.y = r.y;
+      devCamera.yaw = Math.atan2(fx, fz);
+    }
+  }
   renderer.draw(now, devCamera ?? { x, y, z, yaw, pitch }, slot, remotes, {
     weapon: myWeapon,
     // The server's countdown, as a fraction of the whole reload, so the
@@ -643,6 +660,8 @@ if (import.meta.env.DEV) {
     camera(pose: typeof devCamera) { devCamera = pose; },
     /** The menu, so the screenshot script can photograph its screens. */
     menu,
+    /** Put a mint on seats' faces, as a verified roster would. Drawing only. */
+    faces(roster: RosterEntry[]) { renderer?.setRoster(roster); },
     /**
      * A camera pose a few blocks from the closest live opponent, looking at
      * them, from whichever side has a clear line. For the screenshot script.
@@ -650,28 +669,34 @@ if (import.meta.env.DEV) {
     nearestRemote() {
       if (!predictor) return null;
       const me = predictor.me;
-      let best: RemoteView | null = null;
-      let bestD = Infinity;
-      for (const [s, r] of remotes) {
-        if (s === slot || !r.alive) continue;
-        const d = Math.hypot(r.x - me.x, r.z - me.z);
-        if (d < bestD) { bestD = d; best = r; }
-      }
-      if (!best) return null;
-      const eyeY = best.y + EYE_HEIGHT;
-      // Start from the way they are facing, so the first clear view is of
-      // their front.
-      const facing = Math.atan2(-Math.sin(yawToRadians(best.yaw)), -Math.cos(yawToRadians(best.yaw)));
-      for (let k = 0; k < 16; k++) {
-        const a = facing + ((k % 2 === 0 ? 1 : -1) * Math.ceil(k / 2) / 16) * Math.PI * 2;
-        const dx = Math.sin(a);
-        const dz = Math.cos(a);
-        const dist = 3.2;
-        if (rayGrid(best.x, eyeY, best.z, dx, 0, dz, dist + 0.6) < dist + 0.6) continue;
-        const cx = best.x + dx * dist;
-        const cz = best.z + dz * dist;
-        // Facing back at them: forward is (-sin yaw, -cos yaw).
-        return { x: cx, y: best.y, z: cz, yaw: Math.atan2(dx, dz), pitch: -0.12, hideGun: true };
+      const others = [...remotes]
+        .filter(([s, r]) => s !== slot && r.alive)
+        .map(([, r]) => r)
+        .sort((a, b) => Math.hypot(a.x - me.x, a.z - me.z) - Math.hypot(b.x - me.x, b.z - me.z));
+      // Prefer a view of somebody's face: try in front of each of them before
+      // settling for any clear side of the nearest.
+      for (const front of [true, false]) {
+        for (const best of front ? others : others.slice(0, 1)) {
+          const eyeY = best.y + EYE_HEIGHT;
+          const yaw = yawToRadians(best.yaw);
+          const facing = Math.atan2(-Math.sin(yaw), -Math.cos(yaw));
+          const steps = front ? 5 : 16;
+          for (let k = 0; k < steps; k++) {
+            const off = (k % 2 === 0 ? 1 : -1) * Math.ceil(k / 2);
+            const a = facing + off * (front ? 0.25 : Math.PI / 8);
+            const dx = Math.sin(a);
+            const dz = Math.cos(a);
+            const dist = 2.6;
+            if (rayGrid(best.x, eyeY, best.z, dx, 0, dz, dist + 0.6) < dist + 0.6) continue;
+            return {
+              x: best.x + dx * dist, y: best.y, z: best.z + dz * dist,
+              yaw: Math.atan2(dx, dz), pitch: -0.1, hideGun: true,
+              // From in front, track them: a running bot crosses this
+              // distance in a third of a second.
+              ...(front ? { follow: [...remotes].find(([, r]) => r === best)?.[0] } : {}),
+            };
+          }
+        }
       }
       return null;
     },
