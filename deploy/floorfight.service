@@ -22,9 +22,18 @@
 #   cp deploy/floorfight.service /etc/systemd/system/
 #   systemctl daemon-reload && systemctl enable --now floorfight
 #
-# Before enabling: put the resolver keypair at /etc/floorfight/resolver.json,
-# owned by the service user and chmod 600. The server will not start if group
-# or others can read it.
+# That is free play only, and it is complete on its own: no chain, no key, no
+# web3.js loaded. Staked rooms are a drop-in on top of it, so the unit that
+# runs today never names a key file that might not exist yet:
+#
+#   mkdir -p /etc/systemd/system/floorfight.service.d
+#   cp deploy/floorfight-chain.conf /etc/systemd/system/floorfight.service.d/chain.conf
+#   systemctl daemon-reload && systemctl restart floorfight
+#
+# Read floorfight-chain.conf before copying it: the resolver key has to be in
+# place first, or the server refuses to start, by design.
+#
+# Removing the drop-in and restarting takes the box back to free play.
 #
 # Node must be installed system wide (for example /usr/bin/node). tsx starts
 # through `#!/usr/bin/env node`, and a per-user nvm install is not on the
@@ -34,6 +43,14 @@
 Description=Floorfight game server
 After=network-online.target
 Wants=network-online.target
+# Restart=always on its own would retry a server that cannot start (a bad
+# key mode, a half configured chain) every two seconds forever, and the
+# reason would scroll out of the journal. Ten tries in a minute, then systemd
+# gives up and the unit shows as failed, with the reason at the bottom of
+# `journalctl -u floorfight`. `systemctl reset-failed floorfight` and a start
+# once it is fixed.
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -55,16 +72,8 @@ Environment=PORT=8080
 # The droplet has 512 MB. Cap the heap well below that.
 Environment=NODE_OPTIONS=--max-old-space-size=256
 
-# Staked rooms. All three together or none: the server refuses to start half
-# configured, because a server that takes stakes with no way to settle them is
-# worse than one that will not start.
-#
-# The key file is read at startup and must be mode 600 and owned by the
-# service user. The server checks and refuses to start if group or others can
-# read it. It is never in the repo and never in the APK.
-Environment=RPC_URL=https://api.devnet.solana.com
-Environment=PROGRAM_ID=HoktNWjdhuts9nzV76UyqUn6FCqJ57LwAizFYbjD4TCe
-Environment=RESOLVER_KEYPAIR_PATH=/etc/floorfight/resolver.json
+# Staked rooms are not configured here. See floorfight-chain.conf, a drop-in
+# that adds RPC_URL, PROGRAM_ID and RESOLVER_KEYPAIR_PATH together.
 
 # Match logs. Caddy serves this directory read only at /logs/, so anyone can
 # download a log and replay it.
@@ -91,8 +100,10 @@ PrivateTmp=true
 # the match logs go in it.
 StateDirectory=floorfight
 ReadWritePaths=/var/lib/floorfight
-# The resolver key is the only thing it reads outside the install.
-ReadOnlyPaths=/etc/floorfight
+# The resolver key is the only thing it reads outside the install. The minus
+# makes a missing directory fine, which on a free only box it is: without it
+# systemd fails to set up the namespace and the service never starts.
+ReadOnlyPaths=-/etc/floorfight
 
 [Install]
 WantedBy=multi-user.target
