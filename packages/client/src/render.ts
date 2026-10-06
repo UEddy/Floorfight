@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import {
   EYE_HEIGHT,
+  YAW_UNITS,
   rayGrid,
 } from "../../shared/sim";
 import {
@@ -56,6 +57,9 @@ interface Tracer {
   x1: number; y1: number; z1: number;
   life: number;
 }
+
+/** Vertical field of view, in degrees. */
+const FOV = 85;
 
 export const SLOT_COLORS = [0xff4d3d, 0x3da5ff, 0x4fe08a, 0xffd23a, 0xc46bff, 0x2fe0d6];
 
@@ -385,6 +389,8 @@ export class Renderer {
   private view = new ViewModel();
   private lastEye = { x: 0, z: 0 };
   private moving = 0;
+  private bobPhase = 0;
+  private shake = 0;
   private chunks: THREE.InstancedMesh;
   private chunkState: Chunk[] = [];
   private tracers: THREE.LineSegments;
@@ -410,7 +416,7 @@ export class Renderer {
     // readable without a shadow in sight. The sky itself is a dome in props.
     this.scene.fog = new THREE.Fog(0x4b3a66, 14, 62);
 
-    this.camera = new THREE.PerspectiveCamera(75, 1, 0.05, 140);
+    this.camera = new THREE.PerspectiveCamera(FOV, 1, 0.05, 140);
     this.camera.rotation.order = "YXZ";
     this.scene.add(this.camera);
 
@@ -482,9 +488,20 @@ export class Renderer {
     this.view.resize(w / h);
   }
 
-  /** Our own shot: the view model kicks and flashes. */
-  muzzleFlash(): void {
+  /** Our own shot: the view model kicks and flashes, the camera shakes. */
+  muzzleFlash(weapon: number): void {
     this.view.fired();
+    this.shake = Math.min(1, this.shake + (weapon === 2 ? 0.9 : weapon === 1 ? 0.5 : 0.3));
+  }
+
+  /**
+   * Screen pixels from the centre for an aim deviation in yaw units, at the
+   * current field of view. The crosshair is drawn with this.
+   */
+  spreadPixels(units: number): number {
+    const angle = (units / YAW_UNITS) * Math.PI * 2;
+    const half = (this.camera.fov * Math.PI) / 360;
+    return (Math.tan(angle) / Math.tan(half)) * (innerHeight / 2);
   }
 
   /** The local player's colour, for the sleeves. */
@@ -659,11 +676,31 @@ export class Renderer {
     remotes: Map<number, RemoteView>,
     held: { weapon: number; reload: number | null; alive: boolean; grounded: boolean },
   ): void {
-    this.camera.position.set(eye.x, eye.y + EYE_HEIGHT, eye.z);
-    this.camera.rotation.set(eye.pitch, eye.yaw, 0);
-
     const dt = this.lastDraw === 0 ? 0 : Math.min(0.1, (nowMs - this.lastDraw) / 1000);
     this.lastDraw = nowMs;
+
+    // Head bob while walking, and a shake when we fire. Both move the
+    // camera's position by a few centimetres and roll it, and neither turns
+    // it: the middle of the screen stays exactly where the next shot goes,
+    // which a pitch or yaw shake would quietly break.
+    const run = Math.min(1, this.moving / 7.4) * (held.grounded ? 1 : 0);
+    this.bobPhase += dt * (5 + 6 * run);
+    const bobY = -Math.abs(Math.sin(this.bobPhase)) * 0.045 * run;
+    const bobX = Math.cos(this.bobPhase) * 0.025 * run;
+    this.shake -= this.shake * Math.min(1, dt * 18);
+    const jx = (Math.random() - 0.5) * 0.03 * this.shake;
+    const jy = (Math.random() - 0.5) * 0.03 * this.shake;
+    const cy = Math.cos(eye.yaw);
+    const sy = Math.sin(eye.yaw);
+    this.camera.position.set(
+      eye.x + (bobX + jx) * cy,
+      eye.y + EYE_HEIGHT + bobY + jy,
+      eye.z - (bobX + jx) * sy,
+    );
+    this.camera.rotation.set(
+      eye.pitch, eye.yaw,
+      Math.cos(this.bobPhase) * 0.006 * run + (Math.random() - 0.5) * 0.02 * this.shake,
+    );
 
     // Horizontal speed off the drawn eye, smoothed, for the bob. A respawn is
     // a jump of many blocks in one frame and is ignored.

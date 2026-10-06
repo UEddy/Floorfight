@@ -38,6 +38,7 @@ import {
 import { saltSeeds } from "../../shared/weapons";
 import { fromHex } from "../../shared/sha256";
 import {
+  LOG_VERSION,
   canonicalise,
   decanonicalise,
   standingsFrom,
@@ -134,6 +135,13 @@ async function main(): Promise<void> {
   console.log(`map      ${log.map}`);
   console.log(`players  ${log.roster.length}`);
   console.log(`ticks    ${log.ticks.length}`);
+
+  if (log.v !== LOG_VERSION) {
+    throw new Error(
+      `the log is version ${log.v}, this build replays version ${LOG_VERSION}. ` +
+      "The rules changed between them; check out a commit from that version and run this again.",
+    );
+  }
 
   if (log.map !== MAP_ID) {
     throw new Error(

@@ -13,6 +13,7 @@ import path from "node:path";
 import {
   EYE_HEIGHT,
   GRAVITY,
+  GROUND_ACCEL,
   GRID_X,
   GRID_Y,
   GRID_Z,
@@ -23,6 +24,7 @@ import {
   LEVEL_STAGE,
   MAX_HP,
   PLAYER_HEIGHT,
+  PLAYER_SPEED,
   RESPAWN_TICKS,
   ROUND_TICKS,
   SPAWNS,
@@ -34,6 +36,7 @@ import {
   createWorld,
   onGround,
   rayGrid,
+  shotSpread,
   solidAt,
   step,
   supportTop,
@@ -289,6 +292,42 @@ test("supportTop and onGround agree with the grid", () => {
     assert.ok(onGround(s.x, s.y, s.z));
     assert.ok(!boxBlocked(s.x, s.y, s.z), "spawn should not be inside a block");
   }
+});
+
+/* ------------------------------------------------------- acceleration --- */
+
+test("running accelerates to full speed in a few ticks, and stops the same way", () => {
+  const w = createWorld(1);
+  const p = w.players[0];
+  // Spawn 0 faces a clear run east along its aisle.
+  const east = (YAW_UNITS * 3) / 4;
+  run(w, 0, input({ moveY: 127, yaw: east }), 1);
+  const first = Math.hypot(p.vx, p.vz);
+  assert.ok(Math.abs(first - GROUND_ACCEL / TICK_HZ) < 1e-9, `first tick gave ${first}`);
+  run(w, 0, input({ moveY: 127, yaw: east }), 7);
+  assert.ok(Math.abs(Math.hypot(p.vx, p.vz) - PLAYER_SPEED) < 1e-9, "should be at full speed");
+  run(w, 0, input({ yaw: east }), 3);
+  const slowing = Math.hypot(p.vx, p.vz);
+  assert.ok(slowing > 0 && slowing < PLAYER_SPEED, `should be slowing, at ${slowing}`);
+  run(w, 0, input({ yaw: east }), 6);
+  assert.equal(Math.hypot(p.vx, p.vz), 0, "should have stopped");
+});
+
+test("a wall takes the velocity on the axis it blocks", () => {
+  const w = createWorld(1);
+  const p = w.players[0];
+  run(w, 0, input({ moveX: -127, yaw: 0 }), 600);
+  assert.equal(p.vx, 0, "pressing into the west wall should leave no stored run");
+});
+
+test("spread is the base standing still, and opens with speed, air and a string of shots", () => {
+  const rifle = WEAPONS[W_RIFLE];
+  assert.equal(shotSpread(rifle, 0, 0, true, 0), rifle.spread);
+  assert.equal(shotSpread(rifle, PLAYER_SPEED, 0, true, 0), rifle.spread + rifle.moveSpread);
+  assert.equal(shotSpread(rifle, 0, 0, false, 0), rifle.spread + rifle.moveSpread);
+  assert.equal(shotSpread(rifle, 0, 0, true, 999), rifle.spread + rifle.bloomMax);
+  const shotgun = WEAPONS[W_SHOTGUN];
+  assert.equal(shotSpread(shotgun, PLAYER_SPEED, 0, false, 5), shotgun.spread, "the pattern is the spread");
 });
 
 /* ----------------------------------------------------------- hitscan --- */

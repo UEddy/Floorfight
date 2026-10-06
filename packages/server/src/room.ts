@@ -17,6 +17,7 @@ import {
   standingsFrom,
   type MatchLog,
   type RosterEntry,
+  LOG_VERSION,
   type SnapshotPlayer,
   type Standing,
 } from "../../shared/protocol";
@@ -170,7 +171,7 @@ export class Room {
     this.fillWithBots = fillWithBots && kind === "free";
     this.fillAfterMs = kind === "free" ? fillAfterMs : 0;
     this.log = {
-      v: 4,
+      v: LOG_VERSION,
       matchId,
       map: MAP_ID,
       // Filled in at finish: the salt is a secret until the round is over.
@@ -510,6 +511,8 @@ export class Room {
       z: round3(p.z),
       e: round3(p.y),
       w: round3(p.vy),
+      u: round3(p.vx),
+      v: round3(p.vz),
       y: p.yaw,
       p: quantPitch(p.pitch < -PITCH_LIMIT ? -PITCH_LIMIT : p.pitch),
       h: p.hp,

@@ -14,7 +14,15 @@
 import type { HitEvent, Input } from "./sim";
 import { PITCH_LIMIT, YAW_UNITS } from "./sim";
 
-export const PROTOCOL_VERSION = 6;
+export const PROTOCOL_VERSION = 7;
+
+/**
+ * Version of the match log, which is also the version of the rules a replay
+ * has to run it under. Bumped when the simulation changes what the same
+ * inputs produce: 5 added horizontal acceleration and movement and bloom
+ * spread, so a v4 log replayed by this build would not reproduce its match.
+ */
+export const LOG_VERSION = 5;
 
 /** Abuse limits. Exceed any of these and the connection is closed. */
 export const MAX_MSG_BYTES = 4096;
@@ -122,6 +130,8 @@ export interface SnapshotPlayer {
              // renaming it now would silently swap two numbers of the same
              // type at every call site, so the new field got the new name.
   w: number; // vertical velocity
+  u: number; // horizontal velocity, x
+  v: number; // horizontal velocity, z
   y: number; // yaw units
   p: number; // pitch quantised
   h: number; // hp
@@ -135,12 +145,13 @@ export interface SnapshotPlayer {
 }
 
 /**
- * `w` is there for one reason: the local player's prediction replays its
- * unacknowledged inputs from the authoritative state, and with gravity and
- * jumping in the simulation that state now includes vertical velocity. Left
- * out, a reconcile in the middle of a jump would restart the arc from a
- * standstill and the camera would stutter at the top of every jump. It costs
- * a few bytes per player per snapshot and it is only ever read by its owner.
+ * `w`, `u` and `v` are there for one reason: the local player's prediction
+ * replays its unacknowledged inputs from the authoritative state, and with
+ * gravity, jumping and acceleration in the simulation that state includes
+ * velocity. Left out, a reconcile in the middle of a jump would restart the
+ * arc from a standstill, and one in the middle of a run would restart the
+ * run, and the camera would stutter at both. They cost a few bytes per player
+ * per snapshot and are only ever read by their owner.
  */
 
 export type ServerMsg =

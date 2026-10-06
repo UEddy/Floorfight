@@ -93,6 +93,10 @@ export class Predictor {
     // Vertical velocity has to come from the server too, or a correction in
     // mid-jump would restart the arc from rest. See SnapshotPlayer.w.
     p.vy = me.w;
+    // And horizontal velocity, for the same reason now that movement
+    // accelerates: without it a correction mid-run would start from rest.
+    p.vx = me.u;
+    p.vz = me.v;
     p.hp = me.h;
     // Weapon state is the server's too. Prediction strips the fire bit, so
     // without this the predicted magazine would never go down and the two

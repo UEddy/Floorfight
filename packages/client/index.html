@@ -27,11 +27,15 @@
       canvas { display: block; width: 100vw; height: 100vh; }
       .hud { position: fixed; pointer-events: none; }
 
-      #crosshair { left: 50%; top: 50%; width: 18px; height: 18px; margin: -9px 0 0 -9px; }
-      #crosshair::before, #crosshair::after { content: ""; position: absolute; background: var(--ink);
-        box-shadow: 0 0 2px #000; }
-      #crosshair::before { left: 8px; top: 0; width: 2px; height: 18px; }
-      #crosshair::after { top: 8px; left: 0; height: 2px; width: 18px; }
+      /* Four ticks round a dot. The gap is set from the sim's own spread for
+         the next shot, so the ticks open exactly as far as the shot will. */
+      #crosshair { left: 50%; top: 50%; width: 0; height: 0; --gap: 5px; }
+      #crosshair i, #crosshair::after { position: absolute; background: var(--ink); box-shadow: 0 0 2px #000; }
+      #crosshair::after { content: ""; width: 2px; height: 2px; left: -1px; top: -1px; }
+      #crosshair i:nth-child(1) { width: 2px; height: 8px; left: -1px; bottom: var(--gap); }
+      #crosshair i:nth-child(2) { width: 2px; height: 8px; left: -1px; top: var(--gap); }
+      #crosshair i:nth-child(3) { width: 8px; height: 2px; top: -1px; right: var(--gap); }
+      #crosshair i:nth-child(4) { width: 8px; height: 2px; top: -1px; left: var(--gap); }
 
       #hitmarker { left: 50%; top: 50%; width: 34px; height: 34px; margin: -17px 0 0 -17px; opacity: 0;
         transition: opacity 180ms ease-out; }
@@ -191,7 +195,7 @@
   <body>
     <canvas id="view"></canvas>
     <div id="tint" class="hud"><div id="respawn" class="hud"></div></div>
-    <div id="crosshair" class="hud"></div>
+    <div id="crosshair" class="hud"><i></i><i></i><i></i><i></i></div>
     <div id="hitmarker" class="hud"><i></i><i></i><i></i><i></i></div>
     <div id="timer" class="hud">3:00</div>
     <div id="top3" class="hud"></div>

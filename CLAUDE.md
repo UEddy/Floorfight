@@ -181,10 +181,17 @@ full quality, 31 draw calls. That scene was a fraction of the real game, so the
 headroom was real but unearned.
 
 The Hall replaces it and is counted, not measured: 16485 solid blocks reduce to
-36668 triangles once hidden faces are dropped, in 9 merged meshes, one per
-material. With the sign strip, the three instanced player meshes, the gun, the
-flash, the death chunks, the tracers and the remote muzzle flashes, that is
-around 19 draw calls, and it does not grow with the map.
+36668 triangles once hidden faces are dropped, in one merged mesh that samples
+a single procedural texture atlas, with sky and lantern light baked into its
+vertex colours. With the sign strip, the sky dome, the glass roof, the props,
+the lantern glows, the instanced character parts, the view model, the death
+chunks, the tracers and the remote muzzle flashes, a six player frame is about
+23 draw calls and 51k triangles, read off the renderer by `npm run shots` in
+headless Chromium. It does not grow with the map or the player count.
+
+`npm run shots` in `packages/client` plays five seconds against bots and saves
+screenshots from fixed places in the Hall. Use it to look at a visual change
+before shipping it. Its frame rate is SwiftShader's and means nothing.
 
 Frame rate on device is still unmeasured, on either phone. `?debug=1` puts fps,
 the 1% low, draw calls, triangles and the server measured ping on screen, so
@@ -296,7 +303,7 @@ Flag these rather than deciding alone.
 ## Status
 
 Done: deterministic sim core with height, gravity, jumping and three weapons,
-block grid collision and grid hitscan, wire protocol v5, The Hall as authored
+block grid collision and grid hitscan, wire protocol v7 with horizontal acceleration and honest crosshair bloom, The Hall as authored
 map data identified by the hash of its own blocks, merged block renderer with
 hit feedback, damage numbers, death chunks, tracers and synthesized sound,
 touch controls, server tick loop and join handshake, free and staked room

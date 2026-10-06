@@ -42,7 +42,8 @@ import {
   solidAt,
 } from "./map";
 import {
-  FREE_SALT, SWITCH_TICKS, WEAPONS, WEAPON_COUNT, spreadHash, type SpreadSalt,
+  BLOOM_GAP, FREE_SALT, SWITCH_TICKS, WEAPONS, WEAPON_COUNT, spreadHash,
+  type SpreadSalt, type WeaponSpec,
 } from "./weapons";
 
 export {
@@ -56,6 +57,16 @@ export const TICK_MS = 1000 / TICK_HZ;
 export const SNAPSHOT_EVERY = 3; // 20 Hz on the wire
 
 export const PLAYER_SPEED = 7.4;
+
+/**
+ * How fast horizontal velocity turns towards what the stick asks for, in
+ * units per second squared. On the ground a player reaches full speed, or
+ * stops from it, in about seven ticks: quick enough to feel direct, slow
+ * enough that a strafe has weight. In the air there is far less grip, so a
+ * jump carries its run.
+ */
+export const GROUND_ACCEL = 64;
+export const AIR_ACCEL = 18;
 export const PLAYER_RADIUS = 0.45;
 export const EYE_HEIGHT = 1.7;
 
@@ -142,6 +153,10 @@ export interface PlayerState {
   y: number;   // feet height
   z: number;
   vy: number;  // vertical velocity, units per second
+  vx: number;  // horizontal velocity, units per second
+  vz: number;
+  /** Shots in the current unbroken string, for bloom. */
+  streak: number;
   yaw: number;   // integer units
   pitch: number; // radians, clamped
   hp: number;
@@ -228,7 +243,7 @@ export function fullMags(): number[] {
 export function newPlayer(id: number, slot: number): PlayerState {
   const s = SPAWNS[slot % SPAWNS.length];
   return {
-    id, x: s.x, y: s.y, z: s.z, vy: 0, yaw: 0, pitch: 0,
+    id, x: s.x, y: s.y, z: s.z, vy: 0, vx: 0, vz: 0, streak: 0, yaw: 0, pitch: 0,
     hp: MAX_HP, kills: 0, deaths: 0, alive: true,
     respawnAt: 0, lastFireTick: -999, lastInputTick: -1,
     weapon: 0, ammo: fullMags(), reloadUntil: 0, switchUntil: 0,
@@ -547,7 +562,8 @@ export function step(
     if (!p.alive) {
       if (tick >= p.respawnAt) {
         const s = SPAWNS[(slot + p.deaths) % SPAWNS.length];
-        p.x = s.x; p.y = s.y; p.z = s.z; p.vy = 0;
+        p.x = s.x; p.y = s.y; p.z = s.z; p.vy = 0; p.vx = 0; p.vz = 0;
+        p.streak = 0;
         p.hp = MAX_HP; p.alive = true;
         // Fresh magazines, and whatever weapon they died holding.
         p.ammo = fullMags();
@@ -588,15 +604,41 @@ export function step(
       if (wantJump) p.vy = JUMP_SPEED;
     }
 
+    // Turn the velocity towards the one asked for, by at most the
+    // acceleration for one tick. Square root, multiply and divide only, all
+    // exact under IEEE-754, so a replay reaches the same velocity to the bit.
     const s = sinU(p.yaw);
     const c = cosU(p.yaw);
-    const vx = (c * ax - s * ay) * PLAYER_SPEED * dt;
-    const vz = (-s * ax - c * ay) * PLAYER_SPEED * dt;
+    const wantX = (c * ax - s * ay) * PLAYER_SPEED;
+    const wantZ = (-s * ax - c * ay) * PLAYER_SPEED;
+    const dvx = wantX - p.vx;
+    const dvz = wantZ - p.vz;
+    const dv = Math.sqrt(dvx * dvx + dvz * dvz);
+    const maxDv = (ground ? GROUND_ACCEL : AIR_ACCEL) * dt;
+    if (dv <= maxDv) {
+      p.vx = wantX;
+      p.vz = wantZ;
+    } else {
+      p.vx += (dvx * maxDv) / dv;
+      p.vz += (dvz * maxDv) / dv;
+    }
+    const vx = p.vx * dt;
+    const vz = p.vz * dt;
 
-    // One step up per tick at most, whichever axis earns it.
+    // One step up per tick at most, whichever axis earns it. A move that a
+    // wall refuses loses its velocity on that axis, so letting go beside a
+    // wall does not leave a run stored up against it.
     let stepped = false;
-    if (vx !== 0) stepped = moveAxis(p, vx, 0, ground);
-    if (vz !== 0) moveAxis(p, 0, vz, ground && !stepped);
+    if (vx !== 0) {
+      const bx = p.x;
+      stepped = moveAxis(p, vx, 0, ground);
+      if (p.x === bx) p.vx = 0;
+    }
+    if (vz !== 0) {
+      const bz = p.z;
+      moveAxis(p, 0, vz, ground && !stepped);
+      if (p.z === bz) p.vz = 0;
+    }
 
     p.vy -= GRAVITY * dt;
     if (p.vy < -TERMINAL_FALL) p.vy = -TERMINAL_FALL;
@@ -678,7 +720,10 @@ export function step(
     }
 
     p.ammo[p.weapon]--;
+    // Bloom: a shot soon after the last one extends the string.
+    p.streak = tick - p.lastFireTick <= BLOOM_GAP ? p.streak + 1 : 0;
     p.lastFireTick = tick;
+    const spread = shotSpread(spec, p.vx, p.vz, onGround(p.x, p.y, p.z), p.streak);
 
     const view = clamp(inp!.view | 0, tick - MAX_REWIND, tick);
     const rewind = tick - view;
@@ -697,7 +742,7 @@ export function step(
       // root spreads the pattern evenly over the disc instead of bunching it
       // in the middle, and Math.sqrt is exact under IEEE-754.
       const ang = h & (YAW_UNITS - 1);
-      const off = Math.sqrt(((h >>> 13) & 1023) / 1023) * spec.spread;
+      const off = Math.sqrt(((h >>> 13) & 1023) / 1023) * spread;
       const yaw = (p.yaw + Math.round(off * cosU(ang)) + YAW_UNITS) % YAW_UNITS;
       // Clamped because the pitch limit sits below a quarter turn: without
       // this a pellet fired at full elevation could tip past vertical and
@@ -738,6 +783,25 @@ export function step(
   }
 
   world.tick = tick + 1;
+}
+
+/**
+ * The spread a shot actually gets, in yaw units: the weapon's base, plus its
+ * movement spread scaled by horizontal speed (all of it in the air), plus
+ * bloom for the shots before it in the same string.
+ *
+ * Exported because the client draws its crosshair from this same function,
+ * with its own predicted velocity, so the crosshair opens exactly as far as
+ * the server's spread does. A crosshair that bloomed while the real spread
+ * stayed put would be lying to the player about the one thing they aim with.
+ */
+export function shotSpread(
+  spec: WeaponSpec, vx: number, vz: number, grounded: boolean, streak: number,
+): number {
+  let moving = grounded ? Math.sqrt(vx * vx + vz * vz) / PLAYER_SPEED : 1;
+  if (moving > 1) moving = 1;
+  const bloom = streak * spec.bloom;
+  return spec.spread + spec.moveSpread * moving + (bloom > spec.bloomMax ? spec.bloomMax : bloom);
 }
 
 function clamp(v: number, lo: number, hi: number): number {

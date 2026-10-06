@@ -59,6 +59,17 @@ export class Hud {
     this.buildWeaponBar();
   }
 
+  private crossEl = document.getElementById("crosshair") as HTMLElement;
+  private crossGap = -1;
+
+  /** Open the crosshair to a gap, in CSS pixels from the centre. */
+  crosshair(gap: number): void {
+    const g = Math.round(gap * 2) / 2;
+    if (g === this.crossGap) return;
+    this.crossGap = g;
+    this.crossEl.style.setProperty("--gap", `${g}px`);
+  }
+
   setRoster(roster: RosterEntry[]): void {
     this.names = roster.map((r) => `P${r.slot + 1} ${shortWallet(r.wallet)}`);
   }

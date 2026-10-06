@@ -8,13 +8,15 @@ import {
   TICK_MS,
   createWorld,
   cosU,
+  onGround,
+  shotSpread,
   rayGrid,
   sinU,
   yawToRadians,
   type HitEvent,
   type Input,
 } from "../../shared/sim";
-import { WEAPONS } from "../../shared/weapons";
+import { BLOOM_GAP, WEAPONS } from "../../shared/weapons";
 import { fromHex, sha256Hex } from "../../shared/sha256";
 import { quantAxis, quantPitch, quantYaw, type SnapshotPlayer } from "../../shared/protocol";
 import { DEV_MATCH_ID } from "../../shared/dev";
@@ -74,6 +76,12 @@ let seq = 0;
 const sent: Input[] = [];
 let lastTickAt = 0;
 let lastFireSeq = -999;
+/**
+ * Our shots in the current string, counted the way the sim counts them, so
+ * the crosshair can show the bloom the server will apply to the next shot.
+ * Display only: the server keeps its own count and that is the one used.
+ */
+let myStreak = 0;
 let lastDrySeq = -999;
 let lastSnap: { tick: number; players: SnapshotPlayer[] } | null = null;
 let firstSnap: SnapshotPlayer[] | null = null;
@@ -401,6 +409,7 @@ function tick(now: number): void {
   // will use, from the ammo count the server last sent.
   if (wantsFire && myReload === 0 && seq - lastFireSeq >= spec.fireInterval) {
     if (myMag > 0) {
+      myStreak = seq - lastFireSeq <= BLOOM_GAP ? myStreak + 1 : 0;
       lastFireSeq = seq;
       stats.shots++;
       ownShot(now, spec.range);
@@ -419,7 +428,7 @@ function tick(now: number): void {
 /** Our own flash, tracer and report, drawn from where the camera is aiming. */
 function ownShot(now: number, range: number): void {
   if (!renderer || !predictor) return;
-  renderer.muzzleFlash();
+  renderer.muzzleFlash(myWeapon);
   sfx.shot(myWeapon, 0);
 
   const yaw = quantYaw(controls.intent.yaw);
@@ -444,6 +453,7 @@ setInterval(pump, 4);
 /* ---------------------------------------------------------- rendering --- */
 
 const plates: Plate[] = [];
+let crossGap = 0;
 
 /**
  * Dev builds only: a camera pose that replaces the predicted eye when drawing.
@@ -502,6 +512,14 @@ function frame(): void {
     alive: me.alive && !devCamera?.hideGun,
     grounded: me.vy === 0,
   });
+
+  // The crosshair opens to the spread the sim would give the next shot:
+  // the same function, our predicted velocity, and our count of the string
+  // of shots so far, which lapses the way the sim's does.
+  const streak = seq - lastFireSeq <= BLOOM_GAP ? myStreak + 1 : 0;
+  const units = shotSpread(spec, me.vx, me.vz, onGround(me.x, me.y, me.z), streak);
+  crossGap += (renderer.spreadPixels(units) - crossGap) * Math.min(1, dt * 20);
+  hud.crosshair(Math.max(3, crossGap));
 
   // Nameplates, after the draw so the camera matrices are current.
   plates.length = 0;

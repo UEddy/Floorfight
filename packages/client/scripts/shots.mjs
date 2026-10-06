@@ -116,15 +116,15 @@ async function main() {
   let heading = start ? Math.atan2(start.x, start.z) : 0;
   let last = start;
   const t0 = Date.now();
-  let shot = false;
-  while (Date.now() - t0 < 5000) {
-    // Taken part way through, while the bots have had less time to find us.
-    if (!shot && Date.now() - t0 > 2500) {
-      await page.screenshot({ path: join(OUT, "0-playing.png") });
-      shot = true;
-    }
+  // Five seconds, and then for as long as it takes to be alive and on the
+  // move for a second: the bots are quick, and a photograph of the death
+  // screen says nothing about the view model or the crosshair.
+  let aliveSince = 0;
+  while (Date.now() - t0 < 5000 || Date.now() - aliveSince < 1200) {
+    if (Date.now() - t0 > 20000) break;
     const t = (Date.now() - t0) / 1000;
     const me = await page.evaluate(() => window.arena.state().me);
+    if (!me?.alive) aliveSince = Date.now();
     if (me && last && Math.hypot(me.x - last.x, me.z - last.z) < 0.15) heading += 1.3;
     last = me;
     await page.evaluate(([h, t]) => {
@@ -133,6 +133,7 @@ async function main() {
     }, [heading, t]);
     await sleep(150);
   }
+  await page.screenshot({ path: join(OUT, "0-playing.png") });
   await page.evaluate(() => { window.arena.fire(false); window.arena.move(0, 0); });
 
   // The fixed views are for looking at the hall, so the death overlay, if the
