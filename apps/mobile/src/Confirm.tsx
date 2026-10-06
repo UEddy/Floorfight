@@ -20,9 +20,11 @@ export function Confirm(props: {
   if (!p) return null;
 
   const sol = (Number(p.lamports) / LAMPORTS_PER_SOL).toFixed(4);
-  const title = p.action === "join"
-    ? "Join this match"
-    : p.action === "claim" ? "Claim your payout" : "Refund your stake";
+  const title = p.action === "create"
+    ? "Create a match"
+    : p.action === "join"
+      ? "Join this match"
+      : p.action === "claim" ? "Claim your payout" : "Refund your stake";
   const line = p.direction === "pay"
     ? `You will stake ${sol} SOL`
     : `You will receive up to ${sol} SOL`;

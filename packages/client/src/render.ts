@@ -1,12 +1,6 @@
 import * as THREE from "three";
 import {
-  BODY_HALF_X,
-  BODY_HALF_Z,
-  BODY_TOP,
   EYE_HEIGHT,
-  HEAD_BOTTOM,
-  HEAD_HALF,
-  HEAD_TOP,
   YAW_UNITS,
   rayGrid,
 } from "../../shared/sim";
@@ -15,7 +9,6 @@ import {
   GRID_X,
   GRID_Y,
   GRID_Z,
-  MATERIAL_COUNT,
   M_BOOTH,
   M_BOOTH2,
   M_BRICK,
@@ -34,11 +27,17 @@ import {
   solidAt,
 } from "../../shared/map";
 import type { RemoteView } from "./netcode";
+import type { RosterEntry } from "../../shared/protocol";
+import { T, atlas, tileUV } from "./textures";
+import { ViewModel } from "./viewmodel";
+import { addProps } from "./props";
+import { SKY, SKY_FLOOR, WARM, lanternsSeenFrom, skyAt, warmAt } from "./lighting";
+import { Characters, HAIR, SKIN, scheme } from "./characters";
 
 /** Chunks a body bursts into, and how many the pool holds. */
-const CHUNKS_PER_DEATH = 26;
+const CHUNKS_PER_DEATH = 34;
 const CHUNK_POOL = CHUNKS_PER_DEATH * 6;
-const CHUNK_LIFE = 1.6;
+const CHUNK_LIFE = 2.2;
 
 /** Tracers alive at once, and how long one lasts. */
 const TRACER_POOL = 24;
@@ -50,6 +49,8 @@ interface Chunk {
   rx: number; ry: number;
   life: number;
   colour: THREE.Color;
+  /** Scale of this chunk against the base cube. */
+  size: number;
 }
 
 interface Tracer {
@@ -58,39 +59,31 @@ interface Tracer {
   life: number;
 }
 
+/** Vertical field of view, in degrees. */
+const FOV = 85;
+
 export const SLOT_COLORS = [0xff4d3d, 0x3da5ff, 0x4fe08a, 0xffd23a, 0xc46bff, 0x2fe0d6];
 
 /**
  * The Hall, in blocks.
  *
- * Saturated flat colour, no textures on the geometry, and all the light baked
- * into vertex colours at build time: a face angle term so edges read, plus
- * corner occlusion so the lanes between booths have depth. Nothing in the
- * scene is lit at runtime, which is why the whole hall costs one draw call per
- * material.
+ * Every block face samples one 16 pixel tile out of a single atlas (see
+ * textures.ts), and all the light is baked into vertex colours at build time:
+ * a face angle term so edges read, plus corner occlusion so the lanes between
+ * booths have depth. Nothing in the scene is lit at runtime, and because every
+ * material now shares the one atlas, the whole hall is a single draw call.
  *
  * Draw call budget (CLAUDE.md says under 150, and the floor is a Galaxy S10):
- *   up to 9 merged material meshes, 1 sign strip, 3 instanced player meshes,
- *   a gun and a muzzle flash. Around 15, and it does not grow with the size
- *   of the map.
+ *   1 hall mesh, 1 sign strip, 3 instanced player meshes, a gun and a muzzle
+ *   flash, the death chunks, the tracers and remote muzzle flashes. Around
+ *   ten, and it does not grow with the size of the map.
  */
-const PALETTE: Record<number, number> = {
-  [M_FLOOR]: 0xb5652f,
-  [M_BRICK]: 0x9e2b3c,
-  [M_BOOTH]: 0x18907d,
-  [M_BOOTH2]: 0xe0a21c,
-  [M_STAIR]: 0xf2602c,
-  [M_GALLERY]: 0x2f6ddf,
-  [M_IRON]: 0x37456b,
-  [M_STAGE]: 0x7b2fa0,
-  [M_TRIM]: 0xffc426,
-};
 
 /** Per face brightness. Flat colour with no angle term reads as a fog bank. */
-const FACE_SHADE = [0.74, 0.74, 1.0, 0.42, 0.86, 0.86]; // +x -x +y -y +z -z
+const FACE_SHADE = [0.78, 0.78, 1.0, 0.5, 0.9, 0.9]; // +x -x +y -y +z -z
 
 /** Vertex brightness by how many of its three neighbours are solid. */
-const AO_SHADE = [1.0, 0.82, 0.66, 0.5];
+const AO_SHADE = [1.0, 0.8, 0.64, 0.48];
 
 /**
  * The six faces, as an outward normal and two in-plane axes chosen so that
@@ -118,46 +111,143 @@ function occludes(ix: number, iy: number, iz: number): boolean {
   return solidAt(ix, iy, iz);
 }
 
+/** Cheap integer hash for picking tile variants. Cosmetic only. */
+function cellHash(ix: number, iy: number, iz: number): number {
+  let h = (ix * 73856093) ^ (iy * 19349663) ^ (iz * 83492791);
+  h = Math.imul(h ^ (h >>> 13), 0x5bd1e995);
+  return (h ^ (h >>> 15)) >>> 0;
+}
+
+/** Floor columns and rows that are lanes between the booth bays. */
+const LANE_X = new Set([14, 15, 21, 22, 28, 29, 35, 36]);
+const LANE_Z = new Set([15, 21, 22, 28, 29, 35, 36]);
+
+const isIron = (ix: number, iy: number, iz: number) => blockAt(ix, iy, iz) === M_IRON;
+
 /**
- * Build one merged mesh per material.
+ * Which tile a face shows. `f` is the face index: 2 is the top, 3 the bottom,
+ * anything else a side.
+ */
+function tileFor(m: number, f: number, ix: number, iy: number, iz: number): number {
+  const top = f === 2;
+  const bottom = f === 3;
+  const h = cellHash(ix, iy, iz);
+  switch (m) {
+    case M_FLOOR:
+      if (!top) return T.STONE;
+      // Carpet runners down the aisles, the way an exhibition lays them, and
+      // bare boards under and round the booths.
+      if (LANE_X.has(ix) || LANE_Z.has(iz)) return h % 5 === 0 ? T.CARPET_WORN : T.CARPET;
+      return h % 3 === 0 ? T.PLANK_WORN : T.PLANK;
+    case M_BRICK:
+      if (top || bottom) return T.STONE_CAP;
+      // A plinth of cut stone at the foot of every wall, brick above it, and
+      // damp moss only near the floor.
+      if (iy <= 1) return T.STONE;
+      return iy <= 4 && h % 4 === 0 ? T.BRICK_MOSS : T.BRICK;
+    case M_BOOTH: {
+      if (top || bottom) return T.CANVAS;
+      return ((ix / 7) | 0) % 2 === 0 ? T.FABRIC_A : T.FABRIC_A2;
+    }
+    case M_BOOTH2: {
+      if (top || bottom) return T.CANVAS;
+      if (iy >= 4) return T.FABRIC_B2;
+      return ((iz / 7) | 0) % 2 === 0 ? T.FABRIC_B : T.CRATE;
+    }
+    case M_STAIR:
+      return top ? T.STAIR : T.STAIR_SIDE;
+    case M_GALLERY:
+      return top || bottom ? T.DECK : T.DECK_SIDE;
+    case M_IRON: {
+      if (top || bottom) return T.IRON_TOP;
+      // One block thick is a truss and shows its lattice. Anything thicker is
+      // a pier and shows riveted plate.
+      const thin = (!isIron(ix - 1, iy, iz) && !isIron(ix + 1, iy, iz)) ||
+        (!isIron(ix, iy, iz - 1) && !isIron(ix, iy, iz + 1));
+      return thin ? T.IRON : T.IRON_RIVET;
+    }
+    case M_STAGE:
+      if (top || bottom) return T.STAGE_TOP;
+      return iy <= 4 ? T.VELVET : T.STAGE_TOP;
+    case M_TRIM:
+      if (top || bottom) return T.TRIM_TOP;
+      // Stacked trim is a gallery pier, a column rather than a balustrade.
+      return blockAt(ix, iy + 1, iz) === M_TRIM || blockAt(ix, iy - 1, iz) === M_TRIM
+        ? T.COLUMN : T.TRIM;
+    default:
+      return T.STONE;
+  }
+}
+
+/**
+ * Texture coordinate across a side face, so that u runs left to right for a
+ * viewer standing in front of it and v always runs up. Without this half the
+ * walls in the hall would show their bricks lying on their side.
+ */
+function faceUV(f: number, lx: number, ly: number, lz: number): [number, number] {
+  switch (f) {
+    case 0: return [1 - lz, ly];
+    case 1: return [lz, ly];
+    case 4: return [lx, ly];
+    case 5: return [1 - lx, ly];
+    default: return [lx, 1 - lz];
+  }
+}
+
+/**
+ * Build the hall as one merged mesh.
  *
  * Only faces with air on the far side are emitted, which throws away every
  * interior face in the hall: the piers, the walls and the booth masses are
  * solid runs of cells and only their skins survive. That is the difference
  * between about sixty thousand triangles and about a million.
  */
-function buildGrid(): THREE.Mesh[] {
-  const pos: number[][] = [];
-  const col: number[][] = [];
-  for (let m = 0; m < MATERIAL_COUNT; m++) { pos.push([]); col.push([]); }
+function buildGrid(): THREE.Mesh {
+  const P: number[] = [];
+  const C: number[] = [];
+  const U: number[] = [];
 
   for (let iy = 0; iy < GRID_Y; iy++) {
     for (let iz = 0; iz < GRID_Z; iz++) {
       for (let ix = 0; ix < GRID_X; ix++) {
         const m = blockAt(ix, iy, iz);
         if (m === AIR) continue;
-        const base = new THREE.Color(PALETTE[m] ?? 0xcccccc);
         const ox = blockMinX(ix);
         const oz = blockMinZ(iz);
-        const P = pos[m];
-        const C = col[m];
 
         for (let f = 0; f < 6; f++) {
           const { n, a, b } = FACES[f];
           if (occludes(ix + n[0], iy + n[1], iz + n[2])) continue;
           const shade = FACE_SHADE[f];
+          const [u0, v0, u1, v1] = tileUV(tileFor(m, f, ix, iy, iz));
 
-          // Position and brightness of the four corners, then two triangles.
+          // Light for this face: how much sky the air cell in front of it
+          // sees, and which lanterns it can see from its centre.
+          const fcx = ox + 0.5 + n[0] * 0.5;
+          const fcy = iy + 0.5 + n[1] * 0.5;
+          const fcz = oz + 0.5 + n[2] * 0.5;
+          const sky = SKY_FLOOR + (1 - SKY_FLOOR) *
+            skyAt(fcx + n[0] * 0.45, fcy + n[1] * 0.45, fcz + n[2] * 0.45);
+          const seen = lanternsSeenFrom(fcx, fcy, fcz, n[0], n[1], n[2]);
+
+          // Position, brightness and texture coordinate of the four corners,
+          // then two triangles.
           const vx: number[] = [];
           const vy: number[] = [];
           const vz: number[] = [];
           const vk: number[] = [];
+          const vu: number[] = [];
+          const vv: number[] = [];
           for (const [sa, sb] of CORNERS) {
             const ha = sa - 0.5;
             const hb = sb - 0.5;
-            vx.push(0.5 + 0.5 * n[0] + a[0] * ha + b[0] * hb);
-            vy.push(0.5 + 0.5 * n[1] + a[1] * ha + b[1] * hb);
-            vz.push(0.5 + 0.5 * n[2] + a[2] * ha + b[2] * hb);
+            const lx = 0.5 + 0.5 * n[0] + a[0] * ha + b[0] * hb;
+            const ly = 0.5 + 0.5 * n[1] + a[1] * ha + b[1] * hb;
+            const lz = 0.5 + 0.5 * n[2] + a[2] * ha + b[2] * hb;
+            vx.push(lx); vy.push(ly); vz.push(lz);
+            const [tu, tv] = faceUV(f, lx, ly, lz);
+            vu.push(u0 + (u1 - u0) * tu);
+            vv.push(v0 + (v1 - v0) * tv);
 
             const du = sa ? 1 : -1;
             const dv = sb ? 1 : -1;
@@ -169,31 +259,37 @@ function buildGrid(): THREE.Mesh[] {
               sy + a[1] * du + b[1] * dv,
               sz + a[2] * du + b[2] * dv,
             ) ? 1 : 0;
-            vk.push(shade * AO_SHADE[s1 && s2 ? 3 : s1 + s2 + cc]);
+            const ao = AO_SHADE[s1 && s2 ? 3 : s1 + s2 + cc];
+            const base = shade * ao * sky;
+            const warm = seen.length ? warmAt(ox + lx, iy + ly, oz + lz, seen) * (0.4 + 0.6 * ao) : 0;
+            vk.push(
+              base * SKY[0] + warm * WARM[0],
+              base * SKY[1] + warm * WARM[1],
+              base * SKY[2] + warm * WARM[2],
+            );
           }
           for (const i of TRIS) {
             P.push(ox + vx[i], iy + vy[i], oz + vz[i]);
-            C.push(base.r * vk[i], base.g * vk[i], base.b * vk[i]);
+            C.push(vk[i * 3], vk[i * 3 + 1], vk[i * 3 + 2]);
+            U.push(vu[i], vv[i]);
           }
         }
       }
     }
   }
 
-  const meshes: THREE.Mesh[] = [];
-  for (let m = 0; m < MATERIAL_COUNT; m++) {
-    if (pos[m].length === 0) continue;
-    const g = new THREE.BufferGeometry();
-    g.setAttribute("position", new THREE.Float32BufferAttribute(pos[m], 3));
-    g.setAttribute("color", new THREE.Float32BufferAttribute(col[m], 3));
-    g.computeBoundingSphere();
-    // Flat, unlit, vertex coloured. The shading is already in the colours, so
-    // there is no normal attribute and no light to evaluate per fragment.
-    const mesh = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ vertexColors: true, fog: true }));
-    mesh.frustumCulled = false;
-    meshes.push(mesh);
-  }
-  return meshes;
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(P, 3));
+  g.setAttribute("color", new THREE.Float32BufferAttribute(C, 3));
+  g.setAttribute("uv", new THREE.Float32BufferAttribute(U, 2));
+  g.computeBoundingSphere();
+  // Unlit and vertex coloured. The shading is already in the colours, so
+  // there is no normal attribute and no light to evaluate per fragment.
+  const mesh = new THREE.Mesh(
+    g, new THREE.MeshBasicMaterial({ map: atlas(), vertexColors: true, fog: true }),
+  );
+  mesh.frustumCulled = false;
+  return mesh;
 }
 
 /**
@@ -282,19 +378,40 @@ function buildSigns(): THREE.Mesh | null {
 }
 
 /**
- * Player meshes are drawn at exactly the sim's hitbox sizes. What you see is
- * what the server tests, so a shot that lands on a drawn body is a shot that
- * lands on the server's body at the rewound tick.
+ * Player bodies are drawn inside the sim's hitboxes at any facing (see
+ * characters.ts), so a shot that lands on a drawn body is a shot that lands
+ * on the server's body at the rewound tick.
  */
 export class Renderer {
   readonly renderer: THREE.WebGLRenderer;
   readonly camera: THREE.PerspectiveCamera;
   private scene = new THREE.Scene();
-  private bodies: THREE.InstancedMesh;
-  private heads: THREE.InstancedMesh;
-  private visors: THREE.InstancedMesh;
-  private flash: THREE.Mesh;
-  private flashUntil = 0;
+  private people: Characters;
+  private view = new ViewModel();
+  private lastEye = { x: 0, z: 0 };
+  private moving = 0;
+  private bobPhase = 0;
+
+  /*
+   * Dynamic resolution.
+   *
+   * Smooth matters more than sharp. A phone that cannot hold 60 frames a
+   * second at its native resolution stutters, and a stutter is felt in the
+   * aim far more than a few fewer pixels are seen. So the renderer watches
+   * its own frame times and trades resolution for frame rate: down a step
+   * when the last second averaged under 55 fps, back up a step after three
+   * good seconds in a row. Changing the ratio reallocates the drawing
+   * buffer, which costs a frame, so it never changes more than once every
+   * two seconds.
+   */
+  private ratio = 1;
+  private maxRatio = 1;
+  private frameSum = 0;
+  private frameCount = 0;
+  private goodSeconds = 0;
+  private lastRatioChange = 0;
+  private static readonly MIN_RATIO = 0.6;
+  private shake = 0;
   private chunks: THREE.InstancedMesh;
   private chunkState: Chunk[] = [];
   private tracers: THREE.LineSegments;
@@ -307,55 +424,36 @@ export class Renderer {
   private q = new THREE.Quaternion();
   private e = new THREE.Euler();
   private v = new THREE.Vector3();
-  private one = new THREE.Vector3(1, 1, 1);
   private scratch = new THREE.Vector3(1, 1, 1);
   private hidden = new THREE.Matrix4().makeScale(0, 0, 0);
 
   constructor(canvas: HTMLCanvasElement, private slots: number) {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
-    this.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    // Start a phone at a resolution it can usually hold, and let the scaler
+    // below move it from there. A desktop starts at its full ratio, capped.
+    this.maxRatio = Math.min(devicePixelRatio, 2);
+    this.ratio = matchMedia("(pointer: coarse)").matches ? Math.min(this.maxRatio, 1.5) : this.maxRatio;
+    this.renderer.setPixelRatio(this.ratio);
     this.renderer.shadowMap.enabled = false;
 
-    // Gaslight haze. It also hides the far wall of a 48 block hall, which is
-    // the cheapest way to keep the depth readable without a shadow in sight.
-    const air = 0x2a2230;
-    this.scene.background = new THREE.Color(air);
-    this.scene.fog = new THREE.Fog(air, 22, 62);
+    // Dusk haze, the colour of the sky low down through the glass. It softens
+    // the far end of a 48 block hall, which is the cheapest way to keep depth
+    // readable without a shadow in sight. The sky itself is a dome in props.
+    this.scene.fog = new THREE.Fog(0x4b3a66, 14, 62);
 
-    this.camera = new THREE.PerspectiveCamera(75, 1, 0.05, 140);
+    this.camera = new THREE.PerspectiveCamera(FOV, 1, 0.05, 140);
     this.camera.rotation.order = "YXZ";
     this.scene.add(this.camera);
 
-    for (const mesh of buildGrid()) this.scene.add(mesh);
+    this.scene.add(buildGrid());
+    addProps(this.scene);
     const signs = buildSigns();
     if (signs) this.scene.add(signs);
 
-    // Players: body, head and a visor so facing is readable at range. One
-    // lambert pair for all of them, lit by a hemisphere light only, because
-    // these are the only objects in the scene that move.
+    // Players. The hemisphere light is only for the death chunks, which
+    // tumble, so a baked face shade would be wrong half the time.
     this.scene.add(new THREE.HemisphereLight(0xfff0d0, 0x40304a, 2.1));
-    const mat = new THREE.MeshLambertMaterial();
-    this.bodies = new THREE.InstancedMesh(
-      new THREE.BoxGeometry(BODY_HALF_X * 2, BODY_TOP, BODY_HALF_Z * 2).translate(0, BODY_TOP / 2, 0),
-      mat, slots);
-    this.heads = new THREE.InstancedMesh(
-      new THREE.BoxGeometry(HEAD_HALF * 2, HEAD_TOP - HEAD_BOTTOM, HEAD_HALF * 2)
-        .translate(0, (HEAD_BOTTOM + HEAD_TOP) / 2, 0),
-      mat, slots);
-    this.visors = new THREE.InstancedMesh(
-      new THREE.BoxGeometry(HEAD_HALF * 1.6, 0.12, 0.06).translate(0, HEAD_BOTTOM + 0.3, -HEAD_HALF - 0.02),
-      new THREE.MeshBasicMaterial({ color: 0x111111 }),
-      slots);
-    for (let i = 0; i < slots; i++) {
-      const c = new THREE.Color(SLOT_COLORS[i % SLOT_COLORS.length]);
-      this.bodies.setColorAt(i, c);
-      this.heads.setColorAt(i, c.clone().multiplyScalar(1.15));
-    }
-    for (const mesh of [this.bodies, this.heads, this.visors]) {
-      mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-      mesh.frustumCulled = false;
-      this.scene.add(mesh);
-    }
+    this.people = new Characters(this.scene, slots);
 
     // Death chunks: one instanced mesh for every body that has ever burst.
     // Purely cosmetic, so this is the one place in the client that may use
@@ -395,20 +493,12 @@ export class Renderer {
     }
     this.scene.add(this.muzzles);
 
-    // First person gun and muzzle flash, parented to the camera.
-    const gun = new THREE.Mesh(
-      new THREE.BoxGeometry(0.045, 0.06, 0.3),
-      new THREE.MeshBasicMaterial({ color: 0x241f1a }),
-    );
-    gun.position.set(0.16, -0.15, -0.42);
-    this.camera.add(gun);
-    this.flash = new THREE.Mesh(
-      new THREE.SphereGeometry(0.035, 8, 6),
-      new THREE.MeshBasicMaterial({ color: 0xffe08a }),
-    );
-    this.flash.position.set(0.16, -0.13, -0.6);
-    this.flash.visible = false;
-    this.camera.add(this.flash);
+    // The hall, then the view model on top of it with depth cleared. Two
+    // render calls, so the clear between them is ours to make.
+    this.renderer.autoClear = false;
+    // Counted over the whole frame rather than per render call, so the debug
+    // overlay's draw call figure covers both passes.
+    this.renderer.info.autoReset = false;
 
     this.resize();
     addEventListener("resize", () => this.resize());
@@ -420,10 +510,33 @@ export class Renderer {
     this.renderer.setSize(w, h, false);
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
+    this.view.resize(w / h);
   }
 
-  muzzleFlash(nowMs: number): void {
-    this.flashUntil = nowMs + 50;
+  /** Our own shot: the view model kicks and flashes, the camera shakes. */
+  muzzleFlash(weapon: number): void {
+    this.view.fired();
+    this.shake = Math.min(1, this.shake + (weapon === 2 ? 0.9 : weapon === 1 ? 0.5 : 0.3));
+  }
+
+  /**
+   * Screen pixels from the centre for an aim deviation in yaw units, at the
+   * current field of view. The crosshair is drawn with this.
+   */
+  spreadPixels(units: number): number {
+    const angle = (units / YAW_UNITS) * Math.PI * 2;
+    const half = (this.camera.fov * Math.PI) / 360;
+    return (Math.tan(angle) / Math.tan(half)) * (innerHeight / 2);
+  }
+
+  /** Faces from the roster: verified NFT images, or the default face. */
+  setRoster(roster: readonly RosterEntry[]): void {
+    this.people.setFaces(roster);
+  }
+
+  /** The local player's colour, for the sleeves. */
+  setLocalSlot(slot: number): void {
+    this.view.setSleeve(SLOT_COLORS[slot % SLOT_COLORS.length]);
   }
 
   /** Somebody else fired: show a flash at their hands for a moment. */
@@ -440,8 +553,12 @@ export class Renderer {
    * told to anyone.
    */
   burst(x: number, y: number, z: number, slot: number): void {
-    const colour = new THREE.Color(SLOT_COLORS[slot % SLOT_COLORS.length]);
+    // Coloured like the body they came from: mostly shirt, then trousers,
+    // skin, hair and a little of the cap.
+    const s = scheme(slot);
+    const palette = [s.shirt, s.shirt, s.shirt, s.trousers, s.trousers, SKIN, SKIN, HAIR, s.cap];
     for (let i = 0; i < CHUNKS_PER_DEATH; i++) {
+      const colour = new THREE.Color(palette[Math.floor(Math.random() * palette.length)]);
       if (this.chunkState.length >= CHUNK_POOL) this.chunkState.shift();
       const up = 2.5 + Math.random() * 4.5;
       this.chunkState.push({
@@ -457,7 +574,8 @@ export class Renderer {
         // Carried on the chunk rather than written straight into the
         // instance: chunks expire out of the middle of the pool, so the
         // instance a chunk occupies changes during its life.
-        colour: colour.clone().multiplyScalar(0.7 + Math.random() * 0.5),
+        colour: colour.multiplyScalar(0.75 + Math.random() * 0.4),
+        size: 0.6 + Math.random() * 0.8,
       });
     }
   }
@@ -535,7 +653,7 @@ export class Renderer {
       this.chunks.setColorAt(i, c.colour);
       const spin = (CHUNK_LIFE - c.life) * 3;
       this.e.set(c.rx + spin, c.ry + spin, 0);
-      const fade = c.life < 0.35 ? c.life / 0.35 : 1;
+      const fade = (c.life < 0.35 ? c.life / 0.35 : 1) * c.size;
       this.m.compose(
         this.v.set(c.x, c.y, c.z),
         this.q.setFromEuler(this.e),
@@ -571,6 +689,33 @@ export class Renderer {
     this.muzzles.instanceMatrix.needsUpdate = true;
   }
 
+  /** The pixel ratio being rendered at, for the debug overlay. */
+  get pixelRatio(): number {
+    return this.ratio;
+  }
+
+  private scaleResolution(dt: number, nowMs: number): void {
+    if (dt <= 0 || dt > 0.25) return; // a tab switch or a stall, not a frame
+    this.frameSum += dt;
+    this.frameCount++;
+    if (this.frameSum < 1) return;
+    const fps = this.frameCount / this.frameSum;
+    this.frameSum = 0;
+    this.frameCount = 0;
+    if (fps >= 58) this.goodSeconds++;
+    else this.goodSeconds = 0;
+    if (nowMs - this.lastRatioChange < 2000) return;
+    let next = this.ratio;
+    if (fps < 55) next = Math.max(Renderer.MIN_RATIO, this.ratio - 0.2);
+    else if (this.goodSeconds >= 3) next = Math.min(this.maxRatio, this.ratio + 0.1);
+    if (Math.abs(next - this.ratio) < 0.01) return;
+    this.ratio = next;
+    this.lastRatioChange = nowMs;
+    this.goodSeconds = 0;
+    this.renderer.setPixelRatio(next);
+    this.renderer.setSize(innerWidth, innerHeight, false);
+  }
+
   /** Draw calls this frame, for the HUD's budget readout. */
   get drawCalls(): number {
     return this.renderer.info.render.calls;
@@ -586,50 +731,64 @@ export class Renderer {
     eye: { x: number; y: number; z: number; yaw: number; pitch: number },
     localSlot: number,
     remotes: Map<number, RemoteView>,
+    held: { weapon: number; reload: number | null; alive: boolean; grounded: boolean },
   ): void {
-    this.camera.position.set(eye.x, eye.y + EYE_HEIGHT, eye.z);
-    this.camera.rotation.set(eye.pitch, eye.yaw, 0);
-    this.flash.visible = nowMs < this.flashUntil;
-
-    const dt = this.lastDraw === 0 ? 0 : Math.min(0.1, (nowMs - this.lastDraw) / 1000);
+    const rawDt = this.lastDraw === 0 ? 0 : (nowMs - this.lastDraw) / 1000;
+    const dt = Math.min(0.1, rawDt);
     this.lastDraw = nowMs;
+    this.scaleResolution(rawDt, nowMs);
 
+    // Head bob while walking, and a shake when we fire. Both move the
+    // camera's position by a few centimetres and roll it, and neither turns
+    // it: the middle of the screen stays exactly where the next shot goes,
+    // which a pitch or yaw shake would quietly break.
+    const run = Math.min(1, this.moving / 7.4) * (held.grounded ? 1 : 0);
+    this.bobPhase += dt * (5 + 6 * run);
+    const bobY = -Math.abs(Math.sin(this.bobPhase)) * 0.045 * run;
+    const bobX = Math.cos(this.bobPhase) * 0.025 * run;
+    this.shake -= this.shake * Math.min(1, dt * 18);
+    const jx = (Math.random() - 0.5) * 0.03 * this.shake;
+    const jy = (Math.random() - 0.5) * 0.03 * this.shake;
+    const cy = Math.cos(eye.yaw);
+    const sy = Math.sin(eye.yaw);
+    this.camera.position.set(
+      eye.x + (bobX + jx) * cy,
+      eye.y + EYE_HEIGHT + bobY + jy,
+      eye.z - (bobX + jx) * sy,
+    );
+    this.camera.rotation.set(
+      eye.pitch, eye.yaw,
+      Math.cos(this.bobPhase) * 0.006 * run + (Math.random() - 0.5) * 0.02 * this.shake,
+    );
+
+    // Horizontal speed off the drawn eye, smoothed, for the bob. A respawn is
+    // a jump of many blocks in one frame and is ignored.
+    if (dt > 0) {
+      const v = Math.hypot(eye.x - this.lastEye.x, eye.z - this.lastEye.z) / dt;
+      if (v < 30) this.moving += (v - this.moving) * Math.min(1, dt * 12);
+    }
+    this.lastEye.x = eye.x;
+    this.lastEye.z = eye.z;
+    this.view.update(
+      dt, held.weapon, held.reload, this.moving, eye.yaw, eye.pitch, held.alive, held.grounded,
+    );
+
+    this.people.update(dt, remotes, localSlot);
     for (let i = 0; i < this.slots; i++) {
       const r = remotes.get(i);
-      if (i === localSlot || !r || !r.alive) {
-        this.bodies.setMatrixAt(i, this.hidden);
-        this.heads.setMatrixAt(i, this.hidden);
-        this.visors.setMatrixAt(i, this.hidden);
-        continue;
-      }
-      // Hitboxes in the sim are axis aligned and do not rotate with yaw. The
-      // body is drawn the same way so the silhouette is the hitbox. Only the
-      // visor turns, to show facing.
-      this.m.makeTranslation(r.x, r.y, r.z);
-      this.bodies.setMatrixAt(i, this.m);
-      this.heads.setMatrixAt(i, this.m);
-      this.e.set(0, (r.yaw / YAW_UNITS) * Math.PI * 2, 0);
-      this.m.compose(this.v.set(r.x, r.y, r.z), this.q.setFromEuler(this.e), this.one);
-      this.visors.setMatrixAt(i, this.m);
-
-      // Muzzle flash in front of the chest, on the side their gun is on.
-      if (nowMs < this.muzzleUntil[i]) {
-        const yaw = (r.yaw / YAW_UNITS) * Math.PI * 2;
-        const fx = -Math.sin(yaw);
-        const fz = -Math.cos(yaw);
-        this.m.makeTranslation(
-          r.x + fx * 0.55 - fz * 0.2,
-          r.y + 1.25,
-          r.z + fz * 0.55 + fx * 0.2,
-        );
+      // Muzzle flash at the end of their gun.
+      if (r && r.alive && i !== localSlot && nowMs < this.muzzleUntil[i]) {
+        this.people.muzzle(r, this.v);
+        this.m.makeTranslation(this.v.x, this.v.y, this.v.z);
         this.muzzles.setMatrixAt(i, this.m);
       }
     }
-    this.bodies.instanceMatrix.needsUpdate = true;
-    this.heads.instanceMatrix.needsUpdate = true;
-    this.visors.instanceMatrix.needsUpdate = true;
 
     this.advance(dt, nowMs);
+    this.renderer.info.reset();
+    this.renderer.clear();
     this.renderer.render(this.scene, this.camera);
+    this.renderer.clearDepth();
+    this.renderer.render(this.view.scene, this.view.camera);
   }
 }

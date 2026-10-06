@@ -34,6 +34,14 @@ import {
 import { canonicalise, standingsFrom, type MatchLog } from "../packages/shared/protocol";
 import { MAP_ID } from "../packages/shared/map";
 import { FREE_SALT_BYTES } from "../packages/shared/weapons";
+import { LOCK_BEFORE_DEADLINE, STAKE_TIERS } from "../packages/shared/tiers";
+import { lockDecision } from "../packages/server/src/lobby";
+import { lockInstruction, type ChainConfig } from "../packages/server/src/chainrpc";
+import {
+  claimIx as appClaimIx,
+  joinIx as appJoinIx,
+  planCreate,
+} from "../apps/mobile/src/escrow";
 import { toHex } from "../packages/shared/sha256";
 
 const ROOT = path.join(__dirname, "..");
@@ -585,5 +593,148 @@ describe("the server's settlement path", () => {
     expect(() => placementsFrom(standings.slice(0, 2), 3)).to.throw(/no place 3/);
     // And the data builder refuses a hash of the wrong size.
     expect(() => settleData([0, 1, 2], new Uint8Array(31))).to.throw(/32 bytes/);
+  });
+});
+
+describe("holders matches: app, lobby and resolver together", () => {
+  /**
+   * The server's lock instruction needs a ChainConfig. Only the program id and
+   * the resolver key are read to build it; the connection is never used.
+   */
+  function chainFor(h: Harness): ChainConfig {
+    return {
+      connection: new Connection("http://127.0.0.1:1"),
+      programId: PROGRAM_ID,
+      resolver: h.resolver,
+      rpcUrl: "http://127.0.0.1:1",
+    };
+  }
+
+  /** The app's own create transaction: create_match and join_match, one signature. */
+  function appCreate(h: Harness, creator: Keypair, tier: number, id: bigint) {
+    const planned = planCreate(tier, id);
+    h.ok(planned.build(creator.publicKey), [creator]);
+    return matchPda(id);
+  }
+
+  function decoded(h: Harness, m: PublicKey) {
+    return decodeMatch(Buffer.from(h.svm.getAccount(m)!.data));
+  }
+
+  function now(h: Harness): number {
+    return Number(h.svm.getClock().unixTimestamp);
+  }
+
+  it("the lobby's lock rule agrees with the program, on presence and on the deadline", async () => {
+    const h = await setup();
+    const a = h.funded();
+    const b = h.funded();
+    const m = appCreate(h, a, 0, 9001n);
+    let acc = decoded(h, m);
+    expect(acc.count).to.equal(1, "create also took the creator's seat");
+    expect(acc.stake.toString()).to.equal(STAKE_TIERS[0].lamports);
+
+    // One player: the rule waits, and the program agrees it cannot lock.
+    expect(lockDecision(acc, new Set([a.publicKey.toBase58()]), now(h))).to.equal("wait");
+    h.fails([lockInstruction(chainFor(h), 9001n)], [h.resolver], "BadPlayerCount");
+
+    h.ok([appJoinIx(b.publicKey, 9001n)], [b]);
+    acc = decoded(h, m);
+    // Two joined, one in the lobby, ten minutes left: wait.
+    expect(lockDecision(acc, new Set([a.publicKey.toBase58()]), now(h))).to.equal("wait");
+    // Inside the last minute: lock, present or not, and the program takes it.
+    h.warp(acc.joinDeadline - now(h) - LOCK_BEFORE_DEADLINE);
+    expect(lockDecision(acc, new Set([a.publicKey.toBase58()]), now(h))).to.equal("lock");
+    h.ok([lockInstruction(chainFor(h), 9001n)], [h.resolver]);
+    acc = decoded(h, m);
+    expect(acc.state).to.equal("Locked");
+    expect(lockDecision(acc, new Set(), now(h))).to.equal("open-room");
+  });
+
+  it("an expired lobby is one the program also refuses to lock", async () => {
+    const h = await setup();
+    const a = h.funded();
+    const b = h.funded();
+    const m = appCreate(h, a, 1, 9002n);
+    h.ok([appJoinIx(b.publicKey, 9002n)], [b]);
+    const acc = decoded(h, m);
+    h.warp(acc.joinDeadline - now(h) + 1);
+    expect(lockDecision(acc, new Set([a.publicKey.toBase58(), b.publicKey.toBase58()]), now(h)))
+      .to.equal("expired");
+    h.fails([lockInstruction(chainFor(h), 9002n)], [h.resolver], "DeadlinePassed");
+    // And both get their stake back through the app's claim instruction.
+    const before = h.balance(a.publicKey);
+    h.ok([appClaimIx(a.publicKey, 9002n)], [a]);
+    expect((h.balance(a.publicKey) - before).toString()).to.equal(STAKE_TIERS[1].lamports);
+  });
+
+  it("create, join, lock, settle and claim, end to end, as each part builds it", async () => {
+    const h = await setup();
+    const a = h.funded();
+    const b = h.funded();
+    const c = h.funded();
+    const stake = BigInt(STAKE_TIERS[2].lamports);
+
+    // The app creates and takes seat 0; two more join through the app.
+    const aBefore = h.balance(a.publicKey);
+    const m = appCreate(h, a, 2, 9003n);
+    h.ok([appJoinIx(b.publicKey, 9003n)], [b]);
+    h.ok([appJoinIx(c.publicKey, 9003n)], [c]);
+    let acc = decoded(h, m);
+    expect(acc.count).to.equal(3);
+
+    // Everyone is in the lobby: the server's rule says lock, and its
+    // instruction locks it.
+    const everyone = new Set([a, b, c].map((k) => k.publicKey.toBase58()));
+    expect(lockDecision(acc, everyone, now(h))).to.equal("lock");
+    h.ok([lockInstruction(chainFor(h), 9003n)], [h.resolver]);
+    acc = decoded(h, m);
+    expect(acc.state).to.equal("Locked");
+
+    // The room's roster is the account's, in slot order.
+    const roster = rosterFromMatch(acc);
+    expect(roster.map((r) => r.wallet)).to.deep.equal([a, b, c].map((k) => k.publicKey.toBase58()));
+
+    // The round ends with c first, a second, b third. The server settles.
+    const log: MatchLog = {
+      v: 5, matchId: "9003", map: MAP_ID, spreadSalt: toHex(FREE_SALT_BYTES),
+      roster, startedAt: 0, ticks: [], standings: [],
+    };
+    log.standings = standingsFrom(
+      [{ kills: 2, deaths: 1 }, { kills: 0, deaths: 3 }, { kills: 5, deaths: 0 }],
+      log.roster,
+    );
+    const hash = createHash("sha256").update(canonicalise(log)).digest();
+    const placements = placementsFrom(log.standings, acc.count);
+    expect(placements).to.deep.equal([2, 0, 1]);
+    h.ok([new TransactionInstruction({
+      programId: PROGRAM_ID,
+      keys: [
+        { pubkey: h.resolver.publicKey, isSigner: true, isWritable: false },
+        { pubkey: CONFIG, isSigner: false, isWritable: false },
+        { pubkey: m, isSigner: false, isWritable: true },
+      ],
+      data: settleData(placements, hash),
+    })], [h.resolver]);
+
+    // Each claims through the app's instruction and gets exactly 50/30/20.
+    const pot = stake * 3n;
+    const paid = (k: Keypair) => {
+      const before = h.balance(k.publicKey);
+      h.ok([appClaimIx(k.publicKey, 9003n)], [k]);
+      return h.balance(k.publicKey) - before;
+    };
+    expect(paid(c).toString()).to.equal((pot - (pot * 3000n) / 10000n - (pot * 2000n) / 10000n).toString());
+    expect(paid(a).toString()).to.equal(((pot * 3000n) / 10000n).toString());
+    expect(paid(b).toString()).to.equal(((pot * 2000n) / 10000n).toString());
+    // A second claim is refused.
+    h.fails([appClaimIx(a.publicKey, 9003n)], [a], "AlreadyClaimed");
+
+    // a staked, paid rent for the match account (fees are on the harness
+    // payer), and got second place back. The rent stays in the account,
+    // which the program keeps open as the on-chain half of the audit.
+    const rent = h.balance(m);
+    expect((h.balance(a.publicKey) - aBefore + stake + rent).toString())
+      .to.equal(((pot * 3000n) / 10000n).toString());
   });
 });

@@ -9,18 +9,26 @@
  *
  * The page sends intents. It never sends bytes.
  *
- * There are exactly two things it can ask for:
+ * There are exactly three things it can ask for:
  *
- *   1. signJoin   sign the join handshake for a match. The page supplies a
+ *   1. connect    authorise this app with the wallet and say which address
+ *                 it is. Nothing is signed. The page needs the address to
+ *                 show the person's NFTs and to know which results are theirs.
+ *
+ *   2. signJoin   sign the join handshake for a match. The page supplies a
  *                 match id and the nonce the server gave it. This side builds
  *                 the message string itself from a fixed template and refuses
  *                 to sign anything that does not match the pattern.
  *
- *   2. escrow     join, claim or refund for a match id. This side reads the
- *                 match account from the chain, builds the instruction from
- *                 the program IDL, decides for itself whether the action is
- *                 even possible, and shows the amount before the wallet is
- *                 opened.
+ *   3. escrow     create a match at a stake tier, or join, claim or refund a
+ *                 match id. For create the page sends a tier index and this
+ *                 side looks the amount up in its own fixed list, generates
+ *                 the match id itself, and builds create_match and join_match
+ *                 into one transaction. For the others it reads the match
+ *                 account from the chain. Either way it builds the
+ *                 instructions from the program IDL, decides for itself
+ *                 whether the action is possible, and shows the amount before
+ *                 the wallet is opened.
  *
  * There is deliberately no request that carries a transaction, a message, a
  * byte array, an instruction, an account list, a program id or a lamport
@@ -32,6 +40,7 @@
 import {
   MAX_PROTOCOL_VERSION,
   MIN_PROTOCOL_VERSION,
+  STAKE_TIERS,
 } from "./config";
 
 /* ------------------------------------------------------------ requests --- */
@@ -53,11 +62,30 @@ export interface EscrowRequest {
   matchId: string;
 }
 
-export type Request = SignJoinRequest | EscrowRequest;
+/** Create a match. A tier index into config.STAKE_TIERS, and nothing else. */
+export interface CreateRequest {
+  id: string;
+  t: "escrow";
+  action: "create";
+  tier: number;
+}
+
+export interface ConnectRequest {
+  id: string;
+  t: "connect";
+}
+
+export type Request = ConnectRequest | SignJoinRequest | EscrowRequest | CreateRequest;
 
 export type Reply =
+  | { id: string; ok: true; t: "connect"; wallet: string }
   | { id: string; ok: true; t: "signJoin"; wallet: string; signature: string }
-  | { id: string; ok: true; t: "escrow"; action: EscrowAction; signature: string }
+  | {
+      id: string; ok: true; t: "escrow"; action: EscrowAction | "create";
+      /** The match acted on. For create, the id this side generated. */
+      matchId: string;
+      signature: string;
+    }
   | { id: string; ok: false; error: string };
 
 /* ------------------------------------------------------------ patterns --- */
@@ -114,7 +142,7 @@ function str(v: unknown, re: RegExp, what: string): string {
 /**
  * Parse one message from the page.
  *
- * Throws Refused on anything that is not exactly one of the two requests.
+ * Throws Refused on anything that is not exactly one of the requests above.
  * There is no lenient path and no coercion: a field of the wrong type, an
  * unknown request type, an extra key, or a string that does not match its
  * pattern all end here.
@@ -152,6 +180,21 @@ export function parseRequest(raw: string): Request {
       matchId: str(o.matchId, MATCH_ID_RE, "matchId"),
       nonce: str(o.nonce, NONCE_RE, "nonce"),
     };
+  }
+
+  if (o.t === "connect") {
+    expectKeys(o, ["id", "t"]);
+    return { id, t: "connect" };
+  }
+
+  if (o.t === "escrow" && o.action === "create") {
+    // A tier, as a small integer index. Not an amount: the amount lives in
+    // config.ts, and an index that is not in the list is refused here.
+    expectKeys(o, ["id", "t", "action", "tier"]);
+    const tier = o.tier;
+    if (typeof tier !== "number" || !Number.isInteger(tier)) refuse("tier must be an integer");
+    if (tier < 0 || tier >= STAKE_TIERS.length) refuse("no such tier");
+    return { id, t: "escrow", action: "create", tier };
   }
 
   if (o.t === "escrow") {

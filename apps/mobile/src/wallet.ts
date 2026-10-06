@@ -45,6 +45,14 @@ async function authorize(wallet: Web3MobileWallet): Promise<Authorized> {
   return { address: account.address, publicKey: new PublicKey(bytes) };
 }
 
+/**
+ * Authorise with the wallet and return its address. Nothing is signed: this
+ * is the "connect" the page asks for before it shows a holder their NFTs.
+ */
+export async function connectWallet(): Promise<string> {
+  return transact(async (wallet) => (await authorize(wallet)).publicKey.toBase58());
+}
+
 /** The wallet this app last used, as a base58 address, or null. */
 export function currentWallet(): string | null {
   if (!lastAddress) return null;

@@ -40,6 +40,7 @@ function discriminator(kind: "instructions" | "accounts", name: string): Buffer 
 }
 
 const SETTLE_IX = discriminator("instructions", "settle");
+const LOCK_IX = discriminator("instructions", "lock_match");
 const MATCH_ACCOUNT = discriminator("accounts", "Match");
 
 /** Program constants, mirrored from programs/arena/src/lib.rs. */
@@ -85,6 +86,12 @@ export interface MatchAccount {
   state: MatchState;
   joinDeadline: number;
   settleDeadline: number;
+  /** Slot numbers in finishing order, NO_PLACE for unused. */
+  placements: number[];
+  /** Lamports paid for first, second and third. */
+  payouts: bigint[];
+  /** Bit i set once slot i has claimed. */
+  claimed: number;
   logHash: Uint8Array;
 }
 
@@ -123,6 +130,9 @@ export function decodeMatch(data: Buffer | Uint8Array): MatchAccount {
     state,
     joinDeadline: Number(b.readBigInt64LE(M.joinDeadline)),
     settleDeadline: Number(b.readBigInt64LE(M.settleDeadline)),
+    placements: [0, 1, 2].map((i) => b.readUInt8(M.placements + i)),
+    payouts: [0, 1, 2].map((i) => b.readBigUInt64LE(M.payouts + i * 8)),
+    claimed: b.readUInt8(M.claimed),
     logHash: Uint8Array.from(b.subarray(M.logHash, M.logHash + 32)),
   };
 }
@@ -187,4 +197,42 @@ export function settleData(placements: number[], logHash: Uint8Array): Buffer {
     if (!Number.isInteger(p) || p < 0 || p > 255) throw new Error(`placement ${p} is not a byte`);
   }
   return Buffer.concat([SETTLE_IX, Buffer.from(placements), Buffer.from(logHash)]);
+}
+
+/** Instruction data for lock_match: the discriminator, nothing else. */
+export function lockData(): Buffer {
+  return Buffer.from(LOCK_IX);
+}
+
+/**
+ * getProgramAccounts filters for the Open matches at one stake.
+ *
+ * Three filters, all of which the RPC node applies before anything is sent:
+ * the exact size of a Match account, the stake bytes, and the state byte. The
+ * discriminator is checked again when each result is decoded. Returned as
+ * plain data so this module still does not import web3.js.
+ */
+export function openMatchFilters(stake: bigint): {
+  dataSize: number; memcmp: { offset: number; bytes: string }[];
+} {
+  const le = Buffer.alloc(8);
+  le.writeBigUInt64LE(stake);
+  return {
+    dataSize: MATCH_ACCOUNT_SIZE,
+    memcmp: [
+      { offset: 0, bytes: bs58.encode(MATCH_ACCOUNT) },
+      { offset: M.stake, bytes: bs58.encode(le) },
+      // MatchState::Open is variant 0.
+      { offset: M.state, bytes: bs58.encode(Buffer.from([0])) },
+    ],
+  };
+}
+
+/** What a match pays each place, from the pot, as the program computes it. */
+export function payoutsFor(stake: bigint, count: number): bigint[] {
+  const pot = stake * BigInt(count);
+  if (count < 3) return [pot, 0n, 0n];
+  const second = (pot * 3000n) / 10000n;
+  const third = (pot * 2000n) / 10000n;
+  return [pot - second - third, second, third];
 }

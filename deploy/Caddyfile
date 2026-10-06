@@ -17,6 +17,15 @@ floorfight.duckdns.org {
 		reverse_proxy 127.0.0.1:8080
 	}
 
+	# Read only JSON and NFT images from the game server: open holders
+	# matches, a match's state for the results screen, a wallet's NFTs and
+	# their images. Same origin on purpose, so WebGL can draw an NFT image
+	# without a cross origin request. The server rate limits each address
+	# from the X-Forwarded-For Caddy sets here.
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8080
+	}
+
 	# Match logs, read only. These are the canonical logs the server hashed
 	# and settled with, so anyone can download one and replay it:
 	#

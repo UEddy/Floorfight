@@ -1,0 +1,9 @@
+{
+  "name": "Floorfight",
+  "short_name": "Floorfight",
+  "start_url": "/",
+  "display": "fullscreen",
+  "orientation": "landscape",
+  "background_color": "#1a1c20",
+  "theme_color": "#1a1c20"
+}

@@ -11,6 +11,51 @@ it has to be compiled into the binary. The development build is an APK you
 install once and then point at a Metro server, which is the same loop Expo Go
 gives you but with native modules included.
 
+## Two builds
+
+`eas.json` has two Android profiles that matter, and they are for different
+people.
+
+| Profile | Who it is for | JavaScript | Needs Metro |
+| --- | --- | --- | --- |
+| `preview` | judges, testers, anyone installing the APK | bundled into the APK | no |
+| `development` | you, while changing the shell | loaded from Metro on your machine | yes |
+
+**`preview` is the submission APK.** It is a release build
+(`:app:assembleRelease`, `developmentClient: false`), so Metro bundles the
+JavaScript into the APK at build time and the app starts on its own, on any
+phone, with no dev server and no computer on the same network. `expo-dev-client`
+is in the plugin list, but its launcher only exists in debug builds, so it
+does not appear in this one.
+
+```sh
+cd apps/mobile
+eas build --profile preview --platform android
+```
+
+EAS gives you a URL for the `.apk`. That file is what goes in the submission
+and what a judge sideloads. It still loads the game from
+`https://floorfight.duckdns.org`, so the droplet has to be up for it to be
+playable; the shell itself needs nothing else.
+
+**`development`** is the debug build with the dev client launcher, for your
+own testing. Install it once, then run Metro and JavaScript changes reload
+without a rebuild:
+
+```sh
+eas build --profile development --platform android   # once, or when native deps change
+npx expo start --dev-client                          # every session
+```
+
+There is also a `production` profile that makes an Android App Bundle
+(`.aab`). That is the Play Store format and not what the dApp Store or a
+sideload wants; leave it alone until a store asks for it.
+
+No profile sets an update `channel`: those only mean something with
+`expo-updates` installed, and it is not. Every change to the shell's
+JavaScript reaches `preview` users through a new APK, which for a wallet
+holding app is the right default anyway.
+
 ## What you need to set up yourself
 
 I have not done any of this, and none of it can be done from here.
@@ -39,7 +84,8 @@ I have not done any of this, and none of it can be done from here.
    because it does not exist until an account creates it. Commit it once it
    is there.
 
-4. **A development build, and install it on the phone.**
+4. **A development build, and install it on the phone.** (For the
+   submission APK, see "Two builds" above: `--profile preview`.)
 
    ```sh
    eas build --profile development --platform android
@@ -108,12 +154,14 @@ scripting bug away from asking for the wrong one.
 
 **The page sends intents. It never sends bytes.**
 
-There are exactly two requests, both in `src/bridge.ts`:
+There are exactly three requests, all in `src/bridge.ts`:
 
 | Request | What the page sends | What the native side does |
 | --- | --- | --- |
+| `connect` | `{ id, t }` | Authorises with the wallet and returns its address. Signs nothing |
 | `signJoin` | `{ id, t, v, matchId, nonce }` | Builds `floorfight:join:v<N>:<matchId>:<nonce>` itself, checks the result against a strict pattern, signs that and nothing else |
-| `escrow` | `{ id, t, action, matchId }` | Reads the match account, decides whether the action is possible, builds the instruction from the IDL, shows the amount, then opens the wallet |
+| `escrow` create | `{ id, t, action: "create", tier }` | Looks the stake up in its own fixed tier list (`src/config.ts`, devnet 0.01, 0.05, 0.1 SOL), generates a random u64 match id, builds `create_match` plus `join_match` into one transaction, shows the amount, then opens the wallet. Replies with the match id it generated |
+| `escrow` join, claim, refund | `{ id, t, action, matchId }` | Reads the match account, decides whether the action is possible, builds the instruction from the IDL, shows the amount (for a claim with a connected wallet, that wallet's exact payout), then opens the wallet |
 
 There is deliberately no request carrying a transaction, a message, a byte
 array, an instruction, an account list, a program id or a lamport amount. If
@@ -144,7 +192,7 @@ What enforces it:
 - **No file access, no other origins, no new windows,** and no permissions
   beyond network in the manifest.
 
-The web client does not use this bridge yet. When it does, the contract is:
+The web client uses this bridge for holders matches (`packages/client/src/native.ts`). The contract is:
 
 ```js
 // Ask:
@@ -170,9 +218,9 @@ app.config.ts        Android only, landscape, no permissions beyond network
 eas.json             development, preview and production build profiles
 src/polyfills.ts     Buffer and getRandomValues, imported first
 src/config.ts        the origin, the cluster, the program id. Not runtime configurable
-src/bridge.ts        the two requests, and every check that makes them safe
+src/bridge.ts        the requests, and every check that makes them safe
 src/wallet.ts        MWA: one function to sign a message, one to send a transaction
-src/escrow.ts        reads match accounts and builds join, claim and refund from the IDL
+src/escrow.ts        reads match accounts and builds create, join, claim and refund from the IDL
 src/GameWebView.tsx  the WebView with the shutters down
 src/Confirm.tsx      what you are approving, before the wallet opens
 src/idl/arena.json   a copy of the build artifact. npm run idl:sync
@@ -238,7 +286,7 @@ than this file:
 ## What has been checked, and what has not
 
 Checked: the dependency set installs cleanly, the app and the tests both type
-check against the real SDK 57 tree, and the ten bridge tests pass.
+check against the real SDK 57 tree, and the bridge and tier tests pass.
 
 Not checked, and not checkable from here:
 

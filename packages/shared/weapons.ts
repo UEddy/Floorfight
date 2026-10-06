@@ -50,31 +50,54 @@ export interface WeaponSpec {
   readonly auto: boolean;
   /** Range in blocks. Past this the shot simply stops. */
   readonly range: number;
+  /**
+   * Extra spread at full running speed, or in the air, in yaw units. Scaled
+   * by how fast the shooter is going, so a standing shot is the base spread
+   * and a strafing one is not.
+   */
+  readonly moveSpread: number;
+  /** Extra spread per shot in an unbroken string of shots, in yaw units. */
+  readonly bloom: number;
+  /** Most the bloom can add, in yaw units. */
+  readonly bloomMax: number;
 }
 
 function spec(
   id: number, name: string, mag: number, reloadTicks: number, fireInterval: number,
   damage: number, headMult: number, spread: number, pellets: number,
-  auto: boolean, range: number,
+  auto: boolean, range: number, moveSpread: number, bloom: number, bloomMax: number,
 ): WeaponSpec {
   return {
     id, name, mag, reloadTicks, fireInterval, damage, headMult,
     headDamage: Math.round(damage * headMult),
-    spread, pellets, auto, range,
+    spread, pellets, auto, range, moveSpread, bloom, bloomMax,
   };
 }
 
+/**
+ * Ticks after a shot within which the next one counts as the same string,
+ * for bloom. A little longer than any weapon's fire interval, so holding the
+ * rifle's trigger keeps the string going and a pause of a quarter second
+ * resets it.
+ */
+export const BLOOM_GAP = 15;
+
 export const WEAPONS: readonly WeaponSpec[] = [
   // Six body shots or three heads. 1.5 second reload.
-  spec(W_RIFLE, "Rifle", 30, 90, 7, 18, 2, 60, 1, true, 90),
+  // Moving or holding the trigger opens the rifle up to about four degrees,
+  // so tapping from a standstill is how it holds a lane.
+  spec(W_RIFLE, "Rifle", 30, 90, 7, 18, 2, 60, 1, true, 90, 40, 8, 48),
   // 100 damage to the head: one shot, and the only weapon in the game that
   // can do it. Three to the body, at five rounds a second at best.
-  spec(W_PISTOL, "Pistol", 12, 75, 13, 40, 2.5, 14, 1, false, 90),
+  // The one shot head kill wants a still shooter: running, the pistol is
+  // three times as wide.
+  spec(W_PISTOL, "Pistol", 12, 75, 13, 40, 2.5, 14, 1, false, 90, 30, 10, 20),
   // Eight pellets of 14: everything lands at touching distance, and the shot
   // stops dead at sixteen blocks. The hall's longest sightline is about
   // twenty one, so the range limit is what keeps this a weapon for the booth
   // lanes and the stairwells rather than one more way to hold a long lane.
-  spec(W_SHOTGUN, "Shotgun", 6, 150, 45, 14, 1.5, 420, 8, false, 16),
+  // The pattern is already the spread. Moving does not widen it.
+  spec(W_SHOTGUN, "Shotgun", 6, 150, 45, 14, 1.5, 420, 8, false, 16, 0, 0, 0),
 ];
 
 /* --------------------------------------------------------------- spread --- */

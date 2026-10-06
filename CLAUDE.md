@@ -129,8 +129,10 @@ Everything else follows from that:
 
 - Hit registration is server side, with lag compensation rewinding to the
   shooter's timestamp, clamped at 250 ms.
-- NFT character ownership is verified server side by RPC at join. A client
-  claiming a mint it does not hold gets the default skin, not an error.
+- NFT character ownership is verified server side at join, through Helius DAS
+  getAsset. A client claiming a mint it does not hold gets the default face,
+  not an error. The mint is not part of the signed join message: the worst a
+  tampered one can do is change a face, and the ownership check catches that.
 - Join carries a wallet signature over a server-issued nonce, so a captured
   join frame cannot be replayed by a third party.
 - Any aim assist is computed server side and applied identically to every
@@ -181,10 +183,17 @@ full quality, 31 draw calls. That scene was a fraction of the real game, so the
 headroom was real but unearned.
 
 The Hall replaces it and is counted, not measured: 16485 solid blocks reduce to
-36668 triangles once hidden faces are dropped, in 9 merged meshes, one per
-material. With the sign strip, the three instanced player meshes, the gun, the
-flash, the death chunks, the tracers and the remote muzzle flashes, that is
-around 19 draw calls, and it does not grow with the map.
+36668 triangles once hidden faces are dropped, in one merged mesh that samples
+a single procedural texture atlas, with sky and lantern light baked into its
+vertex colours. With the sign strip, the sky dome, the glass roof, the props,
+the lantern glows, the instanced character parts, the view model, the death
+chunks, the tracers and the remote muzzle flashes, a six player frame is about
+23 draw calls and 51k triangles, read off the renderer by `npm run shots` in
+headless Chromium. It does not grow with the map or the player count.
+
+`npm run shots` in `packages/client` plays five seconds against bots and saves
+screenshots from fixed places in the Hall. Use it to look at a visual change
+before shipping it. Its frame rate is SwiftShader's and means nothing.
 
 Frame rate on device is still unmeasured, on either phone. `?debug=1` puts fps,
 the 1% low, draw calls, triangles and the server measured ping on screen, so
@@ -263,6 +272,23 @@ LOG_DIR=/var/lib/floorfight/logs \
 npm --prefix packages/server start
 ```
 
+On the droplet, `deploy/floorfight.service` is free play only and names no
+key. Staked rooms are the drop-in `deploy/floorfight-chain.conf`, which adds
+the three chain settings together and an optional root only
+`/etc/floorfight/helius.env` for `HELIUS_API_KEY`. Without that key there are
+no NFT heads and every holder wears the default face; it never leaves the
+server.
+
+The same port serves read only JSON under `/api`, which Caddy proxies:
+`/api/matches?tier=N` and `/api/match/:id` from the chain, `/api/nfts/:owner`
+and `/api/nft-img/:assetId` through Helius DAS. All are rate limited per
+address and cached for a few seconds. The image route only ever fetches from
+the allow listed CDN hosts in `nft.ts`, never a URL out of metadata.
+
+`npm run init-config` and `npm run show-config` at the repo root set up and
+read the program config. init-config runs on your own machine with the
+deployer key, defaults to devnet, and refuses mainnet without `--mainnet`.
+
 `ARENA_DEV=1` adds the fixed seat dev room for two tabs with known keys, and
 refuses to coexist with a resolver key or with `NODE_ENV=production`.
 `FREE_FILL_MS` is how long a free room waits for company before taking bots,
@@ -296,14 +322,26 @@ Flag these rather than deciding alone.
 ## Status
 
 Done: deterministic sim core with height, gravity, jumping and three weapons,
-block grid collision and grid hitscan, wire protocol v5, The Hall as authored
+block grid collision and grid hitscan, wire protocol v7 with horizontal acceleration and honest crosshair bloom, The Hall as authored
 map data identified by the hash of its own blocks, merged block renderer with
 hit feedback, damage numbers, death chunks, tracers and synthesized sound,
 touch controls, server tick loop and join handshake, free and staked room
-types with server side bots, Anchor escrow program with 17 LiteSVM tests
-covering the attack cases and payout paths, 42 server tests covering replay
-determinism, weapon behaviour, the map id, the map's sightline and
-reachability rules, and the bot rules.
+types with server side bots, Anchor escrow program with 20 LiteSVM tests
+covering the attack cases, the payout paths and the holders flow (the app's
+create transaction, the lobby's lock rule against the real program, and
+create, join, lock, settle and claim end to end), 127 server tests covering
+replay determinism, weapon behaviour, the map id, the map's sightline and
+reachability rules, the bot rules, the holders lobby and API, and the NFT
+image fetch's SSRF limits.
+
+Holders matches, wired: a mode screen (Free or Holders), connect through the
+app, stake tiers (devnet 0.01, 0.05, 0.1 SOL, fixed in the app), open matches
+listed from chain, create (create_match plus join_match in one transaction,
+match id generated natively) or join, a lobby that locks when everyone who
+staked is connected or with 60 seconds of the join window left, a staked room
+with no bots, and a results screen with Claim or Refund and the log link.
+NFT heads for holders through DAS. None of it has run against devnet or a
+wallet yet.
 
 Wired, untested on devnet: free rooms with guest keys and bot fill, staked
 rooms opening from a Locked match account, settlement with backoff, match logs
@@ -316,6 +354,6 @@ exactly two requests from the page and refuses everything else. It type checks
 and its bridge tests pass, but no EAS project exists and nothing has run on a
 phone. `apps/mobile/README.md` lists what has to be set up by hand.
 
-Next: droplet deploy, deploy the program to devnet and run `initialize_config`,
-then the EAS development build, then wiring the web client to the native
-bridge.
+Next: droplet deploy, deploy the program to devnet and run
+`npm run init-config`, then `eas build --profile preview` for the submission
+APK, then the first real holders match on devnet with two phones.

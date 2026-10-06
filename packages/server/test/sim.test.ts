@@ -13,6 +13,7 @@ import path from "node:path";
 import {
   EYE_HEIGHT,
   GRAVITY,
+  GROUND_ACCEL,
   GRID_X,
   GRID_Y,
   GRID_Z,
@@ -23,6 +24,7 @@ import {
   LEVEL_STAGE,
   MAX_HP,
   PLAYER_HEIGHT,
+  PLAYER_SPEED,
   RESPAWN_TICKS,
   ROUND_TICKS,
   SPAWNS,
@@ -34,6 +36,8 @@ import {
   createWorld,
   onGround,
   rayGrid,
+  shotSpread,
+  exposedNow,
   solidAt,
   step,
   supportTop,
@@ -291,6 +295,42 @@ test("supportTop and onGround agree with the grid", () => {
   }
 });
 
+/* ------------------------------------------------------- acceleration --- */
+
+test("running accelerates to full speed in a few ticks, and stops the same way", () => {
+  const w = createWorld(1);
+  const p = w.players[0];
+  // Spawn 0 faces a clear run east along its aisle.
+  const east = (YAW_UNITS * 3) / 4;
+  run(w, 0, input({ moveY: 127, yaw: east }), 1);
+  const first = Math.hypot(p.vx, p.vz);
+  assert.ok(Math.abs(first - GROUND_ACCEL / TICK_HZ) < 1e-9, `first tick gave ${first}`);
+  run(w, 0, input({ moveY: 127, yaw: east }), 7);
+  assert.ok(Math.abs(Math.hypot(p.vx, p.vz) - PLAYER_SPEED) < 1e-9, "should be at full speed");
+  run(w, 0, input({ yaw: east }), 3);
+  const slowing = Math.hypot(p.vx, p.vz);
+  assert.ok(slowing > 0 && slowing < PLAYER_SPEED, `should be slowing, at ${slowing}`);
+  run(w, 0, input({ yaw: east }), 6);
+  assert.equal(Math.hypot(p.vx, p.vz), 0, "should have stopped");
+});
+
+test("a wall takes the velocity on the axis it blocks", () => {
+  const w = createWorld(1);
+  const p = w.players[0];
+  run(w, 0, input({ moveX: -127, yaw: 0 }), 600);
+  assert.equal(p.vx, 0, "pressing into the west wall should leave no stored run");
+});
+
+test("spread is the base standing still, and opens with speed, air and a string of shots", () => {
+  const rifle = WEAPONS[W_RIFLE];
+  assert.equal(shotSpread(rifle, 0, 0, true, 0), rifle.spread);
+  assert.equal(shotSpread(rifle, PLAYER_SPEED, 0, true, 0), rifle.spread + rifle.moveSpread);
+  assert.equal(shotSpread(rifle, 0, 0, false, 0), rifle.spread + rifle.moveSpread);
+  assert.equal(shotSpread(rifle, 0, 0, true, 999), rifle.spread + rifle.bloomMax);
+  const shotgun = WEAPONS[W_SHOTGUN];
+  assert.equal(shotSpread(shotgun, PLAYER_SPEED, 0, false, 5), shotgun.spread, "the pattern is the spread");
+});
+
 /* ----------------------------------------------------------- hitscan --- */
 
 test("a ray stops at the first solid block", () => {
@@ -347,6 +387,38 @@ test("walls and floors block a shot, and an open line does not", () => {
   run(w2, 0, input({ yaw: YAW_UNITS / 4 }), 1);
   run(w2, 0, input({ yaw: YAW_UNITS / 4, fire: 1 }), 20, hits);
   assert.equal(v2.hp, hp2, "a shot across the hall should be stopped by cover");
+});
+
+test("a lag compensated shot does not land on someone who is behind cover now", () => {
+  // On the stage, looking north up the pocket in front of the organ case.
+  // Rewound, the victim is in the open; by the tick the shot is resolved
+  // they are behind the case. From where they stand that hit would be a
+  // bullet through a wall, so it does not land.
+  const setup = (nowZ: number) => {
+    const w = createWorld(2);
+    const shooter = w.players[0];
+    const victim = w.players[1];
+    shooter.x = cellCentreX(22); shooter.z = cellCentreZ(13); shooter.y = LEVEL_STAGE;
+    victim.x = cellCentreX(22); victim.z = cellCentreZ(10); victim.y = LEVEL_STAGE;
+    const seen = w.tick;
+    step(w, [input({ tick: 0, view: seen }), null], []); // records the victim in the open
+    victim.z = cellCentreZ(nowZ);
+    const hits: HitEvent[] = [];
+    // Pitched down a little to the victim's chest, as the shooter saw it.
+    const pitch = Math.round((-0.25 / 1.45) * 32767);
+    step(w, [input({ tick: 1, view: seen, yaw: 0, pitch, fire: 1 }), null], hits);
+    return { victim, hits };
+  };
+
+  const hidden = setup(5);
+  assert.ok(!exposedNow(cellCentreX(22), LEVEL_STAGE + EYE_HEIGHT, cellCentreZ(13), hidden.victim));
+  assert.equal(hidden.hits.length, 0, "behind the organ case now, so no hit");
+  assert.equal(hidden.victim.hp, MAX_HP);
+
+  // The same rewound shot on a victim who stepped back but is still in the
+  // open lands, so the rule only takes away hits through cover.
+  const open = setup(11);
+  assert.ok(open.hits.length > 0, "still in the open, so the rewound shot lands");
 });
 
 test("a shot at someone on the floor below is stopped by the gallery deck", () => {

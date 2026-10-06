@@ -54,6 +54,7 @@ export class Controls {
   botMove: { x: number; y: number } | null = null;
   botFire = false;
   botJump = false;
+  botReload = false;
 
   constructor(
     private canvas: HTMLCanvasElement,
@@ -148,6 +149,7 @@ export class Controls {
     fireButton.addEventListener("touchstart", (e) => {
       e.preventDefault();
       this.onGesture();
+      fireButton.classList.add("down");
       const t = e.changedTouches[0];
       this.touchFire = true;
       this.fireTouch = { id: t.identifier, x: t.clientX, y: t.clientY };
@@ -167,6 +169,7 @@ export class Controls {
     const fireOff = (e: TouchEvent) => {
       for (const t of Array.from(e.changedTouches)) {
         if (this.fireTouch && t.identifier !== this.fireTouch.id) continue;
+        fireButton.classList.remove("down");
         this.touchFire = false;
         this.fireTouch = null;
       }
@@ -178,18 +181,24 @@ export class Controls {
       el.addEventListener("touchstart", (e) => {
         e.preventDefault();
         this.onGesture();
+        el.classList.add("down");
         set(true);
       }, { passive: false });
-      el.addEventListener("touchend", () => set(false));
-      el.addEventListener("touchcancel", () => set(false));
+      const up = () => { el.classList.remove("down"); set(false); };
+      el.addEventListener("touchend", up);
+      el.addEventListener("touchcancel", up);
     };
     hold(jumpButton, (on) => { this.touchJump = on; });
     hold(reloadButton, (on) => { this.touchReload = on; });
     swapButton.addEventListener("touchstart", (e) => {
       e.preventDefault();
       this.onGesture();
+      swapButton.classList.add("down");
       this.cycle();
     }, { passive: false });
+    const swapUp = () => swapButton.classList.remove("down");
+    swapButton.addEventListener("touchend", swapUp);
+    swapButton.addEventListener("touchcancel", swapUp);
   }
 
   get locked(): boolean {
@@ -199,6 +208,13 @@ export class Controls {
   /** Tell the controls which weapon the server says we are holding. */
   syncWeapon(index: number): void {
     this.currentWeapon = index;
+  }
+
+  /** Ask for a weapon by index, as tapping its slot does. */
+  select(index: number): void {
+    if (index < 0 || index >= WEAPON_COUNT) return;
+    this.onGesture();
+    this.pendingWeapon = index + 1;
   }
 
   /** Ask for the next weapon along. */
@@ -237,7 +253,7 @@ export class Controls {
     // three levels tall, so jump has to be a key that is easy to hold.
     i.jump = this.touchJump || this.botJump ||
       this.keys.has("Space") || this.keys.has("KeyJ");
-    i.reload = this.touchReload || this.keys.has("KeyR");
+    i.reload = this.touchReload || this.botReload || this.keys.has("KeyR");
     // One press, one request: the bit is consumed here so holding the button
     // does not cycle through every weapon in the game.
     i.weapon = this.pendingWeapon;

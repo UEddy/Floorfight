@@ -8,18 +8,24 @@ import {
   TICK_MS,
   createWorld,
   cosU,
+  onGround,
+  shotSpread,
   rayGrid,
   sinU,
   yawToRadians,
   type HitEvent,
   type Input,
 } from "../../shared/sim";
-import { WEAPONS } from "../../shared/weapons";
+import { BLOOM_GAP, WEAPONS } from "../../shared/weapons";
 import { fromHex, sha256Hex } from "../../shared/sha256";
-import { quantAxis, quantPitch, quantYaw, type SnapshotPlayer } from "../../shared/protocol";
+import {
+  quantAxis, quantPitch, quantYaw, type RosterEntry, type SnapshotPlayer,
+} from "../../shared/protocol";
 import { DEV_MATCH_ID } from "../../shared/dev";
 import { devKeypair, guestKeypair } from "./keys";
-import { Net } from "./net";
+import { Net, signLocally, type NetHandlers } from "./net";
+import { Menu } from "./menu";
+import * as native from "./native";
 import { BATCH_TICKS, Interpolator, Predictor, type RemoteView } from "./netcode";
 import { Controls } from "./input";
 import { Renderer } from "./render";
@@ -60,6 +66,7 @@ const controls = new Controls(
   () => sfx.start(),
 );
 const hud = new Hud(seat);
+hud.onWeaponTap((i) => controls.select(i));
 
 type Phase = "connecting" | "waiting" | "playing" | "over" | "gone";
 let phase: Phase = "connecting";
@@ -74,6 +81,12 @@ let seq = 0;
 const sent: Input[] = [];
 let lastTickAt = 0;
 let lastFireSeq = -999;
+/**
+ * Our shots in the current string, counted the way the sim counts them, so
+ * the crosshair can show the bloom the server will apply to the next shot.
+ * Display only: the server keeps its own count and that is the one used.
+ */
+let myStreak = 0;
 let lastDrySeq = -999;
 let lastSnap: { tick: number; players: SnapshotPlayer[] } | null = null;
 let firstSnap: SnapshotPlayer[] | null = null;
@@ -83,6 +96,13 @@ const active = new Set<number>();
 let myWeapon = 0;
 let myMag = WEAPONS[0].mag;
 let myReload = 0;
+/**
+ * When the current reload started, back-dated from the server's countdown.
+ * Snapshots come at 20 Hz, so animating straight off the countdown would
+ * move the hands in visible steps. This only smooths the drawing: the
+ * countdown itself is still the server's.
+ */
+let reloadStartedAt = 0;
 let rtt = 0;
 
 /** Tick we were killed on, for the respawn countdown, or null if alive. */
@@ -126,6 +146,7 @@ const frameTimes: number[] = [];
 const fpsWindow: number[] = [];
 let fpsNow = 0;
 let onePercentLow = 0;
+let lowAt = 0;
 
 function recordFrame(now: number, dtMs: number): void {
   frameTimes.push(dtMs);
@@ -133,7 +154,10 @@ function recordFrame(now: number, dtMs: number): void {
   fpsWindow.push(now);
   while (fpsWindow.length > 0 && now - fpsWindow[0] > 1000) fpsWindow.shift();
   fpsNow = fpsWindow.length;
-  if (frameTimes.length >= 50) {
+  // Twice a second, not every frame: sorting a thousand numbers sixty times
+  // a second is garbage for the collector to stop the game for.
+  if (frameTimes.length >= 50 && now - lowAt > 500) {
+    lowAt = now;
     const slowest = [...frameTimes].sort((a, b) => b - a);
     const n = Math.max(1, Math.round(slowest.length * 0.01));
     let sum = 0;
@@ -142,29 +166,74 @@ function recordFrame(now: number, dtMs: number): void {
   }
 }
 
-let keys;
-try {
-  keys = devSeat ? devKeypair(seat) : guestKeypair();
-} catch (e) {
-  hud.message((e as Error).message);
-  throw e;
+/**
+ * The holders match being played, if this is one: its on-chain id and the
+ * wallet that staked into it. Null in free play.
+ */
+let holders: { matchId: string; wallet: string } | null = null;
+
+const menu = new Menu({
+  free: () => startFree(),
+  holders: (matchId, wallet, mint) => startHolders(matchId, wallet, mint),
+});
+
+let net: Net | null = null;
+
+/** Free play: a guest key made up now, or a dev seat in a dev build. */
+function startFree(): void {
+  let keys: ReturnType<typeof guestKeypair>;
+  try {
+    keys = devSeat ? devKeypair(seat) : guestKeypair();
+  } catch (e) {
+    hud.message((e as Error).message);
+    throw e;
+  }
+  hud.message("Connecting...");
+  net = new Net(serverUrl, async (challenge) => {
+    // A dev seat asks for the dev room by name. A guest takes the room the
+    // server offered with the challenge, so the signature covers the id of
+    // the match it actually gets rather than a matchmaking alias.
+    const matchId = devSeat ? DEV_MATCH_ID : challenge.freeMatchId;
+    return matchId ? signLocally(matchId, challenge.nonce, keys) : null;
+  }, handlers);
 }
 
-hud.message("Connecting...");
+/**
+ * A holders match. The join is signed by the wallet, through the app: the
+ * page passes the match id and the nonce and gets back a signature over a
+ * message the app built itself. Until the match locks the server keeps the
+ * socket in the lobby; then it moves it into the room and the game starts.
+ */
+function startHolders(matchId: string, wallet: string, mint: string | null): void {
+  holders = { matchId, wallet };
+  hud.message("Signing in to the lobby...");
+  net = new Net(serverUrl, async (challenge) => {
+    const signed = await native.signJoin(matchId, challenge.nonce);
+    if (signed.wallet !== wallet) {
+      throw new Error("the wallet that signed is not the one that staked");
+    }
+    return {
+      matchId, wallet: signed.wallet, sig: signed.signature,
+      ...(mint ? { mint } : {}),
+    };
+  }, handlers);
+}
 
-const net = new Net(serverUrl, (challenge) => {
-  // A dev seat asks for the dev room by name. A guest takes the room the
-  // server offered with the challenge, so the signature covers the id of the
-  // match it actually gets rather than a matchmaking alias.
-  const matchId = devSeat ? DEV_MATCH_ID : challenge.freeMatchId;
-  return matchId ? { matchId, keys } : null;
-}, {
+const handlers: NetHandlers = {
+  onLobby(view) {
+    hud.message("");
+    menu.showLobby(view);
+  },
+
   onAccepted(msg) {
+    menu.hide();
     slot = msg.slot;
     spreadCommit = msg.spreadCommit;
     hud.setRoster(msg.roster);
     predictor = new Predictor(msg.roster.length, slot);
     renderer = new Renderer(canvas, msg.roster.length);
+    renderer.setLocalSlot(slot);
+    renderer.setRoster(msg.roster);
     // Face the middle of the hall from the spawn, which is where the clock
     // tower is and where the action tends to be.
     const me = createWorld(msg.roster.length).players[slot];
@@ -201,7 +270,11 @@ const net = new Net(serverUrl, (challenge) => {
         sfx.swap();
         controls.syncWeapon(me.g);
       }
-      if (myReload === 0 && me.r > 0) sfx.reload((me.r / TICK_HZ) * 1000);
+      if (myReload === 0 && me.r > 0) {
+        sfx.reload((me.r / TICK_HZ) * 1000, me.g);
+        const full = (WEAPONS[me.g] ?? WEAPONS[0]).reloadTicks;
+        reloadStartedAt = now - ((full - me.r) / TICK_HZ) * 1000;
+      }
       myWeapon = me.g;
       myMag = me.m;
       myReload = me.r;
@@ -252,7 +325,8 @@ const net = new Net(serverUrl, (challenge) => {
     }
 
     hud.showOver(msg.standings, msg.logHash, spread, () => location.reload());
-    net.close();
+    if (holders) menu.showResults(holders.matchId, holders.wallet);
+    net?.close();
     console.log(`[arena] round over, log hash ${msg.logHash}`, msg.standings);
   },
 
@@ -267,7 +341,43 @@ const net = new Net(serverUrl, (challenge) => {
       hud.message("Connection lost. Reload to rejoin.");
     }
   },
-});
+};
+
+/**
+ * Landscape on a phone browser.
+ *
+ * The page cannot rotate a phone by itself, but Android browsers allow a page
+ * that has gone fullscreen to lock its orientation, and fullscreen needs a
+ * tap. So the first tap anywhere asks for both. Where either is refused (an
+ * iPhone, a browser that says no, the app's WebView, which is already locked
+ * to landscape natively) nothing happens, and the overlay in index.html asks
+ * the person to turn the phone instead.
+ */
+function landscapeOnFirstTap(): void {
+  if (native.hasNative() || !matchMedia("(pointer: coarse)").matches) return;
+  const go = () => {
+    removeEventListener("pointerdown", go, true);
+    const el = document.documentElement;
+    const lock = () => {
+      const o = screen.orientation as ScreenOrientation & { lock?: (o: string) => Promise<void> };
+      return o?.lock ? o.lock("landscape") : Promise.resolve();
+    };
+    if (!document.fullscreenElement && el.requestFullscreen) {
+      el.requestFullscreen({ navigationUI: "hide" }).then(lock).catch(() => {});
+    } else {
+      lock().catch(() => {});
+    }
+  };
+  addEventListener("pointerdown", go, true);
+}
+landscapeOnFirstTap();
+
+/*
+ * Free straight away for a dev seat or ?mode=free, which is how the
+ * screenshot script and two-tab testing skip the menu. Otherwise the menu.
+ */
+if (devSeat || params.get("mode") === "free") startFree();
+else menu.showModes();
 
 /* ------------------------------------------------------------ feedback --- */
 
@@ -341,7 +451,14 @@ function shotByOther(p: SnapshotPlayer, now: number): void {
   const dist = predictor
     ? Math.hypot(p.x - predictor.me.x, p.e - predictor.me.y, p.z - predictor.me.z)
     : 0;
-  sfx.shot(p.g, dist);
+  // Which side of us it came from: the shooter's direction against the
+  // camera's right hand, (cos yaw, -sin yaw) in the sim's convention.
+  let pan = 0;
+  if (predictor && dist > 0.01) {
+    const yaw = controls.intent.yaw;
+    pan = ((p.x - predictor.me.x) * Math.cos(yaw) - (p.z - predictor.me.z) * Math.sin(yaw)) / dist;
+  }
+  sfx.shot(p.g, Math.max(0.5, dist), pan * 0.8);
 }
 
 /* ------------------------------------------------------------ ticking --- */
@@ -389,6 +506,7 @@ function tick(now: number): void {
   // will use, from the ammo count the server last sent.
   if (wantsFire && myReload === 0 && seq - lastFireSeq >= spec.fireInterval) {
     if (myMag > 0) {
+      myStreak = seq - lastFireSeq <= BLOOM_GAP ? myStreak + 1 : 0;
       lastFireSeq = seq;
       stats.shots++;
       ownShot(now, spec.range);
@@ -400,14 +518,14 @@ function tick(now: number): void {
 
   sent.push(inp);
   if (sent.length > BATCH_TICKS) sent.shift();
-  net.send({ t: "input", batch: sent.slice() });
+  net?.send({ t: "input", batch: sent.slice() });
   seq++;
 }
 
 /** Our own flash, tracer and report, drawn from where the camera is aiming. */
 function ownShot(now: number, range: number): void {
   if (!renderer || !predictor) return;
-  renderer.muzzleFlash(now);
+  renderer.muzzleFlash(myWeapon);
   sfx.shot(myWeapon, 0);
 
   const yaw = quantYaw(controls.intent.yaw);
@@ -432,6 +550,19 @@ setInterval(pump, 4);
 /* ---------------------------------------------------------- rendering --- */
 
 const plates: Plate[] = [];
+let crossGap = 0;
+
+/**
+ * Dev builds only: a camera pose that replaces the predicted eye when drawing.
+ * The screenshot script uses it to look at the hall from fixed places. It is
+ * drawing only: input, prediction and everything sent to the server carry on
+ * from where the player really is.
+ */
+let devCamera: {
+  x: number; y: number; z: number; yaw: number; pitch: number; hideGun?: boolean;
+  /** Follow this seat, from in front of it, every frame. */
+  follow?: number;
+} | null = null;
 
 function frame(): void {
   requestAnimationFrame(frame);
@@ -469,7 +600,37 @@ function frame(): void {
       else if (r) r.alive = false;
     }
   }
-  renderer.draw(now, { x, y, z, yaw, pitch }, slot, remotes);
+  const spec = WEAPONS[myWeapon] ?? WEAPONS[0];
+  if (devCamera?.follow !== undefined) {
+    const r = remotes.get(devCamera.follow);
+    if (r) {
+      const ry = yawToRadians(r.yaw);
+      const fx = -Math.sin(ry);
+      const fz = -Math.cos(ry);
+      devCamera.x = r.x + fx * 2.4;
+      devCamera.z = r.z + fz * 2.4;
+      devCamera.y = r.y;
+      devCamera.yaw = Math.atan2(fx, fz);
+    }
+  }
+  renderer.draw(now, devCamera ?? { x, y, z, yaw, pitch }, slot, remotes, {
+    weapon: myWeapon,
+    // The server's countdown, as a fraction of the whole reload, so the
+    // animation finishes when the magazine is actually full.
+    reload: myReload > 0
+      ? Math.min(0.999, (now - reloadStartedAt) / ((spec.reloadTicks / TICK_HZ) * 1000))
+      : null,
+    alive: me.alive && !devCamera?.hideGun,
+    grounded: me.vy === 0,
+  });
+
+  // The crosshair opens to the spread the sim would give the next shot:
+  // the same function, our predicted velocity, and our count of the string
+  // of shots so far, which lapses the way the sim's does.
+  const streak = seq - lastFireSeq <= BLOOM_GAP ? myStreak + 1 : 0;
+  const units = shotSpread(spec, me.vx, me.vz, onGround(me.x, me.y, me.z), streak);
+  crossGap += (renderer.spreadPixels(units) - crossGap) * Math.min(1, dt * 20);
+  hud.crosshair(Math.max(3, crossGap));
 
   // Nameplates, after the draw so the camera matrices are current.
   plates.length = 0;
@@ -501,7 +662,7 @@ function frame(): void {
       hud.message("");
     }
 
-    hud.netStats(
+    if (DEBUG) hud.netStats(
       `seat ${slot}  view ${interp.viewTick(now)}  server ${Math.floor(serverTick)}  ` +
       `unacked ${predictor.pendingCount}`,
     );
@@ -510,6 +671,7 @@ function frame(): void {
       `1% low   ${onePercentLow.toFixed(0)}`,
       `draws    ${renderer.drawCalls}`,
       `tris     ${renderer.triangles}`,
+      `res      ${renderer.pixelRatio.toFixed(2)}x`,
       `ping     ${rtt} ms`,
       `unacked  ${predictor.pendingCount}`,
     ] : null);
@@ -535,7 +697,53 @@ if (import.meta.env.DEV) {
     move(mx: number, my: number) { controls.botMove = { x: mx, y: my }; },
     fire(on: boolean) { controls.botFire = on; },
     jump(on: boolean) { controls.botJump = on; },
+    reload(on: boolean) { controls.botReload = on; },
     weapon(n: number) { controls.cycle(n - 1 - myWeapon); },
+    camera(pose: typeof devCamera) { devCamera = pose; },
+    /** The menu, so the screenshot script can photograph its screens. */
+    menu,
+    /** The sound engine, so a script can render it offline and listen. */
+    sfx,
+    /** Put a mint on seats' faces, as a verified roster would. Drawing only. */
+    faces(roster: RosterEntry[]) { renderer?.setRoster(roster); },
+    /**
+     * A camera pose a few blocks from the closest live opponent, looking at
+     * them, from whichever side has a clear line. For the screenshot script.
+     */
+    nearestRemote() {
+      if (!predictor) return null;
+      const me = predictor.me;
+      const others = [...remotes]
+        .filter(([s, r]) => s !== slot && r.alive)
+        .map(([, r]) => r)
+        .sort((a, b) => Math.hypot(a.x - me.x, a.z - me.z) - Math.hypot(b.x - me.x, b.z - me.z));
+      // Prefer a view of somebody's face: try in front of each of them before
+      // settling for any clear side of the nearest.
+      for (const front of [true, false]) {
+        for (const best of front ? others : others.slice(0, 1)) {
+          const eyeY = best.y + EYE_HEIGHT;
+          const yaw = yawToRadians(best.yaw);
+          const facing = Math.atan2(-Math.sin(yaw), -Math.cos(yaw));
+          const steps = front ? 5 : 16;
+          for (let k = 0; k < steps; k++) {
+            const off = (k % 2 === 0 ? 1 : -1) * Math.ceil(k / 2);
+            const a = facing + off * (front ? 0.25 : Math.PI / 8);
+            const dx = Math.sin(a);
+            const dz = Math.cos(a);
+            const dist = 2.6;
+            if (rayGrid(best.x, eyeY, best.z, dx, 0, dz, dist + 0.6) < dist + 0.6) continue;
+            return {
+              x: best.x + dx * dist, y: best.y, z: best.z + dz * dist,
+              yaw: Math.atan2(dx, dz), pitch: -0.1, hideGun: true,
+              // From in front, track them: a running bot crosses this
+              // distance in a third of a second.
+              ...(front ? { follow: [...remotes].find(([, r]) => r === best)?.[0] } : {}),
+            };
+          }
+        }
+      }
+      return null;
+    },
     peek() {
       return {
         phase,
@@ -550,6 +758,7 @@ if (import.meta.env.DEV) {
         reload: myReload,
         remotes: Object.fromEntries(remotes),
         drawCalls: renderer?.drawCalls ?? 0,
+        triangles: renderer?.triangles ?? 0,
         fps: fpsNow,
         onePercentLow,
         ping: rtt,

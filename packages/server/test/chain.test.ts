@@ -22,6 +22,7 @@ import {
 import { FREE_SALT_BYTES, saltSeeds } from "../../shared/weapons";
 import { toHex } from "../../shared/sha256";
 import {
+  LOG_VERSION,
   canonicalise,
   decanonicalise,
   standingsFrom,
@@ -156,7 +157,7 @@ function playedLog(matchId: string, slots = 3): { log: MatchLog; hash: string } 
   const r = roster(slots);
   const world = createWorld(slots, saltSeeds(FREE_SALT_BYTES));
   const log: MatchLog = {
-    v: 4,
+    v: LOG_VERSION,
     matchId,
     map: MAP_ID,
     spreadSalt: toHex(FREE_SALT_BYTES),

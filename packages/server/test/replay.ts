@@ -20,7 +20,7 @@ import {
 } from "../../shared/sim";
 import { FREE_SALT_BYTES, WEAPON_COUNT, saltSeeds } from "../../shared/weapons";
 import { toHex } from "../../shared/sha256";
-import { canonicalise, type MatchLog, type RosterEntry } from "../../shared/protocol";
+import { LOG_VERSION, canonicalise, type MatchLog, type RosterEntry } from "../../shared/protocol";
 
 const SLOTS = 6;
 
@@ -67,7 +67,7 @@ export function runMatch(seed: number, ticks: number, salt: Uint8Array = FREE_SA
     p.vy = 0;
   }
   const log: MatchLog = {
-    v: 4,
+    v: LOG_VERSION,
     matchId: "replay-test",
     map: MAP_ID,
     spreadSalt: toHex(salt),

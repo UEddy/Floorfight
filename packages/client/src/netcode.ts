@@ -93,6 +93,10 @@ export class Predictor {
     // Vertical velocity has to come from the server too, or a correction in
     // mid-jump would restart the arc from rest. See SnapshotPlayer.w.
     p.vy = me.w;
+    // And horizontal velocity, for the same reason now that movement
+    // accelerates: without it a correction mid-run would start from rest.
+    p.vx = me.u;
+    p.vz = me.v;
     p.hp = me.h;
     // Weapon state is the server's too. Prediction strips the fire bit, so
     // without this the predicted magazine would never go down and the two
@@ -165,6 +169,8 @@ export interface RemoteView {
   yaw: number;   // units, may be fractional
   pitch: number; // radians
   alive: boolean;
+  /** Weapon held, an index into WEAPONS. Drawn in their hands, nothing more. */
+  weapon: number;
 }
 
 export class Interpolator {
@@ -178,11 +184,17 @@ export class Interpolator {
     this.snaps.push({ tick, players });
     if (this.snaps.length > 64) this.snaps.shift();
 
-    // Track the server clock from snapshot arrivals. Jitter is smoothed out,
-    // a large jump (tab was hidden, long stall) resets it.
+    // Track the server clock from snapshot arrivals. A snapshot can only
+    // ever arrive late, never early, so the earliest arrivals are the honest
+    // ones: the estimate rises quickly towards an early sample and sinks
+    // only slowly towards a late one. Averaging them instead would let every
+    // delayed packet nudge the clock, and other players would speed up and
+    // slow down with the network. A large jump (tab hidden, long stall)
+    // resets it.
     const sample = tick - nowMs / TICK_MS;
     if (this.offset === null || Math.abs(sample - this.offset) > 10) this.offset = sample;
-    else this.offset += (sample - this.offset) * 0.05;
+    else if (sample > this.offset) this.offset += (sample - this.offset) * 0.2;
+    else this.offset += (sample - this.offset) * 0.01;
   }
 
   get ready(): boolean {
@@ -240,6 +252,7 @@ export class Interpolator {
         yaw: lerpYaw(pa.y, pb.y, t),
         pitch: ((pa.p + (pb.p - pa.p) * t) / 32767) * PITCH_LIMIT,
         alive: (t < 0.5 ? pa.a : pb.a) === 1,
+        weapon: pb.g,
       });
     }
   }

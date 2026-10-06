@@ -14,7 +14,17 @@
 import type { HitEvent, Input } from "./sim";
 import { PITCH_LIMIT, YAW_UNITS } from "./sim";
 
-export const PROTOCOL_VERSION = 6;
+export const PROTOCOL_VERSION = 7;
+
+/**
+ * Version of the match log, which is also the version of the rules a replay
+ * has to run it under. Bumped when the simulation changes what the same
+ * inputs produce: 5 added horizontal acceleration and movement and bloom
+ * spread, so a v4 log replayed by this build would not reproduce its match.
+ * 6 refuses a lag compensated hit on a victim who is behind cover at the
+ * tick the shot is resolved.
+ */
+export const LOG_VERSION = 6;
 
 /** Abuse limits. Exceed any of these and the connection is closed. */
 export const MAX_MSG_BYTES = 4096;
@@ -61,7 +71,18 @@ export function isWellFormedInput(v: unknown): v is Input {
 /* -------------------------------------------------------------- client --- */
 
 export type ClientMsg =
-  | { t: "join"; v: number; matchId: string; wallet: string; sig: string }
+  | {
+      t: "join"; v: number; matchId: string; wallet: string; sig: string;
+      /**
+       * Holders only: the NFT the player wants on their head. A request, not
+       * a claim. The server asks the chain who owns it and puts it in the
+       * roster only if the answer is this wallet; anything else plays with
+       * the default face and is not an error. Not part of the signed
+       * message: the worst a tampered mint can do is change a face, and the
+       * ownership check catches that anyway.
+       */
+      mint?: string;
+    }
   | { t: "input"; batch: Input[] } // resends the last few ticks, server dedupes
   | { t: "pong"; id: number };
 
@@ -122,6 +143,8 @@ export interface SnapshotPlayer {
              // renaming it now would silently swap two numbers of the same
              // type at every call site, so the new field got the new name.
   w: number; // vertical velocity
+  u: number; // horizontal velocity, x
+  v: number; // horizontal velocity, z
   y: number; // yaw units
   p: number; // pitch quantised
   h: number; // hp
@@ -135,12 +158,13 @@ export interface SnapshotPlayer {
 }
 
 /**
- * `w` is there for one reason: the local player's prediction replays its
- * unacknowledged inputs from the authoritative state, and with gravity and
- * jumping in the simulation that state now includes vertical velocity. Left
- * out, a reconcile in the middle of a jump would restart the arc from a
- * standstill and the camera would stutter at the top of every jump. It costs
- * a few bytes per player per snapshot and it is only ever read by its owner.
+ * `w`, `u` and `v` are there for one reason: the local player's prediction
+ * replays its unacknowledged inputs from the authoritative state, and with
+ * gravity, jumping and acceleration in the simulation that state includes
+ * velocity. Left out, a reconcile in the middle of a jump would restart the
+ * arc from a standstill, and one in the middle of a run would restart the
+ * run, and the camera would stutter at both. They cost a few bytes per player
+ * per snapshot and are only ever read by their owner.
  */
 
 export type ServerMsg =
@@ -184,7 +208,32 @@ export type ServerMsg =
       spreadSalt: string;
     }
   | { t: "ping"; id: number }
-  | { t: "kick"; reason: string };
+  | { t: "kick"; reason: string }
+  | LobbyView;
+
+/** Fewer than this on chain and a holders match cannot be locked. */
+export const MIN_PLAYERS_TO_LOCK = 2;
+
+/**
+ * How a holders lobby stands, sent to everyone in it whenever it changes and
+ * at every poll. Every number is the chain's, read off the match account.
+ */
+export interface LobbyView {
+  t: "lobby";
+  matchId: string;
+  /** waiting, locking (lock sent, room opening), expired or over. */
+  phase: "waiting" | "locking" | "expired" | "over";
+  count: number;
+  maxPlayers: number;
+  /** Lamports per player, decimal. */
+  stake: string;
+  /** Unix seconds. */
+  joinDeadline: number;
+  /** One entry per joined slot: is that player connected in the lobby. */
+  present: boolean[];
+  /** Seconds before the deadline at which the match locks regardless. */
+  lockBefore: number;
+}
 
 export interface RosterEntry {
   slot: number;
