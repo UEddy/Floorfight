@@ -11,6 +11,51 @@ it has to be compiled into the binary. The development build is an APK you
 install once and then point at a Metro server, which is the same loop Expo Go
 gives you but with native modules included.
 
+## Two builds
+
+`eas.json` has two Android profiles that matter, and they are for different
+people.
+
+| Profile | Who it is for | JavaScript | Needs Metro |
+| --- | --- | --- | --- |
+| `preview` | judges, testers, anyone installing the APK | bundled into the APK | no |
+| `development` | you, while changing the shell | loaded from Metro on your machine | yes |
+
+**`preview` is the submission APK.** It is a release build
+(`:app:assembleRelease`, `developmentClient: false`), so Metro bundles the
+JavaScript into the APK at build time and the app starts on its own, on any
+phone, with no dev server and no computer on the same network. `expo-dev-client`
+is in the plugin list, but its launcher only exists in debug builds, so it
+does not appear in this one.
+
+```sh
+cd apps/mobile
+eas build --profile preview --platform android
+```
+
+EAS gives you a URL for the `.apk`. That file is what goes in the submission
+and what a judge sideloads. It still loads the game from
+`https://floorfight.duckdns.org`, so the droplet has to be up for it to be
+playable; the shell itself needs nothing else.
+
+**`development`** is the debug build with the dev client launcher, for your
+own testing. Install it once, then run Metro and JavaScript changes reload
+without a rebuild:
+
+```sh
+eas build --profile development --platform android   # once, or when native deps change
+npx expo start --dev-client                          # every session
+```
+
+There is also a `production` profile that makes an Android App Bundle
+(`.aab`). That is the Play Store format and not what the dApp Store or a
+sideload wants; leave it alone until a store asks for it.
+
+No profile sets an update `channel`: those only mean something with
+`expo-updates` installed, and it is not. Every change to the shell's
+JavaScript reaches `preview` users through a new APK, which for a wallet
+holding app is the right default anyway.
+
 ## What you need to set up yourself
 
 I have not done any of this, and none of it can be done from here.
@@ -39,7 +84,8 @@ I have not done any of this, and none of it can be done from here.
    because it does not exist until an account creates it. Commit it once it
    is there.
 
-4. **A development build, and install it on the phone.**
+4. **A development build, and install it on the phone.** (For the
+   submission APK, see "Two builds" above: `--profile preview`.)
 
    ```sh
    eas build --profile development --platform android
