@@ -170,7 +170,9 @@ export class Bot {
       // Yaw units run the same way sim.ts reads them: x is -sin, z is -cos.
       const want = quantYaw(Math.atan2(-dx, -dz));
       this.aim = (want + this.rand(AIM_SLOP * 2) - AIM_SLOP + YAW_UNITS) % YAW_UNITS;
-      this.pitch = Math.atan2(dy, Math.sqrt(dx * dx + dz * dz));
+      // Pull down against most of the climb, the way a person does, and not
+      // all of it, the way a person does not.
+      this.pitch = Math.atan2(dy, Math.sqrt(dx * dx + dz * dz)) - me.kick * 0.7;
       this.strafe = 0;
     }
 

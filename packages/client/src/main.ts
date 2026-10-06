@@ -9,12 +9,15 @@ import {
   createWorld,
   cosU,
   onGround,
+  recoilSettle,
+  recoilShot,
   shotSpread,
   rayGrid,
   sinU,
   yawToRadians,
   type HitEvent,
   type Input,
+  type RecoilState,
 } from "../../shared/sim";
 import { BLOOM_GAP, WEAPONS } from "../../shared/weapons";
 import { fromHex, sha256Hex } from "../../shared/sha256";
@@ -87,6 +90,13 @@ let lastFireSeq = -999;
  * Display only: the server keeps its own count and that is the one used.
  */
 let myStreak = 0;
+/**
+ * Our recoil, run through the sim's own recoilShot and recoilSettle at the
+ * cadence of our own shots, the same way the server runs it over the same
+ * shots. The camera turns by exactly this, so the crosshair stays where the
+ * server will send the next shot.
+ */
+const myRecoil: RecoilState = { kick: 0, drift: 0 };
 let lastDrySeq = -999;
 let lastSnap: { tick: number; players: SnapshotPlayer[] } | null = null;
 let firstSnap: SnapshotPlayer[] | null = null;
@@ -269,10 +279,14 @@ const handlers: NetHandlers = {
       if (me.g !== myWeapon) {
         sfx.swap();
         controls.syncWeapon(me.g);
+        myRecoil.kick = 0;
+        myRecoil.drift = 0;
       }
       if (myReload === 0 && me.r > 0) {
-        sfx.reload((me.r / TICK_HZ) * 1000, me.g);
+        // Placed on the reload the server started, which may have been a
+        // round trip ago, so each sound lands on its frame of the animation.
         const full = (WEAPONS[me.g] ?? WEAPONS[0]).reloadTicks;
+        sfx.reload((full / TICK_HZ) * 1000, ((full - me.r) / TICK_HZ) * 1000, me.g);
         reloadStartedAt = now - ((full - me.r) / TICK_HZ) * 1000;
       }
       myWeapon = me.g;
@@ -500,6 +514,15 @@ function tick(now: number): void {
     weapon: intent.weapon,
   };
   predictor!.apply(inp);
+  if (inp.weapon > 0 && inp.weapon - 1 !== myWeapon) {
+    myRecoil.kick = 0;
+    myRecoil.drift = 0;
+  }
+  if (!alive) {
+    myRecoil.kick = 0;
+    myRecoil.drift = 0;
+  }
+  recoilSettle(myRecoil, spec, seq - lastFireSeq);
 
   // Cosmetic only. The server decides whether the shot happened and what it
   // hit; this draws a flash, a tracer and a report at the cadence the server
@@ -510,6 +533,7 @@ function tick(now: number): void {
       lastFireSeq = seq;
       stats.shots++;
       ownShot(now, spec.range);
+      recoilShot(myRecoil, spec, myStreak);
     } else if (seq - lastDrySeq > 20) {
       lastDrySeq = seq;
       sfx.dryFire();
@@ -528,8 +552,9 @@ function ownShot(now: number, range: number): void {
   renderer.muzzleFlash(myWeapon);
   sfx.shot(myWeapon, 0);
 
-  const yaw = quantYaw(controls.intent.yaw);
-  const pitch = (quantPitch(controls.intent.pitch) / 32767) * PITCH_LIMIT;
+  const yaw = quantYaw(controls.intent.yaw) + myRecoil.drift;
+  const pitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT,
+    (quantPitch(controls.intent.pitch) / 32767) * PITCH_LIMIT + myRecoil.kick));
   const cp = Math.cos(pitch);
   const dx = -sinU(yaw) * cp;
   const dy = Math.sin(pitch);
@@ -582,11 +607,14 @@ function frame(): void {
   const y = predictor.prevY + (me.y - predictor.prevY) * alpha + predictor.errY;
   const z = predictor.prevZ + (me.z - predictor.prevZ) * alpha + predictor.errZ;
 
-  // Aim is drawn quantised, exactly as it will be sent, so the crosshair and
-  // the server's ray agree to the last unit.
+  // Aim is drawn quantised, exactly as it will be sent, plus the recoil the
+  // sim will add to it, so the crosshair and the server's ray agree to the
+  // last unit. The kick is the camera moving: there is no separate shake
+  // that turns it, because that would aim the crosshair somewhere else.
   const intent = controls.intent;
-  const yaw = yawToRadians(quantYaw(intent.yaw));
-  const pitch = (quantPitch(intent.pitch) / 32767) * PITCH_LIMIT;
+  const yaw = yawToRadians(quantYaw(intent.yaw) + myRecoil.drift);
+  const pitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT,
+    (quantPitch(intent.pitch) / 32767) * PITCH_LIMIT + myRecoil.kick));
 
   if (interp.ready) {
     interp.sample(now, remotes);

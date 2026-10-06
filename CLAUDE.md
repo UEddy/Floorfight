@@ -109,6 +109,15 @@ sixteen blocks. The rifle and pistol reach 140, past the hall's longest line. Ma
 damage, head multiplier, spread, pellet count and range all live in that
 table, and the server is the only thing that acts on it.
 
+Recoil is sim state too. Each shot lifts the aim by the weapon's kick, up to
+a ceiling, and pushes it sideways along a fixed sway pattern; once the trigger
+rests it settles back. The shot goes where the input points plus that offset,
+so pulling down against the climb is the skill, and the server is the one
+that applies it. The client runs the same `recoilShot` and `recoilSettle`
+over its own shots and turns the camera by exactly the result, which keeps
+the crosshair on the next shot. A test holds the two to the same numbers
+tick for tick.
+
 Pellet spread comes from hashing (salt, tick, slot, pellet index), never
 `Math.random`. A replay has to be able to derive every random looking number
 the match used from values the log already contains, and all four are in it.
@@ -177,7 +186,7 @@ Everything else follows from that:
 - Any aim assist is computed server side and applied identically to every
   player. Client-side aim assist in a staked match is a cheat vector.
 - Firing, reloading and swapping weapons are intent bits. The magazine, the
-  interval, the spread, what the shot hit and how much it hurt are all decided
+  interval, the recoil, the spread, what the shot hit and how much it hurt are all decided
   server side, and the damage numbers on screen are the server's own, read off
   its hit events.
 - The full accepted input log hashes to a value committed on chain with the

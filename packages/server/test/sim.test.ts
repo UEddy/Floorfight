@@ -27,6 +27,9 @@ import {
   ROUND_TICKS,
   SPAWNS,
   pickSpawn,
+  recoilSettle,
+  recoilShot,
+  RECOIL_SETTLE_DELAY,
   TICK_HZ,
   YAW_UNITS,
   boxBlocked,
@@ -855,6 +858,93 @@ test("a hostile weapon index is ignored", () => {
     assert.ok(p.weapon >= 0 && p.weapon < WEAPON_COUNT, `weapon became ${p.weapon}`);
   }
   assert.equal(p.weapon, W_RIFLE, "nothing in that list should have changed the weapon");
+});
+
+/* ------------------------------------------------------------ recoil --- */
+
+test("a held rifle climbs, walks sideways, and settles once the trigger rests", () => {
+  const w = createWorld(1);
+  const p = w.players[0];
+  const spec = WEAPONS[W_RIFLE];
+  const hits: HitEvent[] = [];
+  let last = 0;
+  // Into the air, so nothing is hit and nothing else changes.
+  for (let i = 0; i < spec.fireInterval * 12; i++) {
+    step(w, [{ ...input({ fire: 1, pitch: 10000 }), tick: w.tick, view: w.tick }], hits);
+    assert.ok(p.kick >= last - spec.recoil.settle * spec.fireInterval, "the climb should not drop away mid string");
+    last = p.kick;
+  }
+  assert.ok(p.kick > spec.recoil.kick * 3, `twelve shots climbed only ${p.kick}`);
+  assert.ok(p.kick <= spec.recoil.kickMax);
+  let swayed = false;
+  for (let i = 0; i < spec.fireInterval * 6; i++) {
+    step(w, [{ ...input({ fire: 1, pitch: 10000 }), tick: w.tick, view: w.tick }], hits);
+    if (p.drift !== 0) swayed = true;
+  }
+  assert.ok(swayed, "a string of shots should push the aim sideways");
+  run(w, 0, input(), 120);
+  assert.equal(p.kick, 0, "two seconds after letting go the aim is back");
+  assert.equal(p.drift, 0);
+});
+
+test("the client's recoil model is the sim's, tick for tick", () => {
+  // The client runs recoilShot and recoilSettle over its own shots to move
+  // the camera. Fed the same trigger and the same cadence, it has to land on
+  // exactly the numbers the sim does, or the crosshair is lying.
+  for (const weapon of [W_RIFLE, W_PISTOL, W_SHOTGUN]) {
+    const spec = WEAPONS[weapon];
+    const w = createWorld(1);
+    const p = w.players[0];
+    run(w, 0, input({ weapon: weapon + 1 }), SWITCH_TICKS + 1);
+    const mine = { kick: 0, drift: 0 };
+    let lastFire = -999;
+    let streak = 0;
+    let held = false;
+    for (let t = 0; t < 400; t++) {
+      // Bursts with pauses, so the settle path runs too.
+      const fire = t % 50 < 30 && p.ammo[weapon] > 0;
+      const tick = w.tick;
+      step(w, [{ ...input({ fire: fire ? 1 : 0, pitch: 12000 }), tick, view: tick }], []);
+      recoilSettle(mine, spec, tick - lastFire);
+      const edge = spec.auto || !held;
+      held = fire;
+      if (fire && edge && tick - lastFire >= spec.fireInterval && p.reloadUntil === 0) {
+        streak = tick - lastFire <= 15 ? streak + 1 : 0;
+        lastFire = tick;
+        recoilShot(mine, spec, streak);
+      }
+      assert.equal(mine.kick, p.kick, `${spec.name} kick parted at tick ${tick}`);
+      assert.equal(mine.drift, p.drift, `${spec.name} drift parted at tick ${tick}`);
+    }
+    assert.ok(RECOIL_SETTLE_DELAY > 0);
+  }
+});
+
+test("a shot goes where the recoil has put the aim", () => {
+  // Point blank on the bandstand with the pistol: level, it is a head shot.
+  // With the aim already kicked thirty degrees up, the same shot sails over.
+  const shoot = (kick: number) => {
+    const w = duel();
+    const hits: HitEvent[] = [];
+    w.players[1].z = cellCentreZ(DUEL_Z + 3);
+    run(w, 0, input({ weapon: W_PISTOL + 1, yaw: FACING }), SWITCH_TICKS + 1);
+    w.players[0].kick = kick;
+    w.players[0].lastFireTick = w.tick - WEAPONS[W_PISTOL].fireInterval;
+    step(w, [{ ...input({ yaw: FACING, fire: 1 }), tick: w.tick, view: w.tick }], hits);
+    return hits;
+  };
+  assert.equal(shoot(0).length, 1, "level, the shot lands");
+  assert.equal(shoot(0.5).length, 0, "kicked up, it goes over their head");
+});
+
+test("a weapon swap and a respawn both start with no recoil", () => {
+  const w = createWorld(1);
+  const p = w.players[0];
+  for (let i = 0; i < 30; i++) step(w, [{ ...input({ fire: 1, pitch: 10000 }), tick: w.tick, view: w.tick }], []);
+  assert.ok(p.kick > 0);
+  step(w, [{ ...input({ weapon: W_SHOTGUN + 1 }), tick: w.tick, view: w.tick }], []);
+  assert.equal(p.kick, 0);
+  assert.equal(p.drift, 0);
 });
 
 test("the round is three minutes and respawning takes three seconds", () => {

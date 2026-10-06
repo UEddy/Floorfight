@@ -23,7 +23,7 @@ export const PROTOCOL_VERSION = 7;
  * spread, so a v4 log replayed by this build would not reproduce its match.
  * 6 refuses a lag compensated hit on a victim who is behind cover at the
  * tick the shot is resolved. 7 is the 96 by 96 hall, respawning away from
- * enemies, and rifle and pistol range long enough for it.
+ * enemies, rifle and pistol range long enough for it, and recoil.
  */
 export const LOG_VERSION = 7;
 

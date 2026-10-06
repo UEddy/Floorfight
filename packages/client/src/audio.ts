@@ -28,9 +28,14 @@ import { W_PISTOL, W_RIFLE, W_SHOTGUN } from "../../shared/weapons";
  *     the hall therefore arrives late, dull and boomy, which is the cue a
  *     player uses to judge range.
  *   - Direction. Other people's shots are panned to the side they came from.
+ *   - Punch. What the shooter feels more than hears: a short sub bass thump
+ *     under their own shot, and the slap of the nearest walls a few tens of
+ *     milliseconds after it, which is most of what makes a shot sound close.
  *   - Mechanism. The bolt or slide cycling, brass casings tinkling onto the
  *     boards a moment later, the shotgun's pump, and reloads with a release,
- *     a magazine out, a magazine in and a charging handle.
+ *     a magazine out and clattering on the floor, a fresh one in and seated,
+ *     and a charging handle, each on the frame of the reload animation where
+ *     the hand does it.
  *
  * Every played sound picks one of several pre-rendered variants and a small
  * random pitch change, so an automatic burst is never the same buffer twice.
@@ -280,6 +285,36 @@ export function renderClick(
   return out;
 }
 
+/**
+ * The punch under a shot: a sine falling from `from` to `to` Hz over a few
+ * tens of milliseconds, with a click on the front. A phone speaker cannot
+ * reproduce the bottom of it, but it reproduces the harmonics the saturation
+ * adds, and the ear fills in the rest.
+ */
+export function renderPunch(sr: number, from: number, to: number, ms: number): Float32Array {
+  const n = Math.floor((ms / 1000) * 3 * sr);
+  const out = new Float32Array(n);
+  const tau = ms / 1000;
+  let phase = 0;
+  for (let i = 0; i < n; i++) {
+    const t = i / sr;
+    const f = to + (from - to) * Math.exp(-t / (tau * 0.35));
+    phase += (2 * Math.PI * f) / sr;
+    out[i] = Math.sin(phase) * Math.exp(-t / tau) * (i < sr * 0.001 ? i / (sr * 0.001) : 1);
+  }
+  saturate(out, 2.2);
+  normalise(out, 0.95);
+  fadeEdges(out, sr);
+  return out;
+}
+
+/** Punch for each weapon: Hz from, Hz to, decay ms, level. */
+const PUNCH: Record<number, [number, number, number, number]> = {
+  [W_RIFLE]: [120, 46, 60, 0.6],
+  [W_PISTOL]: [150, 58, 45, 0.5],
+  [W_SHOTGUN]: [95, 36, 120, 0.95],
+};
+
 /** A magazine sliding out of or into a well: a short swept noise. */
 function renderSlide(sr: number, seed: number, ms: number, from: number, to: number): Float32Array {
   const r = rng(seed);
@@ -347,6 +382,7 @@ function renderHall(ctx: BaseAudioContext): AudioBuffer {
 
 interface Bank {
   shots: Record<number, AudioBuffer[]>;
+  punches: Record<number, AudioBuffer>;
   casings: AudioBuffer[];
   hulls: AudioBuffer[];
   bolt: AudioBuffer[];
@@ -389,7 +425,9 @@ export class Sfx {
     comp.threshold.value = -14;
     comp.knee.value = 8;
     comp.ratio.value = 4;
-    comp.attack.value = 0.002;
+    // Slow enough to let the crack of a shot through before it clamps down,
+    // which is where the punch is.
+    comp.attack.value = 0.005;
     comp.release.value = 0.22;
     const master = ctx.createGain();
     master.gain.value = MASTER;
@@ -431,11 +469,15 @@ export class Sfx {
     const variants = (f: (seed: number) => Float32Array) =>
       Array.from({ length: VARIANTS }, (_, i) => mk(f(i * 104729 + 17)));
     const shots: Record<number, AudioBuffer[]> = {};
+    const punches: Record<number, AudioBuffer> = {};
     for (const w of [W_RIFLE, W_PISTOL, W_SHOTGUN]) {
       shots[w] = variants((s) => renderShot(GUNS[w], sr, s + w * 31));
+      const [from, to, ms] = PUNCH[w];
+      punches[w] = mk(renderPunch(sr, from, to, ms));
     }
     return {
       shots,
+      punches,
       casings: variants((s) => renderCasing(sr, s, false)),
       hulls: variants((s) => renderCasing(sr, s + 5, true)),
       bolt: variants((s) => renderClick(sr, s + 1, 18, 2800, 1.3, 3400)),
@@ -516,9 +558,16 @@ export class Sfx {
     const buf = this.pick(b.shots[weapon] ?? b.shots[W_RIFLE]);
     const own = distance <= 0.01;
 
+    const punch = PUNCH[weapon] ?? PUNCH[W_RIFLE];
     if (own) {
-      // Right on top of us: full level, a little room, then the mechanism.
-      this.play(buf, weapon === W_SHOTGUN ? 1.0 : weapon === W_PISTOL ? 0.9 : 0.8, { send: 0.35 });
+      // Right on top of us: full level, the thump under it, the near walls
+      // slapping it back from either side, a little room, then the
+      // mechanism.
+      this.play(buf, weapon === W_SHOTGUN ? 1.0 : weapon === W_PISTOL ? 0.95 : 0.85, { send: 0.35 });
+      this.play(b.punches[weapon] ?? b.punches[W_RIFLE], punch[3], { send: 0, rate: 0.96 + Math.random() * 0.08 });
+      const slap = weapon === W_SHOTGUN ? 0.32 : 0.24;
+      this.play(buf, slap, { delay: 0.028 + Math.random() * 0.01, pan: -0.7, cutoff: 5200, send: 0.1 });
+      this.play(buf, slap * 0.8, { delay: 0.047 + Math.random() * 0.012, pan: 0.7, cutoff: 4200, send: 0.1 });
       if (weapon === W_SHOTGUN) {
         // Rack the pump, and the empty hull drops.
         this.play(this.pick(b.pump), 0.35, { delay: 0.32, send: 0.15 });
@@ -539,6 +588,12 @@ export class Sfx {
     const direct = 0.85 / (1 + distance / 7);
     const cutoff = Math.max(1800, 16000 - distance * 380);
     this.play(buf, direct, { delay, pan, cutoff, send: 0.5 / Math.max(direct, 0.15) * 0.25 });
+    // Close by, you feel someone else's shot too.
+    if (distance < 20) {
+      this.play(b.punches[weapon] ?? b.punches[W_RIFLE], punch[3] * direct * 0.8, {
+        delay, pan, cutoff: 400, send: 0,
+      });
+    }
   }
 
   /** Trigger pulled on an empty magazine. */
@@ -548,28 +603,38 @@ export class Sfx {
   }
 
   /**
-   * A reload over `ms`, for the weapon in hand. Timed against the reload
-   * the server is running, so the last sound lands as the magazine fills.
+   * A reload of `totalMs`, of which `elapsedMs` has already gone by, for the
+   * weapon in hand. Each sound sits at the fraction of the reload where the
+   * view model's hands do that thing (viewmodel.ts), so the click of the
+   * magazine seating is heard on the frame it seats. Anything already past
+   * when we hear about the reload is skipped rather than played late.
    */
-  reload(ms: number, weapon: number = W_RIFLE): void {
+  reload(totalMs: number, elapsedMs: number, weapon: number = W_RIFLE): void {
     if (!this.ready) return;
     const b = this.bank!;
-    const s = ms / 1000;
+    const at = (f: number) => (f * totalMs - elapsedMs) / 1000;
+    const cue = (f: number, buf: AudioBuffer, gain: number, send: number, rate?: number) => {
+      const d = at(f);
+      if (d < -0.02) return;
+      this.play(buf, gain, { delay: Math.max(0, d), send, rate });
+    };
     if (weapon === W_SHOTGUN) {
-      // Shells one at a time, then the pump.
-      const shells = 4;
-      for (let i = 0; i < shells; i++) {
-        this.play(this.pick(b.shell), 0.35, { delay: 0.25 + (i * (s - 0.7)) / shells, send: 0.12 });
-      }
-      this.play(this.pick(b.pump), 0.4, { delay: s - 0.32, send: 0.15 });
-      this.play(this.pick(b.pump), 0.35, { delay: s - 0.18, send: 0.15, rate: 1.15 });
+      // Five shells, one on each push of the loading hand, then the pump
+      // racked back and run home.
+      for (let k = 0; k < 5; k++) cue(0.12 + (0.66 * (k + 0.5)) / 5, this.pick(b.shell), 0.38, 0.12);
+      cue(0.86, this.pick(b.pump), 0.45, 0.15);
+      cue(0.95, this.pick(b.pump), 0.42, 0.15, 1.15);
       return;
     }
-    this.play(b.magRelease, 0.35, { delay: 0.05, send: 0.1 });
-    this.play(b.magOut, 0.3, { delay: 0.12, send: 0.1 });
-    this.play(b.magIn, 0.45, { delay: Math.max(0.3, s * 0.6), send: 0.12 });
-    this.play(weapon === W_PISTOL ? this.pick(b.slide) : b.charge, 0.45,
-      { delay: Math.max(0.45, s - 0.2), send: 0.15 });
+    // Release, the magazine sliding out and hitting the floor, the fresh one
+    // sliding in and seating with a slap, then the charging handle or the
+    // slide let go.
+    cue(0.2, b.magRelease, 0.4, 0.1);
+    cue(0.24, b.magOut, 0.32, 0.1);
+    cue(0.47, this.pick(b.hulls), 0.28, 0.3, 0.7);
+    cue(0.6, b.magOut, 0.26, 0.1, 1.25);
+    cue(0.8, b.magIn, 0.55, 0.14);
+    cue(0.9, weapon === W_PISTOL ? this.pick(b.slide) : b.charge, 0.5, 0.15);
   }
 
   /* ------------------------------------------------------- HUD sounds --- */
