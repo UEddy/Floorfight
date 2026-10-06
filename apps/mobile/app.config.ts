@@ -56,6 +56,9 @@ const base: ExpoConfig = {
     // A development build rather than Expo Go, because MWA is native code.
     "expo-dev-client",
   ],
+  extra: {
+    eas: { projectId: "178670c1-c103-4718-97ed-05dce4d00cf7" },
+  },
   experiments: {
     typedRoutes: false,
   },
