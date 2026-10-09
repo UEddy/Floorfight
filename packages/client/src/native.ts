@@ -75,9 +75,15 @@ export async function signJoin(matchId: string, nonce: string): Promise<{ wallet
   return { wallet: String(r.wallet), signature: String(r.signature) };
 }
 
-/** Create a match at a tier. Resolves to the match id the app generated. */
-export async function createMatch(tier: number): Promise<{ matchId: string; signature: string }> {
-  const r = await ask({ t: "escrow", action: "create", tier });
+/**
+ * Create a match at a tier, in a currency out of the fixed list. The app
+ * maps both to an amount and, for "skr", its own devnet test mint. Resolves
+ * to the match id the app generated ("skr-" in front for a token pot).
+ */
+export async function createMatch(
+  tier: number, currency: "sol" | "skr" = "sol",
+): Promise<{ matchId: string; signature: string }> {
+  const r = await ask({ t: "escrow", action: "create", tier, currency });
   return { matchId: String(r.matchId), signature: String(r.signature) };
 }
 

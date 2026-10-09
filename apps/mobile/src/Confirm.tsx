@@ -1,6 +1,5 @@
 import { Modal, Pressable, StyleSheet, Text, View } from "react-native";
-import { LAMPORTS_PER_SOL } from "./config";
-import type { Planned } from "./escrow";
+import { formatUnits, type Planned } from "./escrow";
 
 /**
  * What the person is being asked to approve, before the wallet opens.
@@ -19,15 +18,17 @@ export function Confirm(props: {
   const p = props.planned;
   if (!p) return null;
 
-  const sol = (Number(p.lamports) / LAMPORTS_PER_SOL).toFixed(4);
+  // Exact, in integers, in the currency the chain says the match is in. A
+  // token pot is labelled "Test SKR (devnet)", never just "SKR".
+  const amount = `${formatUnits(p.amount, p.decimals)} ${p.unit}`;
   const title = p.action === "create"
     ? "Create a match"
     : p.action === "join"
       ? "Join this match"
       : p.action === "claim" ? "Claim your payout" : "Refund your stake";
   const line = p.direction === "pay"
-    ? `You will stake ${sol} SOL`
-    : `You will receive up to ${sol} SOL`;
+    ? `You will stake ${amount}`
+    : `You will receive up to ${amount}`;
 
   return (
     <Modal transparent animationType="fade" visible onRequestClose={props.onCancel}>
@@ -36,7 +37,7 @@ export function Confirm(props: {
           <Text style={styles.title}>{title}</Text>
           <Text style={styles.amount}>{line}</Text>
           <Text style={styles.detail}>{p.detail}</Text>
-          <Text style={styles.meta}>Match {String(p.matchId)}</Text>
+          <Text style={styles.meta}>Match {p.key}</Text>
           <Text style={styles.meta}>
             {props.wallet ? `Wallet ${short(props.wallet)}` : "Your wallet will be asked next"}
           </Text>

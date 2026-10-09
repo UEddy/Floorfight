@@ -8,6 +8,106 @@
   },
   "instructions": [
     {
+      "name": "allow_mint",
+      "docs": [
+        "Admin: allow a mint for token pots, with its own stake range in raw",
+        "units. Only a classic SPL Token mint can be named here: `Account<Mint>`",
+        "checks the owner is the Token program, so a Token-2022 mint is",
+        "refused before this body runs.",
+        "",
+        "A mint with a freeze authority can have the vault frozen, which traps",
+        "every stake in it. So one is refused unless the admin writes down",
+        "exactly which freeze authority they are accepting, and it has to be",
+        "the one the mint actually has."
+      ],
+      "discriminator": [
+        240,
+        28,
+        240,
+        70,
+        124,
+        240,
+        245,
+        225
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "mint",
+          "docs": [
+            "Classic SPL Token only: the owner check on Account<Mint> refuses a",
+            "Token-2022 mint."
+          ]
+        },
+        {
+          "name": "allow",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  105,
+                  110,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "min_stake",
+          "type": "u64"
+        },
+        {
+          "name": "max_stake",
+          "type": "u64"
+        },
+        {
+          "name": "freeze_authority",
+          "type": {
+            "option": "pubkey"
+          }
+        }
+      ]
+    },
+    {
       "name": "claim",
       "docs": [
         "Pull a payout or a refund. Never paused and never reads config, so no",
@@ -51,6 +151,130 @@
               }
             ]
           }
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "claim_token",
+      "docs": [
+        "Pull a payout or a refund from a token match's vault. Never paused,",
+        "never reads the config or the allowlist: no admin action can stop a",
+        "player getting out what they are owed."
+      ],
+      "discriminator": [
+        116,
+        206,
+        27,
+        191,
+        166,
+        19,
+        0,
+        73
+      ],
+      "accounts": [
+        {
+          "name": "player",
+          "signer": true
+        },
+        {
+          "name": "token_match",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  109,
+                  97,
+                  116,
+                  99,
+                  104
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "token_match.match_id",
+                "account": "TokenMatch"
+              }
+            ]
+          }
+        },
+        {
+          "name": "mint",
+          "relations": [
+            "token_match"
+          ]
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "token_match"
+              },
+              {
+                "kind": "account",
+                "path": "token_program"
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
+        },
+        {
+          "name": "player_tokens",
+          "docs": [
+            "Where the payout goes: the match's mint, owned by the player. The",
+            "claimer is the signer, so a payout can only ever go to its owner."
+          ],
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
         }
       ],
       "args": []
@@ -112,6 +336,197 @@
               }
             ]
           }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "match_id",
+          "type": "u64"
+        },
+        {
+          "name": "stake",
+          "type": "u64"
+        },
+        {
+          "name": "max_players",
+          "type": "u8"
+        },
+        {
+          "name": "join_window",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "create_token_match",
+      "docs": [
+        "A match whose pot is in an allowed token. Same rules as create_match,",
+        "with the stake range taken from the mint's allowlist entry. The vault",
+        "is the associated token account of the match PDA, created here, so",
+        "only this program can ever move tokens out of it."
+      ],
+      "discriminator": [
+        31,
+        211,
+        37,
+        234,
+        193,
+        196,
+        230,
+        111
+      ],
+      "accounts": [
+        {
+          "name": "creator",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "mint",
+          "relations": [
+            "allow"
+          ]
+        },
+        {
+          "name": "allow",
+          "docs": [
+            "The allowlist entry. Its seeds tie it to this mint: no entry, no",
+            "match."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  105,
+                  110,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "token_match",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  109,
+                  97,
+                  116,
+                  99,
+                  104
+                ]
+              },
+              {
+                "kind": "arg",
+                "path": "match_id"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault",
+          "docs": [
+            "The vault: the match PDA's associated token account for the mint.",
+            "init_if_needed rather than init because anyone can create another",
+            "account's ATA, and a stranger creating this one first must not be able",
+            "to block the match. Either way the address, mint and authority are",
+            "checked, so it is the PDA's account and nobody else's."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "token_match"
+              },
+              {
+                "kind": "account",
+                "path": "token_program"
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "associated_token_program",
+          "address": "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
         },
         {
           "name": "system_program",
@@ -281,6 +696,146 @@
       "args": []
     },
     {
+      "name": "join_token_match",
+      "docs": [
+        "Stake into a token match, from a token account of the match's mint",
+        "that the player owns, into the match's vault. Same rules as join_match."
+      ],
+      "discriminator": [
+        142,
+        35,
+        90,
+        206,
+        242,
+        128,
+        221,
+        85
+      ],
+      "accounts": [
+        {
+          "name": "player",
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "token_match",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  109,
+                  97,
+                  116,
+                  99,
+                  104
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "token_match.match_id",
+                "account": "TokenMatch"
+              }
+            ]
+          }
+        },
+        {
+          "name": "mint",
+          "relations": [
+            "token_match"
+          ]
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "token_match"
+              },
+              {
+                "kind": "account",
+                "path": "token_program"
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
+        },
+        {
+          "name": "player_tokens",
+          "docs": [
+            "Where the stake comes from: the match's mint, owned by the player."
+          ],
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "lock_match",
       "docs": [
         "Start a match that did not fill. Resolver only, at least two players,",
@@ -341,6 +896,74 @@
                 "kind": "account",
                 "path": "match_account.match_id",
                 "account": "Match"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "lock_token_match",
+      "docs": [
+        "lock_match for a token match."
+      ],
+      "discriminator": [
+        148,
+        89,
+        17,
+        115,
+        211,
+        44,
+        126,
+        167
+      ],
+      "accounts": [
+        {
+          "name": "resolver",
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "token_match",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  109,
+                  97,
+                  116,
+                  99,
+                  104
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "token_match.match_id",
+                "account": "TokenMatch"
               }
             ]
           }
@@ -442,6 +1065,94 @@
       ]
     },
     {
+      "name": "settle_token_match",
+      "docs": [
+        "settle for a token match: the same placement rules and the same",
+        "50/30/20 split with the rounding dust to first place."
+      ],
+      "discriminator": [
+        180,
+        150,
+        117,
+        66,
+        81,
+        37,
+        196,
+        4
+      ],
+      "accounts": [
+        {
+          "name": "resolver",
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "token_match",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  109,
+                  97,
+                  116,
+                  99,
+                  104
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "token_match.match_id",
+                "account": "TokenMatch"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "placements",
+          "type": {
+            "array": [
+              "u8",
+              3
+            ]
+          }
+        },
+        {
+          "name": "log_hash",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        }
+      ]
+    },
+    {
       "name": "update_config",
       "discriminator": [
         29,
@@ -507,6 +1218,98 @@
           "type": "bool"
         }
       ]
+    },
+    {
+      "name": "update_mint",
+      "docs": [
+        "Admin: change an allowed mint's range, or turn it off for new matches.",
+        "Matches already created with it are unaffected, and their exits never",
+        "read this account."
+      ],
+      "discriminator": [
+        212,
+        203,
+        57,
+        78,
+        75,
+        245,
+        222,
+        5
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "mint",
+          "relations": [
+            "allow"
+          ]
+        },
+        {
+          "name": "allow",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  105,
+                  110,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "min_stake",
+          "type": "u64"
+        },
+        {
+          "name": "max_stake",
+          "type": "u64"
+        },
+        {
+          "name": "freeze_authority",
+          "type": {
+            "option": "pubkey"
+          }
+        },
+        {
+          "name": "enabled",
+          "type": "bool"
+        }
+      ]
     }
   ],
   "accounts": [
@@ -534,6 +1337,32 @@
         56,
         196,
         162
+      ]
+    },
+    {
+      "name": "MintAllow",
+      "discriminator": [
+        107,
+        208,
+        237,
+        107,
+        65,
+        136,
+        73,
+        247
+      ]
+    },
+    {
+      "name": "TokenMatch",
+      "discriminator": [
+        156,
+        85,
+        237,
+        216,
+        57,
+        0,
+        3,
+        163
       ]
     }
   ],
@@ -591,6 +1420,19 @@
       ]
     },
     {
+      "name": "MintAllowed",
+      "discriminator": [
+        80,
+        212,
+        130,
+        120,
+        125,
+        216,
+        111,
+        240
+      ]
+    },
+    {
       "name": "PlayerJoined",
       "discriminator": [
         39,
@@ -601,6 +1443,32 @@
         210,
         183,
         38
+      ]
+    },
+    {
+      "name": "TokenClaimed",
+      "discriminator": [
+        49,
+        144,
+        233,
+        63,
+        84,
+        154,
+        232,
+        26
+      ]
+    },
+    {
+      "name": "TokenMatchCreated",
+      "discriminator": [
+        134,
+        32,
+        194,
+        99,
+        255,
+        110,
+        249,
+        210
       ]
     }
   ],
@@ -699,6 +1567,16 @@
       "code": 6018,
       "name": "Overflow",
       "msg": "Arithmetic overflow"
+    },
+    {
+      "code": 6019,
+      "name": "MintNotAllowed",
+      "msg": "This mint is not allowed for token pots"
+    },
+    {
+      "code": 6020,
+      "name": "MintFreezeAuthority",
+      "msg": "The mint's freeze authority is not the one the allowlist accepted"
     }
   ],
   "types": [
@@ -954,6 +1832,80 @@
       }
     },
     {
+      "name": "MintAllow",
+      "docs": [
+        "An allowed mint for token pots. Seeds: [\"mint\", mint]."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "min_stake",
+            "docs": [
+              "Stake range in the mint's raw units."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "max_stake",
+            "type": "u64"
+          },
+          {
+            "name": "freeze_authority",
+            "docs": [
+              "The freeze authority the admin accepted, which must be the mint's own."
+            ],
+            "type": {
+              "option": "pubkey"
+            }
+          },
+          {
+            "name": "decimals",
+            "docs": [
+              "The mint's decimals when it was allowed, for anyone displaying amounts."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "enabled",
+            "type": "bool"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MintAllowed",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "min_stake",
+            "type": "u64"
+          },
+          {
+            "name": "max_stake",
+            "type": "u64"
+          },
+          {
+            "name": "enabled",
+            "type": "bool"
+          }
+        ]
+      }
+    },
+    {
       "name": "PlayerJoined",
       "type": {
         "kind": "struct",
@@ -969,6 +1921,159 @@
           {
             "name": "slot",
             "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TokenClaimed",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "match_id",
+            "type": "u64"
+          },
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "player",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "refund",
+            "type": "bool"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TokenMatch",
+      "docs": [
+        "A match whose pot is in an allowed token. The same fields as Match plus",
+        "the mint, under its own seeds, so SOL matches and their accounts are",
+        "untouched. Seeds: [\"tmatch\", match_id]. Vault: the ATA of this account."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "match_id",
+            "type": "u64"
+          },
+          {
+            "name": "creator",
+            "type": "pubkey"
+          },
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "stake",
+            "type": "u64"
+          },
+          {
+            "name": "max_players",
+            "type": "u8"
+          },
+          {
+            "name": "count",
+            "type": "u8"
+          },
+          {
+            "name": "players",
+            "type": {
+              "array": [
+                "pubkey",
+                6
+              ]
+            }
+          },
+          {
+            "name": "state",
+            "type": {
+              "defined": {
+                "name": "MatchState"
+              }
+            }
+          },
+          {
+            "name": "join_deadline",
+            "type": "i64"
+          },
+          {
+            "name": "settle_deadline",
+            "type": "i64"
+          },
+          {
+            "name": "placements",
+            "type": {
+              "array": [
+                "u8",
+                3
+              ]
+            }
+          },
+          {
+            "name": "payouts",
+            "type": {
+              "array": [
+                "u64",
+                3
+              ]
+            }
+          },
+          {
+            "name": "claimed",
+            "type": "u8"
+          },
+          {
+            "name": "log_hash",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TokenMatchCreated",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "match_id",
+            "type": "u64"
+          },
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "stake",
+            "type": "u64"
+          },
+          {
+            "name": "max_players",
+            "type": "u8"
+          },
+          {
+            "name": "join_deadline",
+            "type": "i64"
           }
         ]
       }

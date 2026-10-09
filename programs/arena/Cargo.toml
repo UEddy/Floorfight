@@ -14,14 +14,20 @@ cpi = ["no-entrypoint"]
 no-entrypoint = []
 no-idl = []
 no-log-ix-name = []
-idl-build = ["anchor-lang/idl-build"]
+# token_2022 only because anchor-spl's IDL generation needs its interface types
+# to compile; the program itself never accepts a Token-2022 account.
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build", "anchor-spl/token_2022"]
 anchor-debug = []
 custom-heap = []
 custom-panic = []
 
 
 [dependencies]
-anchor-lang = "=0.32.1"
+anchor-lang = { version = "=0.32.1", features = ["init-if-needed"] }
+# Classic SPL Token and associated token accounts only. Token-2022 is left
+# out on purpose: its extensions (transfer fees, hooks, confidential
+# transfers) would change what a stake or a payout actually moves.
+anchor-spl = { version = "=0.32.1", default-features = false, features = ["token", "associated_token"] }
 
 
 [lints.rust]
