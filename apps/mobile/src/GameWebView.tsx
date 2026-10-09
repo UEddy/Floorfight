@@ -15,6 +15,7 @@ import {
 import { plan, planCreate, transactionFor, type Planned } from "./escrow";
 import { connectWallet, currentWallet, signAndSend, signMessage } from "./wallet";
 import { Confirm } from "./Confirm";
+import { walletErrorMessage } from "./auth";
 
 /**
  * The game, in a WebView, with the shutters down.
@@ -36,7 +37,7 @@ export function GameWebView() {
   }, []);
 
   const fail = useCallback((id: string, e: unknown) => {
-    const error = e instanceof Error ? e.message : "something went wrong";
+    const error = walletErrorMessage(e);
     reply({ id, ok: false, error });
   }, [reply]);
 

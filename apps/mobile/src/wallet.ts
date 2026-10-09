@@ -14,6 +14,7 @@ import { transact, type Web3MobileWallet } from "@solana-mobile/mobile-wallet-ad
 import { PublicKey, type Transaction } from "@solana/web3.js";
 import bs58 from "bs58";
 import { APP_IDENTITY, CHAIN } from "./config";
+import { authorizeSession } from "./auth";
 
 /**
  * Cached authorisation token.
@@ -32,10 +33,20 @@ interface Authorized {
   publicKey: PublicKey;
 }
 
+/**
+ * Authorise this session: with the cached token if there is one, which
+ * skips the approval screen, and afresh if the wallet turns it down. See
+ * auth.ts for why this no longer calls reauthorize.
+ */
 async function authorize(wallet: Web3MobileWallet): Promise<Authorized> {
-  const result = authToken
-    ? await wallet.reauthorize({ auth_token: authToken, identity: APP_IDENTITY })
-    : await wallet.authorize({ chain: CHAIN, identity: APP_IDENTITY });
+  let result;
+  try {
+    result = await authorizeSession({ authorize: (p) => wallet.authorize(p) }, authToken, CHAIN, APP_IDENTITY);
+  } catch (e) {
+    // Whatever went wrong, the next attempt starts clean.
+    forgetWallet();
+    throw e;
+  }
   authToken = result.auth_token;
   const account = result.accounts[0];
   if (!account) throw new Error("the wallet authorised no accounts");
