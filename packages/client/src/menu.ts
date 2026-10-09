@@ -13,19 +13,25 @@
  * is for orientation, and says where its numbers come from.
  */
 
-import { STAKE_TIERS } from "../../shared/tiers";
+import { SKR_POT_LABEL, tiersFor, type Currency } from "../../shared/tiers";
 import type { LobbyView } from "../../shared/protocol";
 import * as native from "./native";
 import { LOUNGE_MIN_TIER, SKR_STAKE_URL, SKR_TIERS, cleanTier, tierName } from "../../shared/skr";
 
 const $ = (id: string) => document.getElementById(id) as HTMLElement;
 
-/** Lamports as SOL, trimmed. Display only. */
-export function sol(lamports: string | bigint): string {
-  const n = BigInt(lamports);
-  const whole = n / 1_000_000_000n;
-  const frac = (n % 1_000_000_000n).toString().padStart(9, "0").replace(/0+$/, "");
-  return frac ? `${whole}.${frac}` : `${whole}`;
+/** An amount in its smallest unit, at some decimals, trimmed. Display only. */
+export function units(raw: string | bigint, decimals: number): string {
+  const n = BigInt(raw);
+  if (decimals === 0) return n.toString();
+  const base = 10n ** BigInt(decimals);
+  const frac = (n % base).toString().padStart(decimals, "0").replace(/0+$/, "");
+  return frac ? `${n / base}.${frac}` : `${n / base}`;
+}
+
+/** What a currency is called on screen. A token pot is never just "SKR". */
+function unitName(currency: Currency): string {
+  return currency === "sol" ? "SOL" : SKR_POT_LABEL;
 }
 
 function esc(s: string): string {
@@ -64,6 +70,15 @@ export class Menu {
   private wallet: string | null = null;
   private mint: string | null = null;
   private tier = 0;
+  private currency: Currency = "sol";
+  /**
+   * Decimals per currency, as the server last reported them (it reads the
+   * mint). Display only: the app reads them again for itself before anything
+   * is signed.
+   */
+  private decimals: Record<Currency, number | null> = { sol: 9, skr: null };
+  /** Whether this server hosts Test SKR pots; null until it has said. */
+  private skrPots: boolean | null = null;
 
   constructor(private h: MenuHandlers) {}
 
@@ -97,23 +112,48 @@ export class Menu {
     };
   }
 
-  /** Holders: wallet, head, tier, open matches. */
+  /** Holders: wallet, head, currency, tier, open matches. */
   async showHolders(): Promise<void> {
+    if (this.skrPots === null) {
+      // Only offer Test SKR pots when the server says it hosts them (it
+      // answers 503 when it has no SKR_POT_MINT). Asked once per page load.
+      try {
+        const r = await fetch(`/api/matches?tier=0&currency=skr`, { headers: { Accept: "application/json" } });
+        this.skrPots = r.status !== 503 && r.status !== 404;
+      } catch {
+        this.skrPots = false;
+      }
+    }
+    if (!this.skrPots) this.currency = "sol";
+    const tiers = tiersFor(this.currency);
+    if (this.tier >= tiers.length) this.tier = 0;
+    const currencies: Currency[] = this.skrPots ? ["sol", "skr"] : ["sol"];
     this.el.innerHTML = `
       <div class="card holders">
         <div class="row head"><h1>Holders</h1><button class="link" data-a="back">Back</button></div>
         <div class="wallet"></div>
         <div class="skr"></div>
         <div class="nfts"></div>
-        <div class="tiers">${STAKE_TIERS.map((t, i) =>
+        ${currencies.length > 1 ? `<div class="tiers cur">${currencies.map((c) =>
+          `<button data-cur="${c}" class="${c === this.currency ? "on" : ""}">${esc(unitName(c))}</button>`).join("")}</div>` : ""}
+        <div class="tiers">${tiers.map((t, i) =>
           `<button data-tier="${i}" class="${i === this.tier ? "on" : ""}">${esc(t.label)}</button>`).join("")}</div>
         <div class="list"><p class="dim">Loading open matches...</p></div>
-        <button class="primary" data-a="create">Create a match at ${esc(STAKE_TIERS[this.tier].label)}</button>
-        <p class="note">Devnet. Amounts are confirmed by the app before your wallet opens.</p>
+        <button class="primary" data-a="create">Create a match at ${esc(tiers[this.tier].label)}</button>
+        <p class="note">Devnet. ${this.currency === "skr"
+          ? "Test SKR is a devnet test token with no value, not the real SKR. "
+          : ""}Amounts are confirmed by the app before your wallet opens.</p>
         <p class="err"></p>
       </div>`;
     this.el.classList.add("show");
     (this.el.querySelector('[data-a="back"]') as HTMLButtonElement).onclick = () => this.showModes();
+    for (const b of this.el.querySelectorAll<HTMLButtonElement>("[data-cur]")) {
+      b.onclick = () => {
+        this.currency = b.dataset.cur === "skr" ? "skr" : "sol";
+        this.tier = 0;
+        void this.showHolders();
+      };
+    }
     for (const b of this.el.querySelectorAll<HTMLButtonElement>("[data-tier]")) {
       b.onclick = () => {
         this.tier = Number(b.dataset.tier);
@@ -226,9 +266,11 @@ export class Menu {
     const box = this.el.querySelector(".list");
     if (!box) return;
     try {
-      const { matches } = await getJson<{ matches: OpenMatch[] }>(`/api/matches?tier=${this.tier}`);
+      const { matches, decimals } = await getJson<{ matches: OpenMatch[]; decimals: number | null }>(
+        `/api/matches?tier=${this.tier}&currency=${this.currency}`);
+      if (typeof decimals === "number") this.decimals[this.currency] = decimals;
       if (matches.length === 0) {
-        box.innerHTML = `<p class="dim">No open matches at ${esc(STAKE_TIERS[this.tier].label)}. Create one.</p>`;
+        box.innerHTML = `<p class="dim">No open matches at ${esc(tiersFor(this.currency)[this.tier].label)}. Create one.</p>`;
         return;
       }
       const now = Date.now() / 1000;
@@ -257,7 +299,7 @@ export class Menu {
     this.err(null);
     try {
       const wallet = await this.ensureWallet();
-      const { matchId } = await native.createMatch(this.tier);
+      const { matchId } = await native.createMatch(this.tier, this.currency);
       this.h.holders(matchId, wallet, this.mint);
     } catch (e) {
       this.err(e);
@@ -291,7 +333,7 @@ export class Menu {
     this.el.innerHTML = `
       <div class="card lobby">
         <h1>Lobby</h1>
-        <p class="sub">Match ${esc(v.matchId)} at ${esc(sol(v.stake))} SOL each</p>
+        <p class="sub">Match ${esc(v.matchId)} at ${esc(this.amount(v.stake, v.currency ?? "sol"))} each</p>
         <div class="seats">${Array.from({ length: v.maxPlayers }, (_, i) => {
           const cls = i >= v.count ? "empty" : v.present[i] ? "here" : "away";
           const label = i >= v.count ? "open" : v.present[i] ? "here" : "staked, not here";
@@ -302,6 +344,12 @@ export class Menu {
         <p class="note">No bots in a holders match. Anyone who is not here when it starts stands still.</p>
       </div>`;
     this.el.classList.add("show");
+  }
+
+  /** A stake with its unit, or just the unit when the decimals are not known yet. */
+  private amount(raw: string, currency: Currency): string {
+    const d = this.decimals[currency];
+    return d === null ? `a ${unitName(currency)} stake` : `${units(raw, d)} ${unitName(currency)}`;
   }
 
   /* ---------------------------------------------------------- results --- */
@@ -322,7 +370,12 @@ export class Menu {
         const m = await getJson<{
           state: string; players: string[]; placements: number[]; payouts: string[];
           claimed: number; settleDeadline: number; count: number; stake: string;
+          currency?: Currency; decimals?: number; label?: string;
         }>(`/api/match/${matchId}`);
+        // The currency is the chain's, via the server: the match account
+        // says which escrow it is and the mint says the decimals.
+        const d = m.decimals ?? 9;
+        const unit = m.currency === "skr" ? SKR_POT_LABEL : "SOL";
         const slot = m.players.indexOf(wallet);
         const place = m.placements.indexOf(slot);
         const claimed = slot >= 0 && (m.claimed & (1 << slot)) !== 0;
@@ -333,14 +386,14 @@ export class Menu {
         let action: "claim" | "refund" | null = null;
         if (m.state === "Settled") {
           if (place >= 0) {
-            line = `Place ${place + 1}. Payout <b>${sol(m.payouts[place])} SOL</b>${claimed ? ", claimed." : "."}`;
+            line = `Place ${place + 1}. Payout <b>${esc(units(m.payouts[place], d))} ${esc(unit)}</b>${claimed ? ", claimed." : "."}`;
             if (!claimed) action = "claim";
           } else {
             line = "Settled. You did not place this time.";
           }
           done = true;
         } else if (refundable) {
-          line = `Not settled in time. Refund <b>${sol(m.stake)} SOL</b>${claimed ? ", claimed." : "."}`;
+          line = `Not settled in time. Refund <b>${esc(units(m.stake, d))} ${esc(unit)}</b>${claimed ? ", claimed." : "."}`;
           if (!claimed) action = "refund";
           done = true;
         } else {

@@ -17,7 +17,7 @@ import {
 } from "../../shared/protocol";
 import { DEV_MATCH_ID, DEV_MIN_SEATED } from "../../shared/dev";
 import { devModeFromEnv, devRoster, devWarning } from "./dev";
-import { hasChainEnv, rosterFromMatch } from "./chain";
+import { hasChainEnv, parseMatchRef, rosterFromMatch, type MatchRef } from "./chain";
 import type { ChainConfig } from "./chainrpc";
 import { DEFAULT_LOG_DIR, finishMatch } from "./settlement";
 import { TtlCache, createApi } from "./api";
@@ -115,7 +115,7 @@ export interface RoomOptions {
   /** Start the clock as soon as the room opens. */
   startNow?: boolean;
   /** Set for a staked match: what to settle, and how many players. */
-  staked?: { matchId: bigint; count: number };
+  staked?: { ref: MatchRef; count: number };
   onDone?: () => void;
 }
 
@@ -131,13 +131,16 @@ export function openRoom(
   roster: RosterEntry[],
   opts: RoomOptions = {},
 ): Room {
+  const staked = opts.staked;
   const room = new Room(matchId, roster, (log, hash) => {
     console.log(`[match ${matchId}] finished, log hash ${hash}`);
     void finishMatch(log, hash, {
       logDir: LOG_DIR,
-      staked: opts.staked ?? null,
-      settle: CHAIN && rpc
-        ? (id, placements, logHash) => rpc!.settleWithRetry(CHAIN!, id, placements, logHash)
+      staked: staked ? { matchId: staked.ref.id, count: staked.count } : null,
+      // The ref, not the bare id, goes to the chain: the id alone does not
+      // say which escrow (SOL or token) the match is in.
+      settle: CHAIN && rpc && staked
+        ? (_id, placements, logHash) => rpc!.settleWithRetry(CHAIN!, staked.ref, placements, logHash)
         : undefined,
     }).catch((e: unknown) => {
       // Logged loudly and left there. A staked match that cannot be settled
@@ -154,9 +157,6 @@ export function openRoom(
 }
 
 /* --------------------------------------------------------- staked rooms --- */
-
-/** Match ids that could be an on-chain u64. Nothing else is looked up. */
-const U64_RE = /^(0|[1-9][0-9]{0,19})$/;
 
 /**
  * Ids recently looked up and not found, so that a stream of joins naming
@@ -185,7 +185,9 @@ const opening = new Set<string>();
 async function ensureStakedRoom(
   matchId: string, known?: MatchAccount,
 ): Promise<Room | null> {
-  if (!CHAIN || !rpc || !U64_RE.test(matchId)) return null;
+  // Only the two exact id forms (a u64, or "skr-" and a u64) are looked up.
+  const ref = CHAIN && rpc ? parseMatchRef(matchId) : null;
+  if (!CHAIN || !rpc || !ref) return null;
   const existing = rooms.get(matchId);
   if (existing) return existing;
 
@@ -195,7 +197,7 @@ async function ensureStakedRoom(
 
   opening.add(matchId);
   try {
-    const account = known ?? await rpc.fetchMatch(CHAIN, BigInt(matchId));
+    const account = known ?? await rpc.fetchMatch(CHAIN, ref);
     if (!account) {
       if (missed.size >= MISS_MAX) missed.clear();
       missed.set(matchId, Date.now());
@@ -221,12 +223,14 @@ async function ensureStakedRoom(
     const roster = rosterFromMatch(account);
     console.log(
       `[match ${matchId}] opening staked room, ${roster.length} players, ` +
-      `stake ${account.stake} lamports each`,
+      account.currency === "sol"
+        ? `stake ${account.stake} lamports each`
+        : `stake ${account.stake} raw units of ${account.mint} each`,
     );
     const room = openRoom(matchId, roster, {
       kind: "staked",
       startWhenSeated: roster.length,
-      staked: { matchId: BigInt(matchId), count: account.count },
+      staked: { ref, count: account.count },
       onDone: () => { rooms.delete(matchId); },
     });
 
@@ -312,8 +316,9 @@ const verified = new TtlCache<{ mint: string | null; collection: string | null }
  */
 const lobbies = CHAIN && rpc
   ? new Lobbies({
-      fetchMatch: (id) => rpc!.fetchMatch(CHAIN!, id),
-      lockMatch: (id) => rpc!.lockMatch(CHAIN!, id),
+      // The lobby only ever holds ids enterLobby parsed, so these parse.
+      fetchMatch: (id) => rpc!.fetchMatch(CHAIN!, parseMatchRef(id)!),
+      lockMatch: (id) => rpc!.lockMatch(CHAIN!, parseMatchRef(id)!),
       openRoom: async (id) => (await ensureStakedRoom(id)) !== null,
       nowSeconds: () => Math.floor(Date.now() / 1000),
       log: (line) => console.log(line),
@@ -448,8 +453,10 @@ interface Pending {
 const api = createApi({
   chain: CHAIN && rpc
     ? {
-        listOpen: async (stake) => (await rpc!.listOpenMatches(CHAIN!, stake)).map((m) => m.account),
-        fetchMatch: (id) => rpc!.fetchMatch(CHAIN!, id),
+        listOpen: async (currency, stake) =>
+          (await rpc!.listOpenMatches(CHAIN!, currency, stake)).map((m) => m.account),
+        fetchMatch: (ref) => rpc!.fetchMatch(CHAIN!, ref),
+        potDecimals: CHAIN.potMint ? () => rpc!.potMintDecimals(CHAIN!) : undefined,
       }
     : undefined,
   nfts: NFTS ?? undefined,
@@ -703,10 +710,11 @@ wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
    * the first `count` players on chain.
    */
   async function enterLobby(msg: Extract<ClientMsg, { t: "join" }>): Promise<boolean> {
-    if (!lobbies || !CHAIN || !rpc || !U64_RE.test(msg.matchId)) return false;
+    const ref = parseMatchRef(msg.matchId);
+    if (!lobbies || !CHAIN || !rpc || !ref) return false;
     let account: MatchAccount | null;
     try {
-      account = await rpc.fetchMatch(CHAIN, BigInt(msg.matchId));
+      account = await rpc.fetchMatch(CHAIN, ref);
     } catch {
       return false;
     }
@@ -817,6 +825,9 @@ http.on("listening", () => {
       `staked rooms on ${CHAIN.rpcUrl}, program ${CHAIN.programId.toBase58()}, ` +
       `resolver ${CHAIN.resolver.publicKey.toBase58()}`,
     );
+    console.log(CHAIN.potMint
+      ? `token pots in ${CHAIN.potMint.toBase58()} (Test SKR, devnet)`
+      : "no SKR_POT_MINT: SOL pots only");
   } else {
     console.log("no chain configuration: free rooms only");
   }

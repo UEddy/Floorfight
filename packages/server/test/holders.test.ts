@@ -10,7 +10,7 @@ import { Lobbies, lockDecision, type Member } from "../src/lobby";
 import { RateLimiter, TtlCache, createApi, detail } from "../src/api";
 import type { MatchAccount } from "../src/chain";
 import { payoutsFor } from "../src/chain";
-import { LOCK_BEFORE_DEADLINE, STAKE_TIERS } from "../../shared/tiers";
+import { LOCK_BEFORE_DEADLINE, SKR_POT_LABEL, SKR_STAKE_TIERS, STAKE_TIERS } from "../../shared/tiers";
 import type { LobbyView } from "../../shared/protocol";
 
 const A = "A".repeat(43) + "1";
@@ -21,6 +21,8 @@ const NOW = 1_800_000_000;
 function account(over: Partial<MatchAccount> = {}): MatchAccount {
   const players = [A, B, C, "1".repeat(32), "1".repeat(32), "1".repeat(32)];
   return {
+    currency: "sol",
+    mint: null,
     matchId: 42n,
     stake: BigInt(STAKE_TIERS[0].lamports),
     maxPlayers: 6,
@@ -234,7 +236,7 @@ test("GET /api/matches lists open joinable matches at a tier, and nothing else",
   const listed: bigint[] = [];
   const api = createApi({
     chain: {
-      listOpen: async (stake) => {
+      listOpen: async (_currency, stake) => {
         listed.push(stake);
         return [
           account({ matchId: 1n, count: 2 }),
@@ -298,4 +300,109 @@ test("match detail shows computed payouts before settlement and the chain's afte
   }));
   assert.deepEqual(settled.placements, [1]);
   assert.deepEqual(settled.payouts, ["20000000", "0", "0"]);
+});
+
+/* -------------------------------------------------------- token pots --- */
+
+const POT = "T".repeat(43) + "4";
+
+test("token listings take a currency from the fixed list and a tier, never an amount or a mint", async () => {
+  const listed: { currency: string; stake: bigint }[] = [];
+  const fetched: string[] = [];
+  const api = createApi({
+    chain: {
+      listOpen: async (currency, stake) => {
+        listed.push({ currency, stake });
+        return currency === "skr"
+          ? [account({ currency: "skr", mint: POT, matchId: 5n, stake })]
+          : [account({ matchId: 5n })];
+      },
+      fetchMatch: async (ref) => {
+        fetched.push(`${ref.currency}:${ref.id}`);
+        return ref.currency === "skr"
+          ? account({ currency: "skr", mint: POT, matchId: ref.id, count: 3, stake: 10_000_000n })
+          : null;
+      },
+      // Six decimals here; the real number is whatever the mint says.
+      potDecimals: async () => 6,
+    },
+    nowSeconds: () => NOW,
+  });
+  const { url, server } = await serve(api);
+  try {
+    const r = await fetch(`${url}/api/matches?tier=1&currency=skr`);
+    assert.equal(r.status, 200);
+    const body = await r.json() as {
+      currency: string; label: string; decimals: number; stake: string;
+      matches: { matchId: string; currency: string; mint: string }[];
+    };
+    assert.equal(body.currency, "skr");
+    assert.equal(body.label, SKR_POT_LABEL);
+    assert.equal(body.decimals, 6);
+    // 50 whole tokens at the mint's six decimals.
+    assert.equal(body.stake, (BigInt(SKR_STAKE_TIERS[1].whole) * 10n ** 6n).toString());
+    assert.deepEqual(body.matches.map((m) => [m.matchId, m.currency, m.mint]), [["skr-5", "skr", POT]]);
+
+    // SOL is still the default, and its ids are still bare numbers.
+    const sol = await (await fetch(`${url}/api/matches?tier=1`)).json() as { currency: string; matches: { matchId: string }[] };
+    assert.equal(sol.currency, "sol");
+    assert.deepEqual(sol.matches.map((m) => m.matchId), ["5"]);
+    assert.deepEqual(listed.map((l) => l.currency), ["skr", "sol"]);
+
+    // Nothing else is a currency, and nothing in the query names an amount or a mint.
+    for (const bad of ["usdc", "SKR", "", POT, "skr,sol"]) {
+      assert.equal((await fetch(`${url}/api/matches?tier=0&currency=${encodeURIComponent(bad)}`)).status, 400, bad);
+    }
+    const before = listed.length;
+    await fetch(`${url}/api/matches?tier=0&currency=skr&stake=1&mint=${POT}`);
+    assert.deepEqual(listed[before], { currency: "skr", stake: BigInt(SKR_STAKE_TIERS[0].whole) * 10n ** 6n });
+
+    // Detail by "skr-<id>", with the currency, label and decimals.
+    const d = await (await fetch(`${url}/api/match/skr-9`)).json() as {
+      matchId: string; currency: string; mint: string; label: string; decimals: number; payouts: string[];
+    };
+    assert.equal(d.matchId, "skr-9");
+    assert.equal(d.currency, "skr");
+    assert.equal(d.mint, POT);
+    assert.equal(d.label, SKR_POT_LABEL);
+    assert.equal(d.decimals, 6);
+    assert.deepEqual(d.payouts, payoutsFor(10_000_000n, 3).map(String));
+    assert.deepEqual(fetched, ["skr:9"]);
+
+    for (const bad of ["skr-", "skr-01", "SKR-9", "skr-18446744073709551616", "usdc-9", "skr-9x", "sol-9"]) {
+      assert.equal((await fetch(`${url}/api/match/${bad}`)).status, 400, bad);
+    }
+  } finally {
+    server.close();
+  }
+});
+
+test("a server with no token pot answers token listings with 503 and SOL as before", async () => {
+  const api = createApi({
+    chain: { listOpen: async () => [], fetchMatch: async () => null },
+    nowSeconds: () => NOW,
+  });
+  const { url, server } = await serve(api);
+  try {
+    assert.equal((await fetch(`${url}/api/matches?tier=0&currency=skr`)).status, 503);
+    assert.equal((await fetch(`${url}/api/match/skr-1`)).status, 503);
+    assert.equal((await fetch(`${url}/api/matches?tier=0&currency=sol`)).status, 200);
+  } finally {
+    server.close();
+  }
+});
+
+test("the lobby asks the chain by the match id string it was given", async () => {
+  const asked: string[] = [];
+  const lobbies = new Lobbies({
+    fetchMatch: async (id) => { asked.push(id); return null; },
+    lockMatch: async () => "sig",
+    openRoom: async () => false,
+    nowSeconds: () => NOW,
+  });
+  const m: Member = { wallet: A, send: () => {}, enter: () => {}, close: () => {} };
+  lobbies.add("skr-42", account({ currency: "skr", mint: POT }), m);
+  await lobbies.step("skr-42");
+  assert.ok(asked.includes("skr-42"));
+  lobbies.stop();
 });

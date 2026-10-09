@@ -141,6 +141,14 @@ I have not done any of this, and none of it can be done from here.
     fails loudly instead of quietly building transactions for the wrong
     program.
 
+11. **Test SKR (devnet) pots, optional.** `TEST_SKR_MINT` in
+    `src/config.ts` is null, and while it is the app refuses every token pot
+    request. To turn them on: run `npm run create-test-skr` and
+    `npm run allow-mint` at the repo root (both take your deployer key by
+    path), put the mint address here and in `SKR_POT_MINT` on the server,
+    and build again. It is a devnet test mint, never the mainnet SKR mint:
+    `src/escrow.ts` refuses to load if it is.
+
 Publishing to the Solana dApp Store is a separate exercise: it needs a
 publisher NFT, a signed submission and the real-money question in CLAUDE.md
 settled first. Not yet.

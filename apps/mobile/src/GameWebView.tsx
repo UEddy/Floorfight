@@ -12,7 +12,7 @@ import {
   type Reply,
   type Request,
 } from "./bridge";
-import { plan, planCreate, transactionFor, type Planned } from "./escrow";
+import { parseRef, plan, planCreate, planCreateToken, transactionFor, type Planned } from "./escrow";
 import { connectWallet, currentWallet, signAndSend, signMessage } from "./wallet";
 import { Confirm } from "./Confirm";
 import { walletErrorMessage } from "./auth";
@@ -66,10 +66,11 @@ export function GameWebView() {
     // yes, in onApprove below.
     const now = Math.floor(Date.now() / 1000);
     const planned = req.action === "create"
-      // The tier is looked up in this app's own list and the match id is
-      // generated here. Nothing about the amount came from the page.
-      ? planCreate(req.tier)
-      : await plan(req.action, BigInt(req.matchId), now, currentWallet());
+      // The tier is looked up in this app's own list for the currency, the
+      // mint is this build's own and the match id is generated here.
+      // Nothing about the amount or the mint came from the page.
+      ? (req.currency === "skr" ? await planCreateToken(req.tier) : planCreate(req.tier))
+      : await plan(req.action, parseRef(req.matchId), now, currentWallet());
     setPending({ planned, id: req.id });
   }, [reply]);
 
@@ -101,7 +102,7 @@ export function GameWebView() {
       .then((signature) => {
         reply({
           id: p.id, ok: true, t: "escrow", action: p.planned.action,
-          matchId: p.planned.matchId.toString(), signature,
+          matchId: p.planned.key, signature,
         });
       })
       .catch((e) => fail(p.id, e));

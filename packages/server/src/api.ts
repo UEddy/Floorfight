@@ -18,8 +18,8 @@
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { STAKE_TIERS } from "../../shared/tiers";
-import { NO_PLACE, payoutsFor, type MatchAccount } from "./chain";
+import { SKR_POT_LABEL, SKR_STAKE_TIERS, STAKE_TIERS, isCurrency, wholeToRaw, type Currency } from "../../shared/tiers";
+import { NO_PLACE, matchKey, parseMatchRef, payoutsFor, type MatchAccount, type MatchRef } from "./chain";
 import { clientIp } from "./limits";
 import { SKR_MINT, formatSkr, tierName } from "../../shared/skr";
 
@@ -114,7 +114,11 @@ function json(res: ServerResponse, status: number, body: unknown, maxAge = 0): v
 
 /** A match as the page sees it. Strings for u64s, which JSON cannot hold. */
 export interface MatchSummary {
+  /** A bare number for a SOL match, "skr-" and a number for a token match. */
   matchId: string;
+  currency: Currency;
+  /** The pot's mint for a token match; null for SOL. */
+  mint: string | null;
   stake: string;
   count: number;
   maxPlayers: number;
@@ -136,7 +140,9 @@ export interface MatchDetail extends MatchSummary {
 
 export function summary(a: MatchAccount): MatchSummary {
   return {
-    matchId: a.matchId.toString(),
+    matchId: matchKey({ currency: a.currency, id: a.matchId }),
+    currency: a.currency,
+    mint: a.mint,
     stake: a.stake.toString(),
     count: a.count,
     maxPlayers: a.maxPlayers,
@@ -163,8 +169,13 @@ export function detail(a: MatchAccount): MatchDetail {
 export interface ApiDeps {
   /** Absent on a free only server: the match endpoints answer 503. */
   chain?: {
-    listOpen: (stake: bigint) => Promise<MatchAccount[]>;
-    fetchMatch: (matchId: bigint) => Promise<MatchAccount | null>;
+    listOpen: (currency: Currency, stake: bigint) => Promise<MatchAccount[]>;
+    fetchMatch: (ref: MatchRef) => Promise<MatchAccount | null>;
+    /**
+     * Decimals of the token pot mint, read from the chain. Absent when the
+     * server has no SKR_POT_MINT, and then token listings answer 503.
+     */
+    potDecimals?: () => Promise<number>;
   };
   /** Absent without HELIUS_API_KEY: the NFT endpoints answer 503. */
   nfts?: {
@@ -178,9 +189,7 @@ export interface ApiDeps {
   nowSeconds?: () => number;
 }
 
-const U64_RE = /^(0|[1-9][0-9]{0,19})$/;
 const BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
-const MAX_U64 = 18_446_744_073_709_551_615n;
 
 /**
  * Build the /api handler. Returns a function that answers the request and
@@ -235,8 +244,21 @@ export function createApi(deps: ApiDeps) {
           throw new HttpError(400, "unknown tier");
         }
         const tier = Number(raw);
-        const stake = BigInt(STAKE_TIERS[tier].lamports);
-        const all = await listCache.get(String(tier), () => deps.chain!.listOpen(stake));
+        // A currency from the fixed list, SOL when absent so older pages
+        // keep working. The stake is the tier's, never a number from the URL.
+        const cur = url.searchParams.get("currency") ?? "sol";
+        if (!isCurrency(cur)) throw new HttpError(400, "unknown currency");
+        let stake: bigint;
+        let decimals: number | null = null;
+        if (cur === "sol") {
+          stake = BigInt(STAKE_TIERS[tier].lamports);
+        } else {
+          if (!deps.chain.potDecimals) throw new HttpError(503, "token pots are not configured on this server");
+          if (tier >= SKR_STAKE_TIERS.length) throw new HttpError(400, "unknown tier");
+          decimals = await deps.chain.potDecimals();
+          stake = wholeToRaw(SKR_STAKE_TIERS[tier].whole, decimals);
+        }
+        const all = await listCache.get(`${cur}:${tier}`, () => deps.chain!.listOpen(cur, stake));
         const t = now();
         const open = all
           // Joinable: still Open (the filter says so), seats left, and with
@@ -245,17 +267,33 @@ export function createApi(deps: ApiDeps) {
           .sort((a, b) => b.count - a.count || a.joinDeadline - b.joinDeadline)
           .slice(0, 50)
           .map(summary);
-        json(res, 200, { tier, stake: stake.toString(), matches: open }, 3);
+        json(res, 200, {
+          tier,
+          currency: cur,
+          label: cur === "sol" ? "SOL" : SKR_POT_LABEL,
+          decimals: cur === "sol" ? 9 : decimals,
+          stake: stake.toString(),
+          matches: open,
+        }, 3);
         return true;
       }
 
       if (path.startsWith("/api/match/")) {
         if (!deps.chain) throw new HttpError(503, "holders matches are not configured on this server");
         const id = path.slice("/api/match/".length);
-        if (!U64_RE.test(id) || BigInt(id) > MAX_U64) throw new HttpError(400, "not a match id");
-        const a = await matchCache.get(id, () => deps.chain!.fetchMatch(BigInt(id)));
+        const ref = parseMatchRef(id);
+        if (!ref) throw new HttpError(400, "not a match id");
+        if (ref.currency !== "sol" && !deps.chain.potDecimals) {
+          throw new HttpError(503, "token pots are not configured on this server");
+        }
+        const a = await matchCache.get(id, () => deps.chain!.fetchMatch(ref));
         if (!a) throw new HttpError(404, "no such match");
-        json(res, 200, detail(a), 2);
+        const decimals = a.currency === "sol" ? 9 : await deps.chain.potDecimals!();
+        json(res, 200, {
+          ...detail(a),
+          label: a.currency === "sol" ? "SOL" : SKR_POT_LABEL,
+          decimals,
+        }, 2);
         return true;
       }
 

@@ -238,10 +238,19 @@ async function menus(browser) {
     };
   });
   const now = Math.floor(Date.now() / 1000);
-  await page.route("**/api/matches?*", (r) => r.fulfill({ json: { tier: 0, stake: "10000000", matches: [
-    { matchId: "1844674407370955161", stake: "10000000", count: 3, maxPlayers: 6, joinDeadline: now + 420 },
-    { matchId: "922337203685477580", stake: "10000000", count: 1, maxPlayers: 6, joinDeadline: now + 540 },
-  ] } }));
+  // Answers as a server with a Test SKR pot would: the currency comes from
+  // the query, the six decimals are invented (the real ones are the mint's).
+  await page.route("**/api/matches?*", (r) => {
+    const skr = new URL(r.request().url()).searchParams.get("currency") === "skr";
+    return r.fulfill({ json: skr
+      ? { tier: 0, currency: "skr", label: "Test SKR (devnet)", decimals: 6, stake: "10000000", matches: [
+          { matchId: "skr-77", currency: "skr", stake: "10000000", count: 2, maxPlayers: 6, joinDeadline: now + 300 },
+        ] }
+      : { tier: 0, currency: "sol", label: "SOL", decimals: 9, stake: "10000000", matches: [
+          { matchId: "1844674407370955161", currency: "sol", stake: "10000000", count: 3, maxPlayers: 6, joinDeadline: now + 420 },
+          { matchId: "922337203685477580", currency: "sol", stake: "10000000", count: 1, maxPlayers: 6, joinDeadline: now + 540 },
+        ] } });
+  });
   await page.route("**/api/nfts/*", (r) => r.fulfill({ json: { items: [
     { id: "Face1111111111111111111111111111111111111111", name: "Blue Visitor", collection: null, image: "x" },
     { id: "Face2222222222222222222222222222222222222222", name: "Ember Clerk", collection: null, image: "x" },
@@ -265,8 +274,18 @@ async function menus(browser) {
   await page.click('[data-mint^="Face2"]');
   await sleep(400);
   await page.screenshot({ path: join(OUT, "11-holders.png") });
+  await page.click('[data-cur="skr"]');
+  await page.waitForSelector('[data-join="skr-77"]');
+  await sleep(300);
+  await page.screenshot({ path: join(OUT, "13-holders-test-skr.png") });
   await page.evaluate((now) => window.arena.menu.showLobby({
-    t: "lobby", matchId: "1844674407370955161", phase: "waiting", count: 3, maxPlayers: 6,
+    t: "lobby", matchId: "skr-77", phase: "waiting", count: 2, maxPlayers: 6, currency: "skr",
+    stake: "10000000", joinDeadline: now + 263, present: [true, false], lockBefore: 60,
+  }), now);
+  await page.screenshot({ path: join(OUT, "14-lobby-test-skr.png") });
+  await page.click('[data-a="back"]').catch(() => {});
+  await page.evaluate((now) => window.arena.menu.showLobby({
+    t: "lobby", matchId: "1844674407370955161", phase: "waiting", count: 3, maxPlayers: 6, currency: "sol",
     stake: "10000000", joinDeadline: now + 263, present: [true, true, false], lockBefore: 60,
   }), now);
   await page.screenshot({ path: join(OUT, "12-lobby.png") });

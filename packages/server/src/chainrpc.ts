@@ -22,11 +22,18 @@ import { Connection, Keypair, PublicKey, Transaction, TransactionInstruction } f
 import {
   IDL_ADDRESS,
   decodeMatch,
+  decodeTokenMatch,
   lockData,
+  matchKey,
+  mintDecimals,
   openMatchFilters,
+  openTokenMatchFilters,
   settleData,
   type MatchAccount,
+  type MatchRef,
 } from "./chain";
+import { SKR_MINT } from "../../shared/skr";
+import type { Currency } from "../../shared/tiers";
 
 export { hasChainEnv } from "./chain";
 
@@ -35,7 +42,15 @@ export interface ChainConfig {
   programId: PublicKey;
   resolver: Keypair;
   rpcUrl: string;
+  /**
+   * The one mint this server hosts token matches for (SKR_POT_MINT), or null
+   * for SOL matches only. A token match in any other mint is, to this server,
+   * not there: it is not listed, its room does not open and it is not settled.
+   */
+  potMint: PublicKey | null;
 }
+
+const BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
 /* ------------------------------------------------------------- config --- */
 
@@ -78,8 +93,15 @@ export function chainFromEnv(env: NodeJS.ProcessEnv, devMode: boolean): ChainCon
   const programId = env.PROGRAM_ID;
   const keyPath = env.RESOLVER_KEYPAIR_PATH;
 
+  const potMint = env.SKR_POT_MINT || null;
+
   const given = [rpcUrl, programId, keyPath].filter((v) => v !== undefined && v !== "");
-  if (given.length === 0) return null;
+  if (given.length === 0) {
+    if (potMint) {
+      throw new Error("SKR_POT_MINT is set but there is no chain configuration to settle token matches with");
+    }
+    return null;
+  }
   if (given.length !== 3) {
     throw new Error(
       "RPC_URL, PROGRAM_ID and RESOLVER_KEYPAIR_PATH have to be set together. " +
@@ -104,11 +126,26 @@ export function chainFromEnv(env: NodeJS.ProcessEnv, devMode: boolean): ChainCon
     );
   }
 
+  if (potMint !== null) {
+    if (!BASE58_RE.test(potMint)) throw new Error("SKR_POT_MINT is not a base58 address");
+    // Token pots are a devnet test for now, labelled "Test SKR (devnet)"
+    // everywhere a person sees them. Staking the real token is the dApp
+    // Store question in CLAUDE.md and is not decided, so the server refuses
+    // to be pointed at it rather than relying on nobody trying.
+    if (potMint === SKR_MINT) {
+      throw new Error(
+        "SKR_POT_MINT is the mainnet SKR mint. Token pots run on a devnet test mint " +
+        "until real money staking is decided. Refusing to start.",
+      );
+    }
+  }
+
   return {
     connection: new Connection(rpcUrl!, "confirmed"),
     programId: new PublicKey(programId!),
     resolver: loadResolver(keyPath!),
     rpcUrl: rpcUrl!,
+    potMint: potMint === null ? null : new PublicKey(potMint),
   };
 }
 
@@ -125,30 +162,75 @@ export function matchPda(programId: PublicKey, matchId: bigint): PublicKey {
   return PublicKey.findProgramAddressSync([Buffer.from("match"), id], programId)[0];
 }
 
+/** TokenMatch PDA: seeds are "tmatch" and the u64 id, little endian. */
+export function tokenMatchPda(programId: PublicKey, matchId: bigint): PublicKey {
+  const id = Buffer.alloc(8);
+  id.writeBigUInt64LE(matchId);
+  return PublicKey.findProgramAddressSync([Buffer.from("tmatch"), id], programId)[0];
+}
+
+/** The account a match ref names. */
+export function refPda(programId: PublicKey, ref: MatchRef): PublicKey {
+  return ref.currency === "sol" ? matchPda(programId, ref.id) : tokenMatchPda(programId, ref.id);
+}
+
+/**
+ * Read a match. Null when there is no such account, and also, for a token
+ * match, when its mint is not this server's SKR_POT_MINT (or the server has
+ * none): those are matches this server does not host.
+ */
 export async function fetchMatch(
-  chain: ChainConfig, matchId: bigint,
+  chain: ChainConfig, ref: MatchRef,
 ): Promise<MatchAccount | null> {
-  const info = await chain.connection.getAccountInfo(matchPda(chain.programId, matchId));
+  if (ref.currency !== "sol" && !chain.potMint) return null;
+  const info = await chain.connection.getAccountInfo(refPda(chain.programId, ref));
   if (!info) return null;
   if (!info.owner.equals(chain.programId)) {
-    throw new Error(`match ${matchId} is not owned by ${chain.programId.toBase58()}`);
+    throw new Error(`match ${matchKey(ref)} is not owned by ${chain.programId.toBase58()}`);
   }
-  return decodeMatch(info.data);
+  if (ref.currency === "sol") return decodeMatch(info.data);
+  const m = decodeTokenMatch(info.data);
+  if (m.matchId !== ref.id) throw new Error(`match ${matchKey(ref)} holds id ${m.matchId}`);
+  return m.mint === chain.potMint!.toBase58() ? m : null;
+}
+
+/**
+ * Decimals of the pot mint, read once from the chain and kept: a mint's
+ * decimals cannot change after it is initialized.
+ */
+let potDecimals: Promise<number> | null = null;
+export function potMintDecimals(chain: ChainConfig): Promise<number> {
+  if (!chain.potMint) return Promise.reject(new Error("no token pot mint configured"));
+  potDecimals ??= (async () => {
+    const info = await chain.connection.getAccountInfo(chain.potMint!);
+    if (!info) throw new Error("SKR_POT_MINT does not exist on this cluster");
+    if (info.owner.toBase58() !== "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA") {
+      throw new Error("SKR_POT_MINT is not a classic SPL Token mint");
+    }
+    return mintDecimals(info.data);
+  })().catch((e) => { potDecimals = null; throw e; });
+  return potDecimals;
 }
 
 /* ----------------------------------------------------------- settling --- */
 
+/**
+ * settle, or settle_token_match. Both take the same three accounts in the
+ * same order (resolver, config, the match) and the same two arguments; a
+ * token settle moves no tokens, it only records who is owed what, and each
+ * winner pulls their share with claim_token.
+ */
 export function settleInstruction(
-  chain: ChainConfig, matchId: bigint, placements: number[], logHash: Uint8Array,
+  chain: ChainConfig, ref: MatchRef, placements: number[], logHash: Uint8Array,
 ): TransactionInstruction {
   return new TransactionInstruction({
     programId: chain.programId,
     keys: [
       { pubkey: chain.resolver.publicKey, isSigner: true, isWritable: false },
       { pubkey: configPda(chain.programId), isSigner: false, isWritable: false },
-      { pubkey: matchPda(chain.programId, matchId), isSigner: false, isWritable: true },
+      { pubkey: refPda(chain.programId, ref), isSigner: false, isWritable: true },
     ],
-    data: settleData(placements, logHash),
+    data: settleData(placements, logHash, ref.currency),
   });
 }
 
@@ -163,12 +245,13 @@ export function settleInstruction(
  */
 export async function settleWithRetry(
   chain: ChainConfig,
-  matchId: bigint,
+  ref: MatchRef,
   placements: number[],
   logHash: Uint8Array,
   attempts = 12,
   sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
 ): Promise<string | null> {
+  const matchId = matchKey(ref);
   let lastError = "";
   for (let attempt = 0; attempt < attempts; attempt++) {
     if (attempt > 0) {
@@ -178,7 +261,7 @@ export async function settleWithRetry(
       await sleep(Math.min(60_000, 2000 * 2 ** (attempt - 1)));
     }
     try {
-      const current = await fetchMatch(chain, matchId);
+      const current = await fetchMatch(chain, ref);
       if (!current) throw new Error("match account has gone");
       if (current.state === "Settled") {
         console.log(`[match ${matchId}] already settled on chain`);
@@ -189,7 +272,7 @@ export async function settleWithRetry(
       }
 
       const tx = new Transaction().add(
-        settleInstruction(chain, matchId, placements, logHash),
+        settleInstruction(chain, ref, placements, logHash),
       );
       const sig = await chain.connection.sendTransaction(tx, [chain.resolver], {
         skipPreflight: false,
@@ -213,15 +296,15 @@ export async function settleWithRetry(
 
 /* ------------------------------------------------------------ locking --- */
 
-export function lockInstruction(chain: ChainConfig, matchId: bigint): TransactionInstruction {
+export function lockInstruction(chain: ChainConfig, ref: MatchRef): TransactionInstruction {
   return new TransactionInstruction({
     programId: chain.programId,
     keys: [
       { pubkey: chain.resolver.publicKey, isSigner: true, isWritable: false },
       { pubkey: configPda(chain.programId), isSigner: false, isWritable: false },
-      { pubkey: matchPda(chain.programId, matchId), isSigner: false, isWritable: true },
+      { pubkey: refPda(chain.programId, ref), isSigner: false, isWritable: true },
     ],
-    data: lockData(),
+    data: lockData(ref.currency),
   });
 }
 
@@ -231,8 +314,8 @@ export function lockInstruction(chain: ChainConfig, matchId: bigint): Transactio
  * the right retry because the account may have changed (filled and locked
  * itself, or passed its deadline) in between.
  */
-export async function lockMatch(chain: ChainConfig, matchId: bigint): Promise<string> {
-  const tx = new Transaction().add(lockInstruction(chain, matchId));
+export async function lockMatch(chain: ChainConfig, ref: MatchRef): Promise<string> {
+  const tx = new Transaction().add(lockInstruction(chain, ref));
   const sig = await chain.connection.sendTransaction(tx, [chain.resolver], {
     skipPreflight: false,
     maxRetries: 3,
@@ -243,11 +326,18 @@ export async function lockMatch(chain: ChainConfig, matchId: bigint): Promise<st
 
 /* ------------------------------------------------------------ listing --- */
 
-/** Open matches at one stake, straight from the program's accounts. */
+/**
+ * Open matches at one stake in one currency, straight from the program's
+ * accounts. Token matches are only ever those in SKR_POT_MINT.
+ */
 export async function listOpenMatches(
-  chain: ChainConfig, stake: bigint,
+  chain: ChainConfig, currency: Currency, stake: bigint,
 ): Promise<{ address: string; account: MatchAccount }[]> {
-  const f = openMatchFilters(stake);
+  if (currency !== "sol" && !chain.potMint) return [];
+  const f = currency === "sol"
+    ? openMatchFilters(stake)
+    : openTokenMatchFilters(chain.potMint!.toBase58(), stake);
+  const decode = currency === "sol" ? decodeMatch : decodeTokenMatch;
   const found = await chain.connection.getProgramAccounts(chain.programId, {
     commitment: "confirmed",
     filters: [{ dataSize: f.dataSize }, ...f.memcmp.map((memcmp) => ({ memcmp }))],
@@ -255,7 +345,7 @@ export async function listOpenMatches(
   const out: { address: string; account: MatchAccount }[] = [];
   for (const { pubkey, account } of found) {
     try {
-      out.push({ address: pubkey.toBase58(), account: decodeMatch(account.data) });
+      out.push({ address: pubkey.toBase58(), account: decode(account.data) });
     } catch {
       // Not a Match after all. The filters make this unlikely; the decoder
       // checking the discriminator makes it harmless.

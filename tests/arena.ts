@@ -607,6 +607,7 @@ describe("holders matches: app, lobby and resolver together", () => {
       programId: PROGRAM_ID,
       resolver: h.resolver,
       rpcUrl: "http://127.0.0.1:1",
+      potMint: null,
     };
   }
 
@@ -636,7 +637,7 @@ describe("holders matches: app, lobby and resolver together", () => {
 
     // One player: the rule waits, and the program agrees it cannot lock.
     expect(lockDecision(acc, new Set([a.publicKey.toBase58()]), now(h))).to.equal("wait");
-    h.fails([lockInstruction(chainFor(h), 9001n)], [h.resolver], "BadPlayerCount");
+    h.fails([lockInstruction(chainFor(h), { currency: "sol", id: 9001n })], [h.resolver], "BadPlayerCount");
 
     h.ok([appJoinIx(b.publicKey, 9001n)], [b]);
     acc = decoded(h, m);
@@ -645,7 +646,7 @@ describe("holders matches: app, lobby and resolver together", () => {
     // Inside the last minute: lock, present or not, and the program takes it.
     h.warp(acc.joinDeadline - now(h) - LOCK_BEFORE_DEADLINE);
     expect(lockDecision(acc, new Set([a.publicKey.toBase58()]), now(h))).to.equal("lock");
-    h.ok([lockInstruction(chainFor(h), 9001n)], [h.resolver]);
+    h.ok([lockInstruction(chainFor(h), { currency: "sol", id: 9001n })], [h.resolver]);
     acc = decoded(h, m);
     expect(acc.state).to.equal("Locked");
     expect(lockDecision(acc, new Set(), now(h))).to.equal("open-room");
@@ -661,7 +662,7 @@ describe("holders matches: app, lobby and resolver together", () => {
     h.warp(acc.joinDeadline - now(h) + 1);
     expect(lockDecision(acc, new Set([a.publicKey.toBase58(), b.publicKey.toBase58()]), now(h)))
       .to.equal("expired");
-    h.fails([lockInstruction(chainFor(h), 9002n)], [h.resolver], "DeadlinePassed");
+    h.fails([lockInstruction(chainFor(h), { currency: "sol", id: 9002n })], [h.resolver], "DeadlinePassed");
     // And both get their stake back through the app's claim instruction.
     const before = h.balance(a.publicKey);
     h.ok([appClaimIx(a.publicKey, 9002n)], [a]);
@@ -687,7 +688,7 @@ describe("holders matches: app, lobby and resolver together", () => {
     // instruction locks it.
     const everyone = new Set([a, b, c].map((k) => k.publicKey.toBase58()));
     expect(lockDecision(acc, everyone, now(h))).to.equal("lock");
-    h.ok([lockInstruction(chainFor(h), 9003n)], [h.resolver]);
+    h.ok([lockInstruction(chainFor(h), { currency: "sol", id: 9003n })], [h.resolver]);
     acc = decoded(h, m);
     expect(acc.state).to.equal("Locked");
 

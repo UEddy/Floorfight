@@ -58,6 +58,44 @@ test("create is accepted with a tier index into this build's own list", () => {
   }
 });
 
+test("create takes a currency from the fixed list, and SOL when there is none", () => {
+  for (const currency of ["sol", "skr"]) {
+    for (const tier of [0, 1, 2]) {
+      const req = parseRequest(JSON.stringify({ id: "k", t: "escrow", action: "create", tier, currency }));
+      assert.ok(req.t === "escrow" && req.action === "create");
+      assert.equal(req.currency, currency);
+      assert.equal(req.tier, tier);
+    }
+  }
+  const plain = parseRequest(JSON.stringify({ id: "k", t: "escrow", action: "create", tier: 0 }));
+  assert.ok(plain.t === "escrow" && plain.action === "create" && plain.currency === "sol");
+});
+
+test("a token pot is a currency name and a tier: never a mint, a token account or an amount", () => {
+  const MINT = "SKRbvo6Gf7GondiT3BbTfuRDPqLWei4j2Qy2NPGZhW3";
+  const base = { id: "k", t: "escrow", action: "create", tier: 0, currency: "skr" };
+  const attempts: unknown[] = [
+    { ...base, mint: MINT },
+    { ...base, tokenAccount: "11111111111111111111111111111111" },
+    { ...base, playerTokens: "11111111111111111111111111111111" },
+    { ...base, vault: "11111111111111111111111111111111" },
+    { ...base, amount: "10" },
+    { ...base, decimals: 0 },
+    { ...base, currency: MINT },
+    { ...base, currency: "SKR" },
+    { ...base, currency: "usdc" },
+    { ...base, currency: "" },
+    { ...base, currency: null },
+    { ...base, currency: ["skr"] },
+    { ...base, currency: { mint: MINT } },
+    { ...base, tier: 3 },
+    { id: "x", t: "escrow", action: "join", matchId: "skr-7", mint: MINT },
+    { id: "x", t: "escrow", action: "claim", matchId: "skr-7", tokenAccount: MINT },
+    { id: "x", t: "escrow", action: "join", matchId: "skr-7", currency: "skr" },
+  ];
+  for (const a of attempts) refusal(JSON.stringify(a));
+});
+
 /* ------------------------------------------------------------- refused --- */
 
 test("create takes a tier and only a tier: no amount, no id, no count", () => {
@@ -126,11 +164,15 @@ test("a signJoin request with a bad field is refused", () => {
 });
 
 test("an escrow match id must be a plain u64", () => {
-  const ok = ["0", "1", "18446744073709551615"];
+  const ok = ["0", "1", "18446744073709551615", "skr-0", "skr-7", "skr-18446744073709551615"];
   for (const matchId of ok) {
     parseRequest(JSON.stringify({ id: "e", t: "escrow", action: "join", matchId }));
   }
-  const bad = ["", "-1", "01", "1.0", "1e9", "0x10", " 7", "7 ", "dev", "999999999999999999999"];
+  const bad = [
+    "", "-1", "01", "1.0", "1e9", "0x10", " 7", "7 ", "dev", "999999999999999999999",
+    "18446744073709551616", "skr-", "skr-01", "SKR-7", "skr-18446744073709551616", "sol-7",
+    "usdc-7", "skr-skr-7", "skr- 7", "lounge-1",
+  ];
   for (const matchId of bad) {
     refusal(JSON.stringify({ id: "e", t: "escrow", action: "join", matchId }));
   }

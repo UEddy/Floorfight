@@ -29,9 +29,20 @@
 //!
 //! The match account stays open after settlement on purpose. It holds the log
 //! hash and the placements, which is the on-chain half of the replay audit.
+//!
+//! Token pots. A match can instead be staked in an SPL token the admin has
+//! allowed (TokenMatch, seeds "tmatch"), with the same rules: pull payments,
+//! 50/30/20 with dust to first, refunds after the deadline, exits never
+//! paused, the resolver never admin and never a player. Classic SPL Token
+//! only; a mint with a freeze authority only if the allowlist names it. The
+//! pot sits in the match PDA's associated token account, which only this
+//! program can sign for. SOL matches, their accounts and their instructions
+//! are unchanged.
 
 use anchor_lang::prelude::*;
 use anchor_lang::system_program::{transfer, Transfer};
+use anchor_spl::associated_token::AssociatedToken;
+use anchor_spl::token::{self, Mint, Token, TokenAccount};
 
 // Placeholder. Replace by generating the program keypair and running
 // `anchor keys sync`, which rewrites this line and Anchor.toml together.
@@ -330,6 +341,276 @@ pub mod arena {
         emit!(Claimed { match_id, player, amount, refund });
         Ok(())
     }
+
+    /* ------------------------------------------------------ token pots --- */
+
+    /// Admin: allow a mint for token pots, with its own stake range in raw
+    /// units. Only a classic SPL Token mint can be named here: `Account<Mint>`
+    /// checks the owner is the Token program, so a Token-2022 mint is
+    /// refused before this body runs.
+    ///
+    /// A mint with a freeze authority can have the vault frozen, which traps
+    /// every stake in it. So one is refused unless the admin writes down
+    /// exactly which freeze authority they are accepting, and it has to be
+    /// the one the mint actually has.
+    pub fn allow_mint(
+        ctx: Context<AllowMint>,
+        min_stake: u64,
+        max_stake: u64,
+        freeze_authority: Option<Pubkey>,
+    ) -> Result<()> {
+        require!(min_stake > 0 && min_stake <= max_stake, ArenaError::BadConfig);
+        let actual: Option<Pubkey> = ctx.accounts.mint.freeze_authority.into();
+        require!(actual == freeze_authority, ArenaError::MintFreezeAuthority);
+
+        let allow = &mut ctx.accounts.allow;
+        allow.mint = ctx.accounts.mint.key();
+        allow.min_stake = min_stake;
+        allow.max_stake = max_stake;
+        allow.freeze_authority = freeze_authority;
+        allow.decimals = ctx.accounts.mint.decimals;
+        allow.enabled = true;
+        allow.bump = ctx.bumps.allow;
+        emit!(MintAllowed { mint: allow.mint, min_stake, max_stake, enabled: true });
+        Ok(())
+    }
+
+    /// Admin: change an allowed mint's range, or turn it off for new matches.
+    /// Matches already created with it are unaffected, and their exits never
+    /// read this account.
+    pub fn update_mint(
+        ctx: Context<UpdateMint>,
+        min_stake: u64,
+        max_stake: u64,
+        freeze_authority: Option<Pubkey>,
+        enabled: bool,
+    ) -> Result<()> {
+        require!(min_stake > 0 && min_stake <= max_stake, ArenaError::BadConfig);
+        let actual: Option<Pubkey> = ctx.accounts.mint.freeze_authority.into();
+        require!(actual == freeze_authority, ArenaError::MintFreezeAuthority);
+
+        let allow = &mut ctx.accounts.allow;
+        allow.min_stake = min_stake;
+        allow.max_stake = max_stake;
+        allow.freeze_authority = freeze_authority;
+        allow.enabled = enabled;
+        emit!(MintAllowed { mint: allow.mint, min_stake, max_stake, enabled });
+        Ok(())
+    }
+
+    /// A match whose pot is in an allowed token. Same rules as create_match,
+    /// with the stake range taken from the mint's allowlist entry. The vault
+    /// is the associated token account of the match PDA, created here, so
+    /// only this program can ever move tokens out of it.
+    pub fn create_token_match(
+        ctx: Context<CreateTokenMatch>,
+        match_id: u64,
+        stake: u64,
+        max_players: u8,
+        join_window: i64,
+    ) -> Result<()> {
+        let config = &ctx.accounts.config;
+        require!(!config.paused, ArenaError::Paused);
+        let allow = &ctx.accounts.allow;
+        require!(allow.enabled, ArenaError::MintNotAllowed);
+        require!(
+            stake >= allow.min_stake && stake <= allow.max_stake,
+            ArenaError::StakeOutOfRange
+        );
+        // Checked again here, not only at allow time: the allowlist entry is
+        // a promise about the mint, and this is where money starts to depend
+        // on it. (An SPL freeze authority that is None can never be set
+        // later, so a mint that passes with none stays that way.)
+        let actual: Option<Pubkey> = ctx.accounts.mint.freeze_authority.into();
+        require!(actual == allow.freeze_authority, ArenaError::MintFreezeAuthority);
+        require!(
+            max_players >= MIN_PLAYERS && (max_players as usize) <= MAX_PLAYERS,
+            ArenaError::BadPlayerCount
+        );
+        require!(
+            (MIN_JOIN_WINDOW..=MAX_JOIN_WINDOW).contains(&join_window),
+            ArenaError::BadWindow
+        );
+
+        let now = Clock::get()?.unix_timestamp;
+        let m = &mut ctx.accounts.token_match;
+        m.match_id = match_id;
+        m.creator = ctx.accounts.creator.key();
+        m.mint = ctx.accounts.mint.key();
+        m.stake = stake;
+        m.max_players = max_players;
+        m.count = 0;
+        m.players = [Pubkey::default(); MAX_PLAYERS];
+        m.state = MatchState::Open;
+        m.join_deadline = now.checked_add(join_window).ok_or(ArenaError::Overflow)?;
+        m.settle_deadline = 0;
+        m.placements = [NO_PLACE; PLACES];
+        m.payouts = [0; PLACES];
+        m.claimed = 0;
+        m.log_hash = [0; 32];
+        m.bump = ctx.bumps.token_match;
+
+        emit!(TokenMatchCreated { match_id, mint: m.mint, stake, max_players, join_deadline: m.join_deadline });
+        Ok(())
+    }
+
+    /// Stake into a token match, from a token account of the match's mint
+    /// that the player owns, into the match's vault. Same rules as join_match.
+    pub fn join_token_match(ctx: Context<JoinTokenMatch>) -> Result<()> {
+        let config = &ctx.accounts.config;
+        require!(!config.paused, ArenaError::Paused);
+
+        let player = ctx.accounts.player.key();
+        require!(player != config.resolver, ArenaError::ResolverCannotPlay);
+
+        let now = Clock::get()?.unix_timestamp;
+        let settle_window = config.settle_window;
+        {
+            let m = &ctx.accounts.token_match;
+            require!(m.state == MatchState::Open, ArenaError::WrongState);
+            require!(now <= m.join_deadline, ArenaError::DeadlinePassed);
+            require!(m.count < m.max_players, ArenaError::MatchFull);
+            require!(
+                !m.players[..m.count as usize].contains(&player),
+                ArenaError::AlreadyJoined
+            );
+        }
+
+        let stake = ctx.accounts.token_match.stake;
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                token::Transfer {
+                    from: ctx.accounts.player_tokens.to_account_info(),
+                    to: ctx.accounts.vault.to_account_info(),
+                    authority: ctx.accounts.player.to_account_info(),
+                },
+            ),
+            stake,
+        )?;
+
+        let m = &mut ctx.accounts.token_match;
+        let slot = m.count;
+        m.players[slot as usize] = player;
+        m.count = slot + 1;
+        emit!(PlayerJoined { match_id: m.match_id, player, slot });
+
+        if m.count == m.max_players {
+            m.state = MatchState::Locked;
+            m.settle_deadline = now.checked_add(settle_window).ok_or(ArenaError::Overflow)?;
+            emit!(MatchLocked { match_id: m.match_id, count: m.count, settle_deadline: m.settle_deadline });
+        }
+        Ok(())
+    }
+
+    /// lock_match for a token match.
+    pub fn lock_token_match(ctx: Context<TokenResolverAction>) -> Result<()> {
+        let config = &ctx.accounts.config;
+        require!(!config.paused, ArenaError::Paused);
+
+        let now = Clock::get()?.unix_timestamp;
+        let m = &mut ctx.accounts.token_match;
+        require!(m.state == MatchState::Open, ArenaError::WrongState);
+        require!(now <= m.join_deadline, ArenaError::DeadlinePassed);
+        require!(m.count >= MIN_PLAYERS, ArenaError::BadPlayerCount);
+
+        m.state = MatchState::Locked;
+        m.settle_deadline = now.checked_add(config.settle_window).ok_or(ArenaError::Overflow)?;
+        emit!(MatchLocked { match_id: m.match_id, count: m.count, settle_deadline: m.settle_deadline });
+        Ok(())
+    }
+
+    /// settle for a token match: the same placement rules and the same
+    /// 50/30/20 split with the rounding dust to first place.
+    pub fn settle_token_match(
+        ctx: Context<TokenResolverAction>,
+        placements: [u8; PLACES],
+        log_hash: [u8; 32],
+    ) -> Result<()> {
+        let config = &ctx.accounts.config;
+        require!(!config.paused, ArenaError::Paused);
+
+        let now = Clock::get()?.unix_timestamp;
+        let m = &mut ctx.accounts.token_match;
+        require!(m.state == MatchState::Locked, ArenaError::WrongState);
+        require!(now <= m.settle_deadline, ArenaError::DeadlinePassed);
+
+        check_placements(&placements, m.count)?;
+        let payouts = payouts_for(m.stake, m.count)?;
+
+        m.placements = placements;
+        m.payouts = payouts;
+        m.log_hash = log_hash;
+        m.state = MatchState::Settled;
+        emit!(MatchSettled { match_id: m.match_id, placements, payouts, log_hash });
+        Ok(())
+    }
+
+    /// Pull a payout or a refund from a token match's vault. Never paused,
+    /// never reads the config or the allowlist: no admin action can stop a
+    /// player getting out what they are owed.
+    pub fn claim_token(ctx: Context<ClaimToken>) -> Result<()> {
+        let player = ctx.accounts.player.key();
+        let now = Clock::get()?.unix_timestamp;
+
+        let (amount, refund, match_id, bump) = {
+            let m = &mut ctx.accounts.token_match;
+            let slot = m.players[..m.count as usize]
+                .iter()
+                .position(|p| *p == player)
+                .ok_or(ArenaError::NotAParticipant)?;
+            let bit = 1u8 << slot;
+            require!(m.claimed & bit == 0, ArenaError::AlreadyClaimed);
+
+            let (amount, refund) = match m.state {
+                MatchState::Settled => {
+                    let place = m
+                        .placements
+                        .iter()
+                        .position(|&p| p as usize == slot)
+                        .ok_or(ArenaError::NothingToClaim)?;
+                    (m.payouts[place], false)
+                }
+                MatchState::Refunding => (m.stake, true),
+                MatchState::Open if now > m.join_deadline => {
+                    m.state = MatchState::Refunding;
+                    (m.stake, true)
+                }
+                MatchState::Locked if now > m.settle_deadline => {
+                    m.state = MatchState::Refunding;
+                    (m.stake, true)
+                }
+                _ => return err!(ArenaError::NotClaimable),
+            };
+            require!(amount > 0, ArenaError::NothingToClaim);
+            // Mark before moving tokens.
+            m.claimed |= bit;
+            (amount, refund, m.match_id, m.bump)
+        };
+
+        // Paid from the tracked pot. The vault can hold more than that if
+        // somebody sends tokens to it, and nobody can claim those; it can
+        // never hold less, because only this instruction moves tokens out.
+        require!(ctx.accounts.vault.amount >= amount, ArenaError::InsufficientPot);
+
+        let id = match_id.to_le_bytes();
+        let seeds: &[&[u8]] = &[b"tmatch", id.as_ref(), &[bump]];
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                token::Transfer {
+                    from: ctx.accounts.vault.to_account_info(),
+                    to: ctx.accounts.player_tokens.to_account_info(),
+                    authority: ctx.accounts.token_match.to_account_info(),
+                },
+                &[seeds],
+            ),
+            amount,
+        )?;
+
+        emit!(TokenClaimed { match_id, mint: ctx.accounts.token_match.mint, player, amount, refund });
+        Ok(())
+    }
 }
 
 /* ------------------------------------------------------------ helpers --- */
@@ -545,6 +826,265 @@ pub struct Claimed {
     pub refund: bool,
 }
 
+/* ------------------------------------------------- token pot helpers --- */
+
+/// The placement rules settle applies, for the token path: a placement names
+/// a real slot, no slot twice, and NO_PLACE in every unpaid position.
+fn check_placements(placements: &[u8; PLACES], count: u8) -> Result<()> {
+    let places = if count >= 3 { 3 } else { 1 };
+    for (i, &p) in placements.iter().enumerate() {
+        if i < places {
+            require!(p < count, ArenaError::BadPlacement);
+            require!(!placements[..i].contains(&p), ArenaError::BadPlacement);
+        } else {
+            require!(p == NO_PLACE, ArenaError::BadPlacement);
+        }
+    }
+    Ok(())
+}
+
+/// The split settle applies, in raw units: 50/30/20 with the rounding dust
+/// to first, or the whole pot to the winner of a two player match. Checked
+/// u128 arithmetic, so a huge stake cannot wrap.
+fn payouts_for(stake: u64, count: u8) -> Result<[u64; PLACES]> {
+    let pot = (stake as u128).checked_mul(count as u128).ok_or(ArenaError::Overflow)?;
+    if count < 3 {
+        return Ok([to_u64(pot)?, 0, 0]);
+    }
+    let second = pot.checked_mul(SECOND_BPS).ok_or(ArenaError::Overflow)? / 10_000;
+    let third = pot.checked_mul(THIRD_BPS).ok_or(ArenaError::Overflow)? / 10_000;
+    let first = pot
+        .checked_sub(second)
+        .and_then(|v| v.checked_sub(third))
+        .ok_or(ArenaError::Overflow)?;
+    Ok([to_u64(first)?, to_u64(second)?, to_u64(third)?])
+}
+
+/* ----------------------------------------------- token pot accounts --- */
+
+#[derive(Accounts)]
+pub struct AllowMint<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    #[account(seeds = [b"config"], bump = config.bump, has_one = admin @ ArenaError::Unauthorized)]
+    pub config: Account<'info, Config>,
+
+    /// Classic SPL Token only: the owner check on Account<Mint> refuses a
+    /// Token-2022 mint.
+    pub mint: Account<'info, Mint>,
+
+    #[account(
+        init,
+        payer = admin,
+        space = 8 + MintAllow::INIT_SPACE,
+        seeds = [b"mint", mint.key().as_ref()],
+        bump
+    )]
+    pub allow: Account<'info, MintAllow>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateMint<'info> {
+    pub admin: Signer<'info>,
+
+    #[account(seeds = [b"config"], bump = config.bump, has_one = admin @ ArenaError::Unauthorized)]
+    pub config: Account<'info, Config>,
+
+    pub mint: Account<'info, Mint>,
+
+    #[account(mut, seeds = [b"mint", mint.key().as_ref()], bump = allow.bump, has_one = mint)]
+    pub allow: Account<'info, MintAllow>,
+}
+
+#[derive(Accounts)]
+#[instruction(match_id: u64)]
+pub struct CreateTokenMatch<'info> {
+    #[account(mut)]
+    pub creator: Signer<'info>,
+
+    #[account(seeds = [b"config"], bump = config.bump)]
+    pub config: Account<'info, Config>,
+
+    pub mint: Account<'info, Mint>,
+
+    /// The allowlist entry. Its seeds tie it to this mint: no entry, no
+    /// match.
+    #[account(seeds = [b"mint", mint.key().as_ref()], bump = allow.bump, has_one = mint)]
+    pub allow: Account<'info, MintAllow>,
+
+    #[account(
+        init,
+        payer = creator,
+        space = 8 + TokenMatch::INIT_SPACE,
+        seeds = [b"tmatch", match_id.to_le_bytes().as_ref()],
+        bump
+    )]
+    pub token_match: Account<'info, TokenMatch>,
+
+    /// The vault: the match PDA's associated token account for the mint.
+    /// init_if_needed rather than init because anyone can create another
+    /// account's ATA, and a stranger creating this one first must not be able
+    /// to block the match. Either way the address, mint and authority are
+    /// checked, so it is the PDA's account and nobody else's.
+    #[account(
+        init_if_needed,
+        payer = creator,
+        associated_token::mint = mint,
+        associated_token::authority = token_match,
+        associated_token::token_program = token_program,
+    )]
+    pub vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct JoinTokenMatch<'info> {
+    pub player: Signer<'info>,
+
+    #[account(seeds = [b"config"], bump = config.bump)]
+    pub config: Account<'info, Config>,
+
+    #[account(
+        mut,
+        seeds = [b"tmatch", token_match.match_id.to_le_bytes().as_ref()],
+        bump = token_match.bump,
+        has_one = mint
+    )]
+    pub token_match: Account<'info, TokenMatch>,
+
+    pub mint: Account<'info, Mint>,
+
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = token_match,
+        associated_token::token_program = token_program,
+    )]
+    pub vault: Account<'info, TokenAccount>,
+
+    /// Where the stake comes from: the match's mint, owned by the player.
+    #[account(mut, token::mint = mint, token::authority = player, token::token_program = token_program)]
+    pub player_tokens: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct TokenResolverAction<'info> {
+    pub resolver: Signer<'info>,
+
+    #[account(seeds = [b"config"], bump = config.bump, has_one = resolver @ ArenaError::Unauthorized)]
+    pub config: Account<'info, Config>,
+
+    #[account(
+        mut,
+        seeds = [b"tmatch", token_match.match_id.to_le_bytes().as_ref()],
+        bump = token_match.bump
+    )]
+    pub token_match: Account<'info, TokenMatch>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimToken<'info> {
+    pub player: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"tmatch", token_match.match_id.to_le_bytes().as_ref()],
+        bump = token_match.bump,
+        has_one = mint
+    )]
+    pub token_match: Account<'info, TokenMatch>,
+
+    pub mint: Account<'info, Mint>,
+
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = token_match,
+        associated_token::token_program = token_program,
+    )]
+    pub vault: Account<'info, TokenAccount>,
+
+    /// Where the payout goes: the match's mint, owned by the player. The
+    /// claimer is the signer, so a payout can only ever go to its owner.
+    #[account(mut, token::mint = mint, token::authority = player, token::token_program = token_program)]
+    pub player_tokens: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+/// An allowed mint for token pots. Seeds: ["mint", mint].
+#[account]
+#[derive(InitSpace)]
+pub struct MintAllow {
+    pub mint: Pubkey,
+    /// Stake range in the mint's raw units.
+    pub min_stake: u64,
+    pub max_stake: u64,
+    /// The freeze authority the admin accepted, which must be the mint's own.
+    pub freeze_authority: Option<Pubkey>,
+    /// The mint's decimals when it was allowed, for anyone displaying amounts.
+    pub decimals: u8,
+    pub enabled: bool,
+    pub bump: u8,
+}
+
+/// A match whose pot is in an allowed token. The same fields as Match plus
+/// the mint, under its own seeds, so SOL matches and their accounts are
+/// untouched. Seeds: ["tmatch", match_id]. Vault: the ATA of this account.
+#[account]
+#[derive(InitSpace)]
+pub struct TokenMatch {
+    pub match_id: u64,
+    pub creator: Pubkey,
+    pub mint: Pubkey,
+    pub stake: u64,
+    pub max_players: u8,
+    pub count: u8,
+    pub players: [Pubkey; MAX_PLAYERS],
+    pub state: MatchState,
+    pub join_deadline: i64,
+    pub settle_deadline: i64,
+    pub placements: [u8; PLACES],
+    pub payouts: [u64; PLACES],
+    pub claimed: u8,
+    pub log_hash: [u8; 32],
+    pub bump: u8,
+}
+
+#[event]
+pub struct MintAllowed {
+    pub mint: Pubkey,
+    pub min_stake: u64,
+    pub max_stake: u64,
+    pub enabled: bool,
+}
+
+#[event]
+pub struct TokenMatchCreated {
+    pub match_id: u64,
+    pub mint: Pubkey,
+    pub stake: u64,
+    pub max_players: u8,
+    pub join_deadline: i64,
+}
+
+#[event]
+pub struct TokenClaimed {
+    pub match_id: u64,
+    pub mint: Pubkey,
+    pub player: Pubkey,
+    pub amount: u64,
+    pub refund: bool,
+}
+
 /* ------------------------------------------------------------- errors --- */
 
 #[error_code]
@@ -587,4 +1127,8 @@ pub enum ArenaError {
     InsufficientPot,
     #[msg("Arithmetic overflow")]
     Overflow,
+    #[msg("This mint is not allowed for token pots")]
+    MintNotAllowed,
+    #[msg("The mint's freeze authority is not the one the allowlist accepted")]
+    MintFreezeAuthority,
 }

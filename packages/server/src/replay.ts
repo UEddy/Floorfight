@@ -173,19 +173,24 @@ async function main(): Promise<void> {
   // Loaded here, not at the top, so a replay of a free match needs no
   // @solana/web3.js at all.
   const { Connection, PublicKey } = await import("@solana/web3.js");
-  const { matchPda } = await import("./chainrpc");
-  const { decodeMatch } = await import("./chain");
+  const { refPda } = await import("./chainrpc");
+  const { decodeMatch, decodeTokenMatch, parseMatchRef } = await import("./chain");
 
-  if (!/^(0|[1-9][0-9]{0,19})$/.test(log.matchId)) {
+  // A bare number is a SOL match, "skr-" and a number a token match. The
+  // prefix is in the log, so it is covered by the hash being checked.
+  const ref = parseMatchRef(log.matchId);
+  if (!ref) {
     console.log(`match id ${log.matchId} is not an on-chain id, so nothing to check against`);
     return;
   }
   const programId = new PublicKey(opts.programId);
   const connection = new Connection(opts.rpcUrl, "confirmed");
-  const pda = matchPda(programId, BigInt(log.matchId));
+  const pda = refPda(programId, ref);
   const info = await connection.getAccountInfo(pda);
   if (!info) throw new Error(`no match account at ${pda.toBase58()}`);
-  const account = decodeMatch(info.data);
+  if (!info.owner.equals(programId)) throw new Error(`${pda.toBase58()} is not owned by ${programId.toBase58()}`);
+  const account = ref.currency === "sol" ? decodeMatch(info.data) : decodeTokenMatch(info.data);
+  console.log(`currency ${account.currency === "sol" ? "SOL" : `token, mint ${account.mint}`}`);
   const onChain = Buffer.from(account.logHash).toString("hex");
   console.log(`account  ${pda.toBase58()}`);
   console.log(`state    ${account.state}`);

@@ -243,6 +243,50 @@ Phase 1, read only: badges and the lounge. No SKR moves anywhere.
 - Tested against a stand in mainnet RPC (`server/test/skr.test.ts`), not yet
   against mainnet itself.
 
+Phase 2, token pots, devnet only: a holders match can be staked in a
+devnet test mint that stands in for SKR, shown everywhere as "Test SKR
+(devnet)". Not the real SKR and not mainnet. Written and tested under
+LiteSVM; not yet deployed, and nothing has run on devnet or a phone.
+
+- The program has a second escrow beside the SOL one, which is untouched
+  byte for byte: a `TokenMatch` account (seeds "tmatch" and the id) that is
+  the `Match` fields plus its mint, so one currency per match is stored in
+  the match. The vault is the associated token account of the match PDA,
+  created by `create_token_match` (init_if_needed, so a stranger creating it
+  first cannot block a match) and checked by address, mint and authority on
+  every instruction that touches it.
+- An admin allowlist of mints (`MintAllow`, seeds "mint" and the mint), each
+  with its own min and max stake in raw units, and enabled or not. Classic
+  SPL Token only: a Token-2022 mint is refused by the account owner check.
+  A mint with a freeze authority is refused unless the allowlist entry names
+  that exact authority, checked again at create.
+- Every token account is checked for owner and mint. Payouts and refunds
+  follow the SOL rules exactly: pull payments by `claim_token`, 50/30/20 with
+  the dust to first in u128 checked arithmetic, refunds after the deadline,
+  `claim_token` never paused and never reading the config or the allowlist,
+  the resolver unable to play. Payouts are from the tracked pot, so tokens
+  sent to the vault cannot be claimed.
+- The page sends a tier index and a currency from the fixed list `sol` or
+  `skr`, never a mint, a token account or an amount. The app maps `skr` to
+  its own `TEST_SKR_MINT` (`apps/mobile/src/config.ts`, null until set,
+  which refuses every token pot request), reads the mint's decimals and the
+  allowlist range from chain, and stakes from and pays to the player's own
+  associated token account. Tiers are whole tokens in `shared/tiers.ts`
+  (10, 50, 100), converted with the mint's decimals at the moment of use.
+- The server hosts token matches in exactly one mint, `SKR_POT_MINT`, and
+  refuses to start if that is the mainnet SKR mint or if it is set without
+  the chain configuration. Token match ids are `skr-<u64>` in the room, the
+  lobby, `/api/matches?tier=N&currency=skr`, `/api/match/skr-<id>` and the
+  match log, so the log says its currency and the hash covers it. The
+  resolver locks and settles them with `lock_token_match` and
+  `settle_token_match`; the replay checks their hash on chain the same way.
+- `npm run create-test-skr`, `npm run airdrop-test-skr` and
+  `npm run allow-mint` at the repo root make the devnet test mint (with the
+  mainnet SKR mint's decimals, read over RPC, never assumed), mint to
+  testers, and allowlist it. Each takes a keypair path, refuses one inside
+  the repo, and refuses mainnet unless told otherwise (create and airdrop
+  never run on it at all).
+
 ## Trust boundary
 
 This is the part that must not erode under deadline pressure.
@@ -370,7 +414,11 @@ S10 before trusting any of this. The S10 is the floor, not the S24.
 
   The test script sets `NODE_OPTIONS=--no-experimental-strip-types` because
   Node 24 otherwise loads the `.ts` file itself as an ES module and the
-  `@coral-xyz/anchor` import fails. LiteSVM is pinned at 0.8.0, the last
+  `@coral-xyz/anchor` import fails. It also passes
+  `--v8-no-allocation-site-pretenuring` through mocha: V8's pretenuring
+  feedback throws `std::bad_alloc` during garbage collection after a few
+  LiteSVM transactions in some environments, and with it off the whole
+  suite runs in one process. LiteSVM is pinned at 0.8.0, the last
   release built on web3.js, which the Anchor TypeScript client needs.
 
 ## Installing the server
@@ -420,7 +468,7 @@ no NFT heads and every holder wears the default face; it never leaves the
 server.
 
 The same port serves read only JSON under `/api`, which Caddy proxies:
-`/api/matches?tier=N` and `/api/match/:id` from the chain, `/api/nfts/:owner`
+`/api/matches?tier=N&currency=sol|skr` and `/api/match/:id` from the chain, `/api/nfts/:owner`
 and `/api/nft-img/:assetId` through Helius DAS. All are rate limited per
 address and cached for a few seconds. The image route only ever fetches from
 the allow listed CDN hosts in `nft.ts`, never a URL out of metadata.
@@ -430,7 +478,8 @@ read the program config. init-config runs on your own machine with the
 deployer key, defaults to devnet, and refuses mainnet without `--mainnet`.
 
 `RPC_URL_MAINNET` (or `HELIUS_API_KEY`) turns on SKR badges and the
-lounge; see the SKR section.
+lounge; see the SKR section. `SKR_POT_MINT`, with the chain settings, turns
+on Test SKR (devnet) pots for that one mint.
 
 `ARENA_DEV=1` adds the fixed seat dev room for two tabs with known keys, and
 refuses to coexist with a resolver key or with `NODE_ENV=production`.
@@ -470,10 +519,13 @@ open nave, three galleries, fourteen spawns) as authored map data identified
 by the hash of its own blocks, respawn away from enemies, bots that hunt, merged block renderer with
 hit feedback, damage numbers, death chunks, tracers and synthesized sound,
 touch controls, server tick loop and join handshake, free and staked room
-types with server side bots, Anchor escrow program with 20 LiteSVM tests
-covering the attack cases, the payout paths and the holders flow (the app's
-create transaction, the lobby's lock rule against the real program, and
-create, join, lock, settle and claim end to end), 159 server tests covering
+types with server side bots, Anchor escrow program with 57 LiteSVM tests
+(25 for SOL pots, 32 for token pots) covering the attack cases, the payout
+paths and the holders flow (the app's create transaction, the lobby's lock
+rule against the real program, and create, join, lock, settle and claim end
+to end, for both currencies, with the server's and the app's own
+instructions), 168 server tests covering token match ids, decoding and the
+listing by currency,
 SKR badges (balance parsing, cache, rate limit, failing closed, the lounge
 gate, the badge in the roster and log, and a client unable to assert one),
 replay determinism against a pinned golden result (`test/golden.json`,
@@ -491,6 +543,12 @@ staked is connected or with 60 seconds of the join window left, a staked room
 with no bots, and a results screen with Claim or Refund and the log link.
 NFT heads for holders through DAS. None of it has run against devnet or a
 wallet yet.
+
+Test SKR (devnet) pots, wired and tested under LiteSVM only: the program's
+token escrow, the server's listing, lock and settle, the app's create, join
+and claim, the page's currency choice, and the scripts. The program upgrade
+that carries them is not deployed, no test mint exists yet, and
+`TEST_SKR_MINT` is null in the app.
 
 Wired, untested on devnet: free rooms with guest keys and bot fill, staked
 rooms opening from a Locked match account, settlement with backoff, match logs

@@ -237,7 +237,9 @@ export interface LobbyView {
   phase: "waiting" | "locking" | "expired" | "over";
   count: number;
   maxPlayers: number;
-  /** Lamports per player, decimal. */
+  /** "sol", or "skr" for a Test SKR (devnet) pot. Read off the match account. */
+  currency: "sol" | "skr";
+  /** Per player, decimal, in the currency's smallest unit: lamports, or the mint's raw units. */
   stake: string;
   /** Unix seconds. */
   joinDeadline: number;

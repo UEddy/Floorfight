@@ -21,8 +21,10 @@
  *                 to sign anything that does not match the pattern.
  *
  *   3. escrow     create a match at a stake tier, or join, claim or refund a
- *                 match id. For create the page sends a tier index and this
- *                 side looks the amount up in its own fixed list, generates
+ *                 match id. For create the page sends a tier index and a
+ *                 currency out of a fixed list of two ("sol", or "skr" for
+ *                 a Test SKR pot on devnet), and this side looks the amount
+ *                 and the mint up in its own config, generates
  *                 the match id itself, and builds create_match and join_match
  *                 into one transaction. For the others it reads the match
  *                 account from the chain. Either way it builds the
@@ -31,8 +33,8 @@
  *                 the wallet is opened.
  *
  * There is deliberately no request that carries a transaction, a message, a
- * byte array, an instruction, an account list, a program id or a lamport
- * amount. If the page could hand over any of those, every check in this file
+ * byte array, an instruction, an account list, a program id, a mint, a token
+ * account or an amount in any currency. If the page could hand over any of those, every check in this file
  * would be decoration. Adding one is not an acceptable shortcut, for the same
  * reason the game protocol has no message that asserts a kill.
  */
@@ -40,12 +42,20 @@
 import {
   MAX_PROTOCOL_VERSION,
   MIN_PROTOCOL_VERSION,
+  SKR_STAKE_TIERS,
   STAKE_TIERS,
 } from "./config";
 
 /* ------------------------------------------------------------ requests --- */
 
 export type EscrowAction = "join" | "claim" | "refund";
+
+/**
+ * What a pot can be staked in. A name out of this list, never a mint: which
+ * mint "skr" means is config.TEST_SKR_MINT, in this build.
+ */
+export const CURRENCIES = ["sol", "skr"] as const;
+export type Currency = (typeof CURRENCIES)[number];
 
 export interface SignJoinRequest {
   id: string;
@@ -62,11 +72,15 @@ export interface EscrowRequest {
   matchId: string;
 }
 
-/** Create a match. A tier index into config.STAKE_TIERS, and nothing else. */
+/**
+ * Create a match. A currency from CURRENCIES and a tier index into that
+ * currency's list in config.ts, and nothing else.
+ */
 export interface CreateRequest {
   id: string;
   t: "escrow";
   action: "create";
+  currency: Currency;
   tier: number;
 }
 
@@ -116,8 +130,14 @@ const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
  */
 const MATCH_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
-/** On-chain match id: a u64, decimal, no sign and no padding games. */
-const ESCROW_MATCH_ID_RE = /^(0|[1-9][0-9]{0,19})$/;
+/**
+ * On-chain match id: a u64, decimal, no sign and no padding games, with
+ * "skr-" in front for a token pot. The prefix only says which escrow to read;
+ * the mint, the amounts and whether the action is possible all come from the
+ * account on chain.
+ */
+const ESCROW_MATCH_ID_RE = /^(skr-)?(0|[1-9][0-9]{0,19})$/;
+const MAX_U64 = 18_446_744_073_709_551_615n;
 
 /** The server issues base58 of 24 random bytes. */
 const NONCE_RE = /^[1-9A-HJ-NP-Za-km-z]{16,64}$/;
@@ -188,13 +208,21 @@ export function parseRequest(raw: string): Request {
   }
 
   if (o.t === "escrow" && o.action === "create") {
-    // A tier, as a small integer index. Not an amount: the amount lives in
-    // config.ts, and an index that is not in the list is refused here.
-    expectKeys(o, ["id", "t", "action", "tier"]);
+    // A tier, as a small integer index, and a currency by name. Not an
+    // amount and not a mint: both live in config.ts, and anything that is not
+    // in those lists is refused here. No currency means SOL, which is what a
+    // page from before token pots sends.
+    expectKeys(o, ["id", "t", "action", "tier", "currency"]);
+    // Absent, not null: a null is a value the page chose and is refused.
+    const currency = Object.prototype.hasOwnProperty.call(o, "currency") ? o.currency : "sol";
+    if (typeof currency !== "string" || !(CURRENCIES as readonly string[]).includes(currency)) {
+      refuse("currency must be sol or skr");
+    }
     const tier = o.tier;
     if (typeof tier !== "number" || !Number.isInteger(tier)) refuse("tier must be an integer");
-    if (tier < 0 || tier >= STAKE_TIERS.length) refuse("no such tier");
-    return { id, t: "escrow", action: "create", tier };
+    const tiers = currency === "sol" ? STAKE_TIERS : SKR_STAKE_TIERS;
+    if (tier < 0 || tier >= tiers.length) refuse("no such tier");
+    return { id, t: "escrow", action: "create", currency: currency as Currency, tier };
   }
 
   if (o.t === "escrow") {
@@ -203,12 +231,9 @@ export function parseRequest(raw: string): Request {
     if (action !== "join" && action !== "claim" && action !== "refund") {
       refuse("action must be join, claim or refund");
     }
-    return {
-      id,
-      t: "escrow",
-      action,
-      matchId: str(o.matchId, ESCROW_MATCH_ID_RE, "matchId"),
-    };
+    const matchId = str(o.matchId, ESCROW_MATCH_ID_RE, "matchId");
+    if (BigInt(matchId.replace(/^skr-/, "")) > MAX_U64) refuse("matchId is not a u64");
+    return { id, t: "escrow", action, matchId };
   }
 
   refuse("unknown request");

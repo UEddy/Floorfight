@@ -21,6 +21,7 @@
 import bs58 from "bs58";
 import idlJson from "../../../idl/arena.json";
 import type { RosterEntry, Standing } from "../../shared/protocol";
+import type { Currency } from "../../shared/tiers";
 
 interface IdlFile {
   address: string;
@@ -42,6 +43,9 @@ function discriminator(kind: "instructions" | "accounts", name: string): Buffer 
 const SETTLE_IX = discriminator("instructions", "settle");
 const LOCK_IX = discriminator("instructions", "lock_match");
 const MATCH_ACCOUNT = discriminator("accounts", "Match");
+const SETTLE_TOKEN_IX = discriminator("instructions", "settle_token_match");
+const LOCK_TOKEN_IX = discriminator("instructions", "lock_token_match");
+const TOKEN_MATCH_ACCOUNT = discriminator("accounts", "TokenMatch");
 
 /** Program constants, mirrored from programs/arena/src/lib.rs. */
 export const MAX_PLAYERS = 6;
@@ -54,6 +58,10 @@ export const NO_PLACE = 255;
  * Borsh writes these in declaration order with no padding, and every field is
  * fixed size, so plain offsets are enough. The unit-only MatchState enum is
  * one byte.
+ *
+ * A TokenMatch is the same struct with the mint's 32 bytes inserted after the
+ * creator, so its layout is this one with every later field moved along by
+ * 32 (see `layout`).
  */
 const M = {
   matchId: 8,
@@ -73,10 +81,61 @@ const M = {
 } as const;
 export const MATCH_ACCOUNT_SIZE = M.bump + 1;
 
+/** Where the mint sits in a TokenMatch. */
+const TOKEN_MINT_OFFSET = 48;
+type Layout = { [K in keyof typeof M]: number };
+const TM: Layout = Object.fromEntries(
+  Object.entries(M).map(([k, v]) => [k, v >= TOKEN_MINT_OFFSET ? v + 32 : v]),
+) as Layout;
+export const TOKEN_MATCH_ACCOUNT_SIZE = TM.bump + 1;
+
+/**
+ * Which escrow a match lives in, and its u64 id there.
+ *
+ * SOL matches and token matches are separate accounts with separate id
+ * spaces (seeds "match" and "tmatch"), so the same number can name one of
+ * each. The string form the server and the page use keeps them apart: a SOL
+ * match is its bare number, as it always was, and a token match is "skr-"
+ * and the number. That string is the room id, the match log's file name and
+ * the log's matchId, so the log itself says which currency it was played for
+ * and that is covered by the hash settled on chain.
+ */
+export interface MatchRef {
+  currency: Currency;
+  id: bigint;
+}
+
+const SOL_REF_RE = /^(0|[1-9][0-9]{0,19})$/;
+const SKR_REF_RE = /^skr-(0|[1-9][0-9]{0,19})$/;
+const MAX_U64 = 18_446_744_073_709_551_615n;
+
+/** Parse a match id string. Null for anything that is not exactly one of the two forms. */
+export function parseMatchRef(s: string): MatchRef | null {
+  let m = SOL_REF_RE.exec(s);
+  let currency: Currency = "sol";
+  if (!m) {
+    m = SKR_REF_RE.exec(s);
+    currency = "skr";
+  }
+  if (!m) return null;
+  const id = BigInt(m[1]);
+  if (id > MAX_U64) return null;
+  return { currency, id };
+}
+
+/** The string form of a match ref: the room id and the log's matchId. */
+export function matchKey(ref: MatchRef): string {
+  return ref.currency === "sol" ? ref.id.toString() : `skr-${ref.id}`;
+}
+
 export type MatchState = "Open" | "Locked" | "Settled" | "Refunding";
 const STATES: MatchState[] = ["Open", "Locked", "Settled", "Refunding"];
 
 export interface MatchAccount {
+  /** "sol" for a Match, "skr" for a TokenMatch. */
+  currency: Currency;
+  /** Base58 mint of a token match's pot; null for SOL. */
+  mint: string | null;
   matchId: bigint;
   stake: bigint;
   maxPlayers: number;
@@ -88,7 +147,7 @@ export interface MatchAccount {
   settleDeadline: number;
   /** Slot numbers in finishing order, NO_PLACE for unused. */
   placements: number[];
-  /** Lamports paid for first, second and third. */
+  /** Paid for first, second and third: lamports, or raw token units. */
   payouts: bigint[];
   /** Bit i set once slot i has claimed. */
   claimed: number;
@@ -103,37 +162,51 @@ export interface MatchAccount {
  * in it.
  */
 export function decodeMatch(data: Buffer | Uint8Array): MatchAccount {
+  return decodeWith(Buffer.from(data), M, MATCH_ACCOUNT, "Match", null);
+}
+
+/** Decode a TokenMatch account: the same checks, the token layout, and its mint. */
+export function decodeTokenMatch(data: Buffer | Uint8Array): MatchAccount {
   const b = Buffer.from(data);
-  if (b.length < MATCH_ACCOUNT_SIZE) {
-    throw new Error(`match account is ${b.length} bytes, expected ${MATCH_ACCOUNT_SIZE}`);
+  return decodeWith(b, TM, TOKEN_MATCH_ACCOUNT, "TokenMatch", TOKEN_MINT_OFFSET);
+}
+
+function decodeWith(
+  b: Buffer, L: Layout, disc: Buffer, name: string, mintAt: number | null,
+): MatchAccount {
+  const size = L.bump + 1;
+  if (b.length < size) {
+    throw new Error(`${name} account is ${b.length} bytes, expected ${size}`);
   }
-  if (!b.subarray(0, 8).equals(MATCH_ACCOUNT)) {
-    throw new Error("that account is not a Match: wrong discriminator");
+  if (!b.subarray(0, 8).equals(disc)) {
+    throw new Error(`that account is not a ${name}: wrong discriminator`);
   }
 
-  const count = b.readUInt8(M.count);
+  const count = b.readUInt8(L.count);
   if (count > MAX_PLAYERS) throw new Error(`match claims ${count} players`);
   const players: string[] = [];
   for (let i = 0; i < MAX_PLAYERS; i++) {
-    players.push(bs58.encode(b.subarray(M.players + i * 32, M.players + i * 32 + 32)));
+    players.push(bs58.encode(b.subarray(L.players + i * 32, L.players + i * 32 + 32)));
   }
-  const stateByte = b.readUInt8(M.state);
+  const stateByte = b.readUInt8(L.state);
   const state = STATES[stateByte];
   if (!state) throw new Error(`match state byte ${stateByte} is not a known state`);
 
   return {
-    matchId: b.readBigUInt64LE(M.matchId),
-    stake: b.readBigUInt64LE(M.stake),
-    maxPlayers: b.readUInt8(M.maxPlayers),
+    currency: mintAt === null ? "sol" : "skr",
+    mint: mintAt === null ? null : bs58.encode(b.subarray(mintAt, mintAt + 32)),
+    matchId: b.readBigUInt64LE(L.matchId),
+    stake: b.readBigUInt64LE(L.stake),
+    maxPlayers: b.readUInt8(L.maxPlayers),
     count,
     players,
     state,
-    joinDeadline: Number(b.readBigInt64LE(M.joinDeadline)),
-    settleDeadline: Number(b.readBigInt64LE(M.settleDeadline)),
-    placements: [0, 1, 2].map((i) => b.readUInt8(M.placements + i)),
-    payouts: [0, 1, 2].map((i) => b.readBigUInt64LE(M.payouts + i * 8)),
-    claimed: b.readUInt8(M.claimed),
-    logHash: Uint8Array.from(b.subarray(M.logHash, M.logHash + 32)),
+    joinDeadline: Number(b.readBigInt64LE(L.joinDeadline)),
+    settleDeadline: Number(b.readBigInt64LE(L.settleDeadline)),
+    placements: [0, 1, 2].map((i) => b.readUInt8(L.placements + i)),
+    payouts: [0, 1, 2].map((i) => b.readBigUInt64LE(L.payouts + i * 8)),
+    claimed: b.readUInt8(L.claimed),
+    logHash: Uint8Array.from(b.subarray(L.logHash, L.logHash + 32)),
   };
 }
 
@@ -185,23 +258,29 @@ export function placementsFrom(standings: Standing[], count: number): number[] {
  * server does not.
  */
 export function hasChainEnv(env: NodeJS.ProcessEnv): boolean {
-  return [env.RPC_URL, env.PROGRAM_ID, env.RESOLVER_KEYPAIR_PATH]
+  return [env.RPC_URL, env.PROGRAM_ID, env.RESOLVER_KEYPAIR_PATH, env.SKR_POT_MINT]
     .some((v) => v !== undefined && v !== "");
 }
 
-/** Instruction data for settle: discriminator, placements, log hash. */
-export function settleData(placements: number[], logHash: Uint8Array): Buffer {
+/**
+ * Instruction data for settle (or settle_token_match, which takes the same
+ * two arguments): discriminator, placements, log hash.
+ */
+export function settleData(
+  placements: number[], logHash: Uint8Array, currency: Currency = "sol",
+): Buffer {
   if (placements.length !== PLACES) throw new Error("placements must have three entries");
   if (logHash.length !== 32) throw new Error("log hash must be 32 bytes");
   for (const p of placements) {
     if (!Number.isInteger(p) || p < 0 || p > 255) throw new Error(`placement ${p} is not a byte`);
   }
-  return Buffer.concat([SETTLE_IX, Buffer.from(placements), Buffer.from(logHash)]);
+  const ix = currency === "sol" ? SETTLE_IX : SETTLE_TOKEN_IX;
+  return Buffer.concat([ix, Buffer.from(placements), Buffer.from(logHash)]);
 }
 
-/** Instruction data for lock_match: the discriminator, nothing else. */
-export function lockData(): Buffer {
-  return Buffer.from(LOCK_IX);
+/** Instruction data for lock_match or lock_token_match: the discriminator, nothing else. */
+export function lockData(currency: Currency = "sol"): Buffer {
+  return Buffer.from(currency === "sol" ? LOCK_IX : LOCK_TOKEN_IX);
 }
 
 /**
@@ -226,6 +305,43 @@ export function openMatchFilters(stake: bigint): {
       { offset: M.state, bytes: bs58.encode(Buffer.from([0])) },
     ],
   };
+}
+
+/**
+ * getProgramAccounts filters for the Open token matches at one stake in one
+ * mint. The mint is a filter, not just a check afterwards: the allowlist can
+ * hold more than one mint, and this server only lists, opens and settles
+ * matches for the one it was configured with (SKR_POT_MINT).
+ */
+export function openTokenMatchFilters(mint: string, stake: bigint): {
+  dataSize: number; memcmp: { offset: number; bytes: string }[];
+} {
+  const le = Buffer.alloc(8);
+  le.writeBigUInt64LE(stake);
+  return {
+    dataSize: TOKEN_MATCH_ACCOUNT_SIZE,
+    memcmp: [
+      { offset: 0, bytes: bs58.encode(TOKEN_MATCH_ACCOUNT) },
+      { offset: TOKEN_MINT_OFFSET, bytes: mint },
+      { offset: TM.stake, bytes: bs58.encode(le) },
+      { offset: TM.state, bytes: bs58.encode(Buffer.from([0])) },
+    ],
+  };
+}
+
+/**
+ * Decimals of a classic SPL mint, from its raw account data: one byte at
+ * offset 44 of the 82 byte layout. Read from the chain, never written down,
+ * because the decimals of the real SKR mint are not something this code
+ * gets to assume.
+ */
+export function mintDecimals(data: Buffer | Uint8Array): number {
+  const b = Buffer.from(data);
+  if (b.length !== 82) throw new Error(`mint account is ${b.length} bytes, not a classic SPL mint`);
+  if (b.readUInt8(45) !== 1) throw new Error("mint is not initialized");
+  const d = b.readUInt8(44);
+  if (d > 18) throw new Error(`mint claims ${d} decimals`);
+  return d;
 }
 
 /** What a match pays each place, from the pot, as the program computes it. */

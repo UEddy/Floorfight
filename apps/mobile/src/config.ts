@@ -72,3 +72,30 @@ export const STAKE_TIERS: readonly bigint[] = [
 /** Every holders match this app creates: six seats, ten minutes to join. */
 export const HOLDERS_MAX_PLAYERS = 6;
 export const HOLDERS_JOIN_WINDOW = 600;
+
+/* --------------------------------------------------------- token pots --- */
+
+/**
+ * The devnet test mint that token pots are staked in, shown everywhere as
+ * SKR_POT_LABEL. Null until scripts/create-test-skr.ts has made one and
+ * scripts/allow-mint.ts has put it on the program's allowlist; while it is
+ * null this build refuses every token pot request.
+ *
+ * Never the mainnet SKR mint: escrow.ts refuses to load if it is. Staking the
+ * real token waits on the dApp Store question in CLAUDE.md.
+ *
+ * Like every other address in this file, it is this build's and nobody
+ * else's. The page picks "skr" from a fixed list of two currencies; it never
+ * names a mint, a token account or an amount.
+ */
+export const TEST_SKR_MINT: string | null = null;
+
+/** What a token pot is called on the confirmation sheet. */
+export const SKR_POT_LABEL = "Test SKR (devnet)";
+
+/**
+ * Token pot tiers in whole tokens. Converted to raw units with the mint's
+ * own decimals, read from the chain when a create is planned; decimals are
+ * never written down. test/tiers.test.ts holds this to the shared list.
+ */
+export const SKR_STAKE_TIERS: readonly bigint[] = [10n, 50n, 100n];

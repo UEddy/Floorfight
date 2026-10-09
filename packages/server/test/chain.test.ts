@@ -8,6 +8,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
 import nacl from "tweetnacl";
+import bs58 from "bs58";
 import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -29,7 +30,21 @@ import {
   type MatchLog,
   type RosterEntry,
 } from "../../shared/protocol";
-import { hasChainEnv, placementsFrom, settleData } from "../src/chain";
+import {
+  MATCH_ACCOUNT_SIZE,
+  TOKEN_MATCH_ACCOUNT_SIZE,
+  decodeMatch,
+  decodeTokenMatch,
+  hasChainEnv,
+  lockData,
+  matchKey,
+  mintDecimals,
+  parseMatchRef,
+  placementsFrom,
+  settleData,
+} from "../src/chain";
+import { SKR_MINT } from "../../shared/skr";
+import { wholeToRaw } from "../../shared/tiers";
 import { assertKeyFilePrivate, chainFromEnv, loadResolver } from "../src/chainrpc";
 import { finishMatch, writeMatchLog } from "../src/settlement";
 
@@ -287,4 +302,78 @@ test("settle data is the discriminator and the two fixed arguments", () => {
   assert.throws(() => settleData([0, 1], hash), /three entries/);
   assert.throws(() => settleData([0, 1, 2], randomBytes(31)), /32 bytes/);
   assert.throws(() => settleData([0, 1, 300], hash), /not a byte/);
+});
+
+/* --------------------------------------------------------- token pots --- */
+
+test("match ids name exactly one escrow, and nothing else parses", () => {
+  assert.deepEqual(parseMatchRef("42"), { currency: "sol", id: 42n });
+  assert.deepEqual(parseMatchRef("skr-42"), { currency: "skr", id: 42n });
+  assert.deepEqual(parseMatchRef("18446744073709551615"), { currency: "sol", id: 18446744073709551615n });
+  for (const bad of [
+    "", "-1", "042", "skr-", "skr-042", "SKR-1", "skr-1 ", " 1", "1e3", "sol-1", "usdc-1",
+    "skr--1", "skr-skr-1", "18446744073709551616", "skr-18446744073709551616", "free-1", "lounge-1",
+  ]) {
+    assert.equal(parseMatchRef(bad), null, bad);
+  }
+  for (const s of ["0", "7", "skr-0", "skr-99"]) assert.equal(matchKey(parseMatchRef(s)!), s);
+});
+
+test("token lock and settle use their own discriminators and the same arguments", () => {
+  const hash = randomBytes(32);
+  const sol = settleData([2, 0, 1], hash, "sol");
+  const tok = settleData([2, 0, 1], hash, "skr");
+  assert.equal(tok.length, sol.length);
+  assert.notDeepEqual(tok.subarray(0, 8), sol.subarray(0, 8));
+  assert.deepEqual(tok.subarray(8), sol.subarray(8));
+  assert.notDeepEqual(lockData("skr"), lockData("sol"));
+  assert.deepEqual(settleData([2, 0, 1], hash), sol, "SOL stays the default");
+});
+
+test("the token decoder refuses a SOL match and the SOL decoder a token match", () => {
+  assert.equal(TOKEN_MATCH_ACCOUNT_SIZE, MATCH_ACCOUNT_SIZE + 32);
+  assert.throws(() => decodeTokenMatch(Buffer.alloc(TOKEN_MATCH_ACCOUNT_SIZE)), /not a TokenMatch/);
+  assert.throws(() => decodeTokenMatch(Buffer.alloc(MATCH_ACCOUNT_SIZE)), /expected/);
+  assert.throws(() => decodeMatch(Buffer.alloc(TOKEN_MATCH_ACCOUNT_SIZE)), /not a Match/);
+});
+
+test("mint decimals come from the mint account, and only a classic initialized one", () => {
+  const mint = Buffer.alloc(82);
+  mint.writeUInt8(9, 44);
+  mint.writeUInt8(1, 45);
+  assert.equal(mintDecimals(mint), 9);
+  mint.writeUInt8(0, 45);
+  assert.throws(() => mintDecimals(mint), /not initialized/);
+  assert.throws(() => mintDecimals(Buffer.alloc(165)), /not a classic/);
+  const big = Buffer.alloc(82);
+  big.writeUInt8(19, 44);
+  big.writeUInt8(1, 45);
+  assert.throws(() => mintDecimals(big), /decimals/);
+});
+
+test("whole token tiers convert to raw units in integers, and refuse anything else", () => {
+  assert.equal(wholeToRaw("10", 6), 10_000_000n);
+  assert.equal(wholeToRaw("100", 0), 100n);
+  assert.equal(wholeToRaw("50", 9), 50_000_000_000n);
+  for (const bad of ["1.5", "-1", "1e3", "", "010"]) assert.throws(() => wholeToRaw(bad, 6), bad);
+  assert.throws(() => wholeToRaw("10", 19));
+  assert.throws(() => wholeToRaw("10", 1.5));
+  assert.throws(() => wholeToRaw("18446744073709551615", 1), /u64/);
+});
+
+test("SKR_POT_MINT needs the chain, a real address, and never the mainnet SKR mint", () => {
+  const dir = tmp();
+  const full = {
+    RPC_URL: "https://api.devnet.solana.com",
+    PROGRAM_ID: PROGRAM,
+    RESOLVER_KEYPAIR_PATH: keyFile(dir, 0o600),
+  };
+  const potMint = bs58.encode(nacl.sign.keyPair().publicKey);
+
+  assert.equal(chainFromEnv(full, false)!.potMint, null, "no SKR_POT_MINT is SOL pots only");
+  assert.equal(chainFromEnv({ ...full, SKR_POT_MINT: potMint }, false)!.potMint!.toBase58(), potMint);
+  assert.equal(hasChainEnv({ SKR_POT_MINT: potMint }), true);
+  assert.throws(() => chainFromEnv({ SKR_POT_MINT: potMint }, false), /no chain configuration/);
+  assert.throws(() => chainFromEnv({ ...full, SKR_POT_MINT: "not a key" }, false), /base58/);
+  assert.throws(() => chainFromEnv({ ...full, SKR_POT_MINT: SKR_MINT }, false), /mainnet SKR mint/);
 });

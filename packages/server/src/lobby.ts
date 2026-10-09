@@ -71,8 +71,9 @@ export interface Member {
 }
 
 export interface LobbyDeps {
-  fetchMatch: (matchId: bigint) => Promise<MatchAccount | null>;
-  lockMatch: (matchId: bigint) => Promise<string>;
+  /** Both take the match id string: a bare number for SOL, "skr-" and a number for a token match. */
+  fetchMatch: (matchId: string) => Promise<MatchAccount | null>;
+  lockMatch: (matchId: string) => Promise<string>;
   /** Open the staked room for a Locked match. False if it could not be opened. */
   openRoom: (matchId: string) => Promise<boolean>;
   nowSeconds: () => number;
@@ -198,7 +199,7 @@ export class Lobbies {
   private async stepLocked(matchId: string, lobby: Lobby): Promise<void> {
     let account: MatchAccount | null;
     try {
-      account = await this.deps.fetchMatch(BigInt(matchId));
+      account = await this.deps.fetchMatch(matchId);
     } catch (e) {
       this.deps.log?.(`[lobby ${matchId}] read failed: ${(e as Error).message}`);
       return;
@@ -224,7 +225,7 @@ export class Lobbies {
     this.broadcast(matchId, lobby, "locking");
     try {
       if (decision === "lock") {
-        const sig = await this.deps.lockMatch(BigInt(matchId));
+        const sig = await this.deps.lockMatch(matchId);
         this.deps.log?.(`[lobby ${matchId}] locked, ${sig}`);
       }
       const opened = await this.deps.openRoom(matchId);
@@ -248,6 +249,7 @@ export class Lobbies {
       phase: phase ?? "waiting",
       count: a?.count ?? 0,
       maxPlayers: a?.maxPlayers ?? 0,
+      currency: a?.currency ?? "sol",
       stake: a ? a.stake.toString() : "0",
       joinDeadline: a?.joinDeadline ?? 0,
       // Which of the joined slots have a socket here. Slots, not wallets: the
