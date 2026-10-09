@@ -208,6 +208,41 @@ hit. Skeletal animation was the alternative and was turned down: it needs
 rigged, licensed models and gives up the instancing. All cosmetic; the sim
 never reads it, and the body and head stay inside the hitbox circle.
 
+## SKR
+
+Phase 1, read only: badges and the lounge. No SKR moves anywhere.
+
+- After a wallet signs a join for a holders match, its lobby or the SKR
+  lounge, the server reads its SKR balance on mainnet with one
+  `getTokenAccountsByOwner` call filtered by the mint
+  (`SKRbvo6Gf7GondiT3BbTfuRDPqLWei4j2Qy2NPGZhW3`), jsonParsed. Decimals come
+  from that answer every time; nothing hard codes them. Every field is
+  checked (token program owner, mint, wallet, integer amount, consistent
+  decimals) and anything off is no badge (`server/src/skr.ts`).
+- Cached per wallet for a minute, rate limited per address, and a join
+  waits at most 2.5 s for it. Any failure, timeout or limit is tier 0, and
+  a join is never refused because the read failed. Free play signs with a
+  page made guest key, which never holds SKR, so it is not read there.
+- Tiers and the lounge threshold are named constants in
+  `shared/skr.ts`: Holder from 1 SKR, Backer from 1,000, Patron from 25,000,
+  lounge from Holder. The tier goes on the roster (`skr`), into the match
+  log from LOG_VERSION 9, and never into the sim. A client has no field to
+  send one in; a test sends one anyway and gets tier 0.
+- Perks, cosmetic and access only: a badge on the nameplate and in the kill
+  feed, a halo over the character, and the SKR lounge, free rooms that seat
+  only wallets at the lounge tier or above, checked server side.
+- `/api/skr/:owner` gives the menu's SKR panel the server's read of a
+  wallet's balance and tier. The panel says it reads mainnet and never moves
+  funds, and links to stake.solanamobile.com.
+- Staked SKR is not counted. The staking program's account layout could not
+  be verified from published docs or an IDL, so it is not read rather than
+  guessed at.
+- Needs `RPC_URL_MAINNET` (https) or `HELIUS_API_KEY` on the server. Neither
+  is ever sent to a client. Without them: no badges, no lounge, nothing else
+  changes.
+- Tested against a stand in mainnet RPC (`server/test/skr.test.ts`), not yet
+  against mainnet itself.
+
 ## Trust boundary
 
 This is the part that must not erode under deadline pressure.
@@ -394,6 +429,9 @@ the allow listed CDN hosts in `nft.ts`, never a URL out of metadata.
 read the program config. init-config runs on your own machine with the
 deployer key, defaults to devnet, and refuses mainnet without `--mainnet`.
 
+`RPC_URL_MAINNET` (or `HELIUS_API_KEY`) turns on SKR badges and the
+lounge; see the SKR section.
+
 `ARENA_DEV=1` adds the fixed seat dev room for two tabs with known keys, and
 refuses to coexist with a resolver key or with `NODE_ENV=production`.
 `FREE_FILL_MS` is how long a free room waits for company before taking bots,
@@ -435,7 +473,9 @@ touch controls, server tick loop and join handshake, free and staked room
 types with server side bots, Anchor escrow program with 20 LiteSVM tests
 covering the attack cases, the payout paths and the holders flow (the app's
 create transaction, the lobby's lock rule against the real program, and
-create, join, lock, settle and claim end to end), 145 server tests covering
+create, join, lock, settle and claim end to end), 159 server tests covering
+SKR badges (balance parsing, cache, rate limit, failing closed, the lounge
+gate, the badge in the roster and log, and a client unable to assert one),
 replay determinism against a pinned golden result (`test/golden.json`,
 regenerated only on purpose with `npm run golden`), lag compensation at
 mobile round trips, reconnecting into the same seat, the message budget

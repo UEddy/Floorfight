@@ -36,6 +36,8 @@ export interface SignedJoin {
  */
 export type ResolveJoin = (challenge: {
   freeMatchId: string | null;
+  /** The SKR lounge room on offer, if the server has one. */
+  loungeMatchId: string | null;
   nonce: string;
 }) => Promise<SignedJoin | null>;
 
@@ -80,7 +82,7 @@ export class Net {
             this.close();
             return;
           }
-          void resolve({ freeMatchId: msg.freeMatchId, nonce: msg.nonce }).then((choice) => {
+          void resolve({ freeMatchId: msg.freeMatchId, loungeMatchId: msg.loungeMatchId ?? null, nonce: msg.nonce }).then((choice) => {
             if (!choice) {
               handlers.onKick("no room available right now");
               this.close();

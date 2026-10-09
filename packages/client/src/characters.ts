@@ -6,6 +6,7 @@ import type { RemoteView } from "./netcode";
 import { T, atlas } from "./textures";
 import type { RosterEntry } from "../../shared/protocol";
 import { probe } from "./lighting";
+import { SKR_TIERS, cleanTier } from "../../shared/skr";
 
 /**
  * Other players: blocky characters with a look of their own and a procedural
@@ -311,6 +312,10 @@ export class Characters {
   private spikes: THREE.InstancedMesh;
   private coats: THREE.InstancedMesh;
   private flames: THREE.InstancedMesh;
+  /** The SKR halo, over holders with a badge. */
+  private halos: THREE.InstancedMesh;
+  /** SKR badge tier per seat, from the server's roster. Cosmetic only. */
+  private skrTiers: number[] = [];
   private guns: THREE.InstancedMesh[] = [];
   private all: THREE.InstancedMesh[] = [];
   private rigs: Rig[] = [];
@@ -419,6 +424,13 @@ uniform float faceCells;`)
     this.spikes = this.instanced(scene, spikes, mat, slots);
     this.coats = this.instanced(scene, coat, mat, slots);
     this.flames = this.instanced(scene, flames, mat, slots);
+    // A halo of small blocks over the head, in the badge's colour.
+    const ring: Part[] = [];
+    for (let k = 0; k < 10; k++) {
+      const a = (k / 10) * Math.PI * 2;
+      ring.push({ x: Math.sin(a) * 0.24, y: 0, z: Math.cos(a) * 0.24, w: 0.07, h: 0.04, d: 0.07, tile: T.LAMP, ry: a });
+    }
+    this.halos = this.instanced(scene, buildParts(ring).geometry, mat, slots);
     for (const w of [W_RIFLE, W_PISTOL, W_SHOTGUN]) {
       this.guns.push(this.instanced(scene, buildParts(gunParts(w)).geometry, mat, slots));
     }
@@ -477,6 +489,7 @@ uniform float faceCells;`)
     for (const r of roster) {
       if (r.slot < 0 || r.slot >= this.slots) continue;
       this.looks[r.slot] = { ...builtinLook(r.slot) };
+      this.skrTiers[r.slot] = cleanTier(r.skr);
       this.paintBuiltin(r.slot);
       if (!r.mint || !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(r.mint)) continue;
       const img = new Image();
@@ -750,6 +763,16 @@ uniform float faceCells;`)
     hatAt(this.caps, look.hat === "cap");
     hatAt(this.fedoras, look.hat === "fedora");
     hatAt(this.beanies, look.hat === "beanie");
+    const tier = this.skrTiers[i] ?? 0;
+    if (tier > 0) {
+      this.halos.setMatrixAt(i, this.m.copy(headM)
+        .multiply(this.t.makeTranslation(0, HEAD_H + 0.34 + Math.sin(g.breath * 1.3) * 0.02, 0))
+        .multiply(this.t.makeRotationY(g.breath * 0.9)));
+      const c = SKR_TIERS[tier - 1].colour;
+      this.halos.setColorAt(i, this.c.setRGB(((c >> 16) & 255) / 170, ((c >> 8) & 255) / 170, (c & 255) / 170));
+    } else {
+      this.halos.setMatrixAt(i, this.hidden);
+    }
     if (look.flames) {
       const flick = 1 + Math.sin(g.breath * 7 + i) * 0.15 + Math.sin(g.breath * 13.3) * 0.08;
       this.flames.setMatrixAt(i, this.m.copy(headM)

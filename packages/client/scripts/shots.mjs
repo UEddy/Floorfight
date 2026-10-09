@@ -165,8 +165,10 @@ async function main() {
   // serves a verified NFT, so the head's NFT path is in the picture too.
   await page.route("**/api/nft-img/*", (r) =>
     r.fulfill({ path: resolve("scripts/fixtures", "face1.png"), contentType: "image/png" }));
+  // Every other seat also carries an SKR badge tier, so the halo and the
+  // nameplate badge are in the picture.
   await page.evaluate(() => window.arena.faces([1, 2, 3, 4, 5].map((slot) => ({
-    slot, wallet: "", collection: null, mint: "Face2222222222222222222222222222222222222222",
+    slot, wallet: "", collection: null, mint: "Face2222222222222222222222222222222222222222", skr: (slot % 3) + 1,
   }))));
   const near = await page.evaluate(() => window.arena.nearestRemote?.() ?? null);
   if (near) {
@@ -245,6 +247,11 @@ async function menus(browser) {
     { id: "Face2222222222222222222222222222222222222222", name: "Ember Clerk", collection: null, image: "x" },
     { id: "Face3333333333333333333333333333333333333333", name: "Fern Usher", collection: null, image: "x" },
   ] } }));
+  // A canned SKR read for the made up wallet: the panel's layout is real,
+  // the balance is invented.
+  await page.route("**/api/skr/*", (r) => r.fulfill({ json: {
+    balance: "2150.5", raw: "2150500000", decimals: 6, tier: 2, tierName: "Backer", network: "mainnet",
+  } }));
   await page.route("**/api/nft-img/*", (r) => {
     const n = Number(/Face(\d)/.exec(r.request().url())?.[1] ?? 1) - 1;
     return r.fulfill({ path: resolve("scripts/fixtures", `face${n}.png`), contentType: "image/png" });

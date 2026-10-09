@@ -16,6 +16,7 @@
 import { STAKE_TIERS } from "../../shared/tiers";
 import type { LobbyView } from "../../shared/protocol";
 import * as native from "./native";
+import { LOUNGE_MIN_TIER, SKR_STAKE_URL, SKR_TIERS, cleanTier, tierName } from "../../shared/skr";
 
 const $ = (id: string) => document.getElementById(id) as HTMLElement;
 
@@ -49,7 +50,12 @@ export interface MenuHandlers {
   free(): void;
   /** Enter a holders match: the caller connects and signs the join. */
   holders(matchId: string, wallet: string, mint: string | null): void;
+  /** Enter the SKR lounge with this wallet: the caller signs the join. */
+  lounge(wallet: string, mint: string | null): void;
 }
+
+/** What /api/skr says about a wallet. The server read it; this only shows it. */
+interface SkrView { balance: string; tier: number; decimals: number | null }
 
 interface OpenMatch { matchId: string; stake: string; count: number; maxPlayers: number; joinDeadline: number }
 
@@ -97,6 +103,7 @@ export class Menu {
       <div class="card holders">
         <div class="row head"><h1>Holders</h1><button class="link" data-a="back">Back</button></div>
         <div class="wallet"></div>
+        <div class="skr"></div>
         <div class="nfts"></div>
         <div class="tiers">${STAKE_TIERS.map((t, i) =>
           `<button data-tier="${i}" class="${i === this.tier ? "on" : ""}">${esc(t.label)}</button>`).join("")}</div>
@@ -141,6 +148,45 @@ export class Menu {
     }
     box.innerHTML = `<p>Wallet <b>${esc(short(this.wallet))}</b></p>`;
     void this.loadNfts();
+    void this.loadSkr();
+  }
+
+  /**
+   * The SKR panel: the wallet's SKR balance on mainnet as the server read
+   * it, the badge it earns, and the lounge if it earns enough. Read only:
+   * nothing here can move SKR, and the copy says so.
+   */
+  private async loadSkr(): Promise<void> {
+    const box = this.el.querySelector(".skr");
+    if (!box || !this.wallet) return;
+    const wallet = this.wallet;
+    box.innerHTML = `<div class="skrbox"><b>SKR</b> <span class="dim">Reading your mainnet balance...</span></div>`;
+    let v: SkrView;
+    try {
+      v = await getJson<SkrView>(`/api/skr/${wallet}`);
+    } catch {
+      box.innerHTML = `<div class="skrbox"><b>SKR</b> <span class="dim">Could not read your SKR balance right now. No badge this time.</span></div>`;
+      return;
+    }
+    const tier = cleanTier(v.tier);
+    const name = tierName(tier);
+    const next = SKR_TIERS[tier];
+    const lounge = tier >= LOUNGE_MIN_TIER;
+    box.innerHTML = `
+      <div class="skrbox">
+        <div class="row"><b>SKR</b><span>${esc(v.balance)} SKR${name
+          ? ` <span class="badge" style="--c:#${SKR_TIERS[tier - 1].colour.toString(16).padStart(6, "0")}">${esc(name)}</span>`
+          : ""}</span></div>
+        <p class="dim">${name
+          ? `Your ${esc(name)} badge shows on your nameplate, in the kill feed and as a halo over your character. Cosmetic only: it never changes how the game plays.`
+          : `Hold ${SKR_TIERS[0].min} SKR or more on mainnet for a badge on your nameplate and character, and the SKR lounge.`}
+          ${next ? ` ${esc(next.name)} at ${next.min.toLocaleString("en")} SKR.` : ""}</p>
+        ${lounge ? `<button data-a="lounge">Play the SKR lounge</button>` : ""}
+        <p class="note">Reads your mainnet SKR balance. It never moves your funds. Staked SKR is not counted yet.
+          <a href="${SKR_STAKE_URL}" target="_blank" rel="noopener noreferrer">Stake SKR</a></p>
+      </div>`;
+    const b = box.querySelector<HTMLButtonElement>('[data-a="lounge"]');
+    if (b) b.onclick = () => this.h.lounge(wallet, this.mint);
   }
 
   /**

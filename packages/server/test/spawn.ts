@@ -35,7 +35,7 @@ export async function startServer(env: Record<string, string> = {}): Promise<Ser
   delete full.HOST;
   if (!("ARENA_DEV" in env)) delete full.ARENA_DEV;
   if (!("NODE_ENV" in env)) delete full.NODE_ENV;
-  for (const key of ["RPC_URL", "PROGRAM_ID", "RESOLVER_KEYPAIR_PATH"]) {
+  for (const key of ["RPC_URL", "PROGRAM_ID", "RESOLVER_KEYPAIR_PATH", "RPC_URL_MAINNET", "HELIUS_API_KEY"]) {
     if (!(key in env)) delete full[key];
   }
 

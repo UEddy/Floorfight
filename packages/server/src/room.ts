@@ -176,6 +176,9 @@ export class Room {
     this.matchId = matchId;
     this.kind = kind;
     this.roster = roster;
+    // Every seat carries an SKR tier in the log, 0 until a join sets one, so
+    // the roster written to disk reads back exactly as it was.
+    for (const r of roster) r.skr ??= 0;
     this.spreadSalt = kind === "staked"
       ? new Uint8Array(randomBytes(32))
       : FREE_SALT_BYTES;

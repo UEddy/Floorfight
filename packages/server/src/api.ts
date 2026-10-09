@@ -6,6 +6,7 @@
  *   GET /api/match/:id         one match account, for the results screen
  *   GET /api/nfts/:owner       a wallet's NFTs, for the head picker
  *   GET /api/nft-img/:assetId  one NFT image, same origin so WebGL can use it
+ *   GET /api/skr/:owner        a wallet's SKR balance on mainnet and its badge tier
  *
  * Every one of them is a way for an anonymous caller to make this server
  * spend RPC calls, so every one is rate limited per address and cached for a
@@ -20,6 +21,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { STAKE_TIERS } from "../../shared/tiers";
 import { NO_PLACE, payoutsFor, type MatchAccount } from "./chain";
 import { clientIp } from "./limits";
+import { SKR_MINT, formatSkr, tierName } from "../../shared/skr";
 
 /* ------------------------------------------------------------- limits --- */
 
@@ -169,6 +171,10 @@ export interface ApiDeps {
     list: (owner: string) => Promise<unknown>;
     image: (assetId: string) => Promise<{ type: string; body: Buffer }>;
   };
+  /** Absent without a mainnet RPC: the SKR endpoint answers 503. */
+  skr?: {
+    balance: (owner: string) => Promise<{ raw: bigint; decimals: number | null; tier: number }>;
+  };
   nowSeconds?: () => number;
 }
 
@@ -259,6 +265,26 @@ export function createApi(deps: ApiDeps) {
         if (!BASE58_RE.test(owner)) throw new HttpError(400, "not a wallet address");
         const list = await nftCache.get(owner, () => deps.nfts!.list(owner));
         json(res, 200, list, 30);
+        return true;
+      }
+
+      if (path.startsWith("/api/skr/")) {
+        if (!deps.skr) throw new HttpError(503, "SKR badges are not configured on this server");
+        const owner = path.slice("/api/skr/".length);
+        if (!BASE58_RE.test(owner)) throw new HttpError(400, "not a wallet address");
+        // The service caches each wallet for a minute, so this is one RPC
+        // call per wallet per minute whatever the traffic.
+        const b = await deps.skr.balance(owner);
+        json(res, 200, {
+          owner,
+          mint: SKR_MINT,
+          network: "mainnet",
+          raw: b.raw.toString(),
+          decimals: b.decimals,
+          balance: b.decimals === null ? "0" : formatSkr(b.raw, b.decimals),
+          tier: b.tier,
+          tierName: tierName(b.tier),
+        }, 30);
         return true;
       }
 
