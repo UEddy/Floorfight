@@ -670,8 +670,13 @@ export class Renderer {
 
     // Other players' muzzle flashes, one slot each.
     this.muzzles = new THREE.InstancedMesh(
-      new THREE.BoxGeometry(0.22, 0.22, 0.22),
-      new THREE.MeshBasicMaterial({ color: 0xffe9a8 }),
+      // A star of three crossed blades rather than a cube, added over what
+      // is behind it, so a flash reads as light and not as a block.
+      new THREE.OctahedronGeometry(0.13, 0),
+      new THREE.MeshBasicMaterial({
+        color: 0xffb860, transparent: true, opacity: 0.9,
+        blending: THREE.AdditiveBlending, depthWrite: false,
+      }),
       slots,
     );
     this.muzzles.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
@@ -732,6 +737,12 @@ export class Renderer {
   remoteFlash(slot: number, nowMs: number): void {
     if (slot < 0 || slot >= this.muzzleUntil.length) return;
     this.muzzleUntil[slot] = nowMs + 60;
+    this.people.fired(slot);
+  }
+
+  /** Somebody else was hit from (fromX, fromZ): their body flinches. */
+  flinch(slot: number, fromX: number, fromZ: number): void {
+    this.people.hit(slot, fromX, fromZ);
   }
 
   /**
@@ -968,7 +979,11 @@ export class Renderer {
       // Muzzle flash at the end of their gun.
       if (r && r.alive && i !== localSlot && nowMs < this.muzzleUntil[i]) {
         this.people.muzzle(r, this.v);
-        this.m.makeTranslation(this.v.x, this.v.y, this.v.z);
+        // A different size and twist every frame, the way a real flash is
+        // never the same shape twice. Cosmetic, so Math.random is fine.
+        const s = 0.7 + Math.random() * 0.6;
+        this.e.set(Math.random() * 3, Math.random() * 3, Math.random() * 3);
+        this.m.compose(this.v, this.q.setFromEuler(this.e), this.scratch.set(s, s, s * 1.6));
         this.muzzles.setMatrixAt(i, this.m);
       }
     }

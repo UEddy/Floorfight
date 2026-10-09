@@ -576,6 +576,12 @@ function onHit(h: HitEvent, now: number): void {
     }
   }
 
+  // A hit that does not kill shows on the body that took it.
+  if (!h.lethal && h.victim !== slot && renderer) {
+    const from = h.shooter === slot && predictor ? predictor.me : remotes.get(h.shooter);
+    if (from) renderer.flinch(h.victim, from.x, from.z);
+  }
+
   if (h.lethal) {
     hud.kill(h);
     if (h.victim !== slot) killedAt.set(h.victim, h.tick);

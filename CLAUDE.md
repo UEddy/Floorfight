@@ -188,6 +188,26 @@ in the replay, so it reads only the world state.
 the grid, with spawns and zones marked. `docs/screenshots/map-v2/` holds that
 plan and the shots views.
 
+## Characters
+
+`client/src/characters.ts`. A holder whose NFT the server verified is dressed
+as it: the art on the front of the head, the colour round its edge on the
+sides and back, the body in the art's strongest colours. Everyone else is one
+of six original built in characters (Rex, Noir, Kick, Ember, Bronze, Nova),
+drawn here as 16 pixel head faces and box outfits. None of them is a copy of
+any collection, and no collection's art ships in the app: holders bring their
+own, which is the licensing line under "Open, not yet decided".
+
+Movement is a procedural rig, no animation library: two part legs that
+stride in the direction of travel relative to the body (so strafes step
+sideways and backpedals step back), knees that fold on the swing, cadence
+from speed, hips that drop twice a stride, lean into acceleration and
+strafe, a tuck in the air and a crouch on landing, a shuffle when turning on
+the spot, breath at rest, an arm kick on firing and a flinch away from a
+hit. Skeletal animation was the alternative and was turned down: it needs
+rigged, licensed models and gives up the instancing. All cosmetic; the sim
+never reads it, and the body and head stay inside the hitbox circle.
+
 ## Trust boundary
 
 This is the part that must not erode under deadline pressure.
@@ -270,7 +290,8 @@ samples one procedural texture atlas, with sky and lantern light baked into
 vertex colours. With the sign strip, the sky dome, the glass roof, the props,
 the lantern glows, the instanced character parts, the view model, the death
 chunks, the tracers and the remote muzzle flashes, a six player frame is
-29 to 32 draw calls and 57k to 63k triangles, read off the renderer by
+36 to 39 draw calls and 59k to 64k triangles (characters are 19 instanced
+meshes, whatever the player count), read off the renderer by
 `npm run shots` in headless Chromium. The 48 block hall before it was 22
 draw calls and 51k triangles.
 
