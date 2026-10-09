@@ -61,7 +61,8 @@ function keyFile(dir: string, mode: number): string {
 function roster(n: number): RosterEntry[] {
   const out: RosterEntry[] = [];
   for (let i = 0; i < n; i++) {
-    out.push({ slot: i, wallet: `w${i}`, collection: null, mint: null });
+    // Badge tiers vary by seat, so the round trip covers them too.
+    out.push({ slot: i, wallet: `w${i}`, collection: null, mint: null, skr: i % 3 });
   }
   return out;
 }

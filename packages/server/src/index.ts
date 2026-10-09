@@ -22,6 +22,8 @@ import type { ChainConfig } from "./chainrpc";
 import { DEFAULT_LOG_DIR, finishMatch } from "./settlement";
 import { TtlCache, createApi } from "./api";
 import { nftsFromEnv, type NftService } from "./nft";
+import { skrFromEnv, type SkrService } from "./skr";
+import { LOUNGE_MIN_TIER, SKR_TIERS } from "../../shared/skr";
 import { Lobbies, type Member } from "./lobby";
 import type { MatchAccount } from "./chain";
 import { FREE_SEAT_OPEN, Room, type RoomKind, type Seat } from "./room";
@@ -273,6 +275,32 @@ try {
   console.error((e as Error).message);
   process.exit(1);
 }
+/* ----------------------------------------------------------------- SKR --- */
+
+/**
+ * SKR badges and the lounge. Needs RPC_URL_MAINNET or HELIUS_API_KEY;
+ * without either there are no badges and no lounge, and nothing else
+ * changes. The URL and any key in it never leave this process.
+ */
+let SKR: SkrService | null = null;
+try {
+  SKR = skrFromEnv(process.env);
+} catch (e) {
+  console.error((e as Error).message);
+  process.exit(1);
+}
+
+/**
+ * A wallet's badge tier, read after it has signed a join. Never throws and
+ * never holds a join up for long (see SkrService.tierAtJoin).
+ */
+async function skrTierFor(wallet: string, ip: string): Promise<number> {
+  if (!SKR) return 0;
+  const tier = await SKR.tierAtJoin(wallet, ip);
+  if (tier > 0) console.log(`[skr] ${wallet} holds tier ${tier}`);
+  return tier;
+}
+
 /** Ownership answers, for a minute, so a reconnect does not cost another DAS call. */
 const verified = new TtlCache<{ mint: string | null; collection: string | null }>(60_000, 2000);
 
@@ -310,11 +338,18 @@ const FREE_FILL_MS = Number(process.env.FREE_FILL_MS ?? 8000);
 const BOOT = Date.now().toString(36);
 let freeCounter = 0;
 const freeRooms: Room[] = [];
+/**
+ * The SKR lounge: free rooms that seat only wallets holding at least
+ * LOUNGE_MIN_TIER of SKR, checked here at join from the mainnet balance.
+ * Bots fill them like any free room. They share free play's room cap.
+ */
+const loungeRooms: Room[] = [];
+let loungeCounter = 0;
 
 function openFreeRoom(): Room | null {
   // Free play gets a share of the room cap, never all of it: a staked match
   // has money in escrow and must not be the thing that cannot open.
-  if (freeRooms.length >= LIMIT_FREE_ROOMS || rooms.size >= LIMIT_ROOMS) {
+  if (freeRooms.length + loungeRooms.length >= LIMIT_FREE_ROOMS || rooms.size >= LIMIT_ROOMS) {
     console.warn(
       `[free] at capacity: ${freeRooms.length} free rooms, ${rooms.size} rooms in total`,
     );
@@ -354,6 +389,33 @@ function matchmake(): Room | null {
   return openFreeRoom();
 }
 
+/** The newest joinable lounge room, opening one if needed. Null without SKR. */
+function matchmakeLounge(): Room | null {
+  if (!SKR) return null;
+  for (let i = loungeRooms.length - 1; i >= 0; i--) {
+    if (loungeRooms[i].joinable()) return loungeRooms[i];
+  }
+  if (freeRooms.length + loungeRooms.length >= LIMIT_FREE_ROOMS || rooms.size >= LIMIT_ROOMS) return null;
+  const matchId = `lounge-${BOOT}-${++loungeCounter}`;
+  const roster: RosterEntry[] = [];
+  for (let slot = 0; slot < FREE_SEATS; slot++) {
+    roster.push({ slot, wallet: FREE_SEAT_OPEN, collection: null, mint: null });
+  }
+  const room = openRoom(matchId, roster, {
+    kind: "free",
+    fillWithBots: true,
+    fillAfterMs: FREE_FILL_MS,
+    onDone: () => {
+      rooms.delete(matchId);
+      const i = loungeRooms.indexOf(room);
+      if (i >= 0) loungeRooms.splice(i, 1);
+    },
+  });
+  loungeRooms.push(room);
+  console.log(`[lounge] opened ${matchId}`);
+  return room;
+}
+
 /**
  * Dev only. Reached solely through the DEV flag, which devModeFromEnv never
  * sets in production. When a round ends a fresh room replaces it, so tabs can
@@ -391,6 +453,7 @@ const api = createApi({
       }
     : undefined,
   nfts: NFTS ?? undefined,
+  skr: SKR ?? undefined,
 });
 const http = createServer((req, res) => {
   void api(req, res).then((handled) => {
@@ -486,6 +549,7 @@ wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
     v: PROTOCOL_VERSION,
     nonce: pending.nonce,
     freeMatchId: offered ? offered.matchId : null,
+    loungeMatchId: SKR ? matchmakeLounge()?.matchId ?? null : null,
   }));
 
   ws.on("message", (raw) => {
@@ -597,11 +661,25 @@ wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
     }
 
     let entry: RosterEntry | undefined;
-    if (target.kind === "free") {
-      // Any key that signed the nonce gets a seat, in join order.
+    if (target.kind === "free" && loungeRooms.includes(target)) {
+      // The lounge: the wallet has signed, so its balance is worth reading.
+      // Below the threshold, or if the read fails, it is not let in.
+      const tier = await skrTierFor(msg.wallet, ip);
+      if (tier < LOUNGE_MIN_TIER) {
+        return kick(`the SKR lounge is for wallets holding ${SKR_TIERS[LOUNGE_MIN_TIER - 1].min} SKR or more`);
+      }
       const claimed = target.claimFreeSeat(msg.wallet);
       if (claimed === null) return kick("that room filled up, reconnect for another");
       entry = target.roster[claimed];
+      entry.skr = tier;
+    } else if (target.kind === "free") {
+      // Any key that signed the nonce gets a seat, in join order. Free play
+      // signs with a guest key made up by the page, which never holds SKR,
+      // so no balance is read for it.
+      const claimed = target.claimFreeSeat(msg.wallet);
+      if (claimed === null) return kick("that room filled up, reconnect for another");
+      entry = target.roster[claimed];
+      entry.skr = 0;
     } else {
       // The roster is the allow list. A wallet that did not stake has no
       // seat, whatever it signs, and its slot is the one the chain gave it.
@@ -610,7 +688,11 @@ wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
       // Cosmetic only, and deliberately non-fatal. A wallet that does not
       // hold the mint it asks for plays as the default character rather than
       // being refused a seat it paid for.
-      Object.assign(entry, await verifyCharacter(msg.wallet, msg.mint));
+      const [character, tier] = await Promise.all([
+        verifyCharacter(msg.wallet, msg.mint),
+        skrTierFor(msg.wallet, ip),
+      ]);
+      Object.assign(entry, character, { skr: tier });
     }
     takeSeat(target, entry);
   }
@@ -634,7 +716,10 @@ wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
       return true;
     }
     // Checked now, while the socket waits, so the room can seat it at once.
-    const character = await verifyCharacter(msg.wallet, msg.mint);
+    const [character, tier] = await Promise.all([
+      verifyCharacter(msg.wallet, msg.mint),
+      skrTierFor(msg.wallet, ip),
+    ]);
     const matchId = msg.matchId;
     const member: Member = {
       wallet: msg.wallet,
@@ -645,7 +730,7 @@ wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
         const r = rooms.get(id);
         const entry = r?.roster.find((e) => e.wallet === msg.wallet);
         if (!r || !entry) return kick("the room did not open");
-        Object.assign(entry, character);
+        Object.assign(entry, character, { skr: tier });
         takeSeat(r, entry);
       },
     };

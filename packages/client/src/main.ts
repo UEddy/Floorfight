@@ -215,6 +215,7 @@ let holders: { matchId: string; wallet: string } | null = null;
 const menu = new Menu({
   free: () => startFree(),
   holders: (matchId, wallet, mint) => startHolders(matchId, wallet, mint),
+  lounge: (wallet, mint) => startLounge(wallet, mint),
 });
 
 let net: Net | null = null;
@@ -325,6 +326,26 @@ function startHolders(matchId: string, wallet: string, mint: string | null): voi
   };
   rejoin = { matchId, sign };
   net = new Net(serverUrl, async (challenge) => sign(challenge.nonce), handlers);
+}
+
+/**
+ * The SKR lounge: a free room for SKR holders. The wallet signs the join
+ * through the app, like a holders match, and the server reads the wallet's
+ * SKR balance before it seats it. Nothing is staked.
+ */
+function startLounge(wallet: string, mint: string | null): void {
+  hud.message("Signing in to the SKR lounge...");
+  const signFor = (matchId: string) => async (nonce: string): Promise<SignedJoin> => {
+    const signed = await native.signJoin(matchId, nonce);
+    if (signed.wallet !== wallet) throw new Error("the wallet that signed is not the one connected");
+    return { matchId, wallet: signed.wallet, sig: signed.signature, ...(mint ? { mint } : {}) };
+  };
+  net = new Net(serverUrl, async (challenge) => {
+    if (!challenge.loungeMatchId) throw new Error("the SKR lounge is not open on this server");
+    const sign = signFor(challenge.loungeMatchId);
+    rejoin = { matchId: challenge.loungeMatchId, sign };
+    return sign(challenge.nonce);
+  }, handlers);
 }
 
 const handlers: NetHandlers = {

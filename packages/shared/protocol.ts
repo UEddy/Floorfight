@@ -24,9 +24,11 @@ export const PROTOCOL_VERSION = 7;
  * 6 refuses a lag compensated hit on a victim who is behind cover at the
  * tick the shot is resolved. 7 is the 96 by 96 hall, respawning away from
  * enemies, rifle and pistol range long enough for it, and recoil. 8 rewinds
- * up to half a second and retunes the weapons.
+ * up to half a second and retunes the weapons. 9 adds each player's SKR
+ * badge tier to the roster: the simulation is unchanged, the log's bytes
+ * are not.
  */
-export const LOG_VERSION = 8;
+export const LOG_VERSION = 9;
 
 /** Abuse limits. Exceed any of these and the connection is closed. */
 export const MAX_MSG_BYTES = 4096;
@@ -185,6 +187,12 @@ export type ServerMsg =
        * chain.
        */
       freeMatchId: string | null;
+      /**
+       * The SKR lounge room this connection could sit in, if the server has
+       * one: a free room open only to wallets holding enough SKR, checked
+       * server side at join. Absent or null when there is no lounge.
+       */
+      loungeMatchId?: string | null;
     }
   | {
       t: "accepted"; slot: number; tick: number; startsInMs: number;
@@ -244,6 +252,13 @@ export interface RosterEntry {
   wallet: string;
   collection: string | null; // verified mint collection, or null for default skin
   mint: string | null;
+  /**
+   * SKR badge tier, 0 for none (see shared/skr.ts). Set by the server from
+   * the wallet's mainnet balance after the join signature is checked; the
+   * client has no way to send one. Recorded in the match log so a replay
+   * sees the same roster, and never read by the simulation.
+   */
+  skr?: number;
 }
 
 export interface Standing {
@@ -358,13 +373,16 @@ export function decanonicalise(text: string): MatchLog | null {
   const log: MatchLog = {
     v, matchId, map, spreadSalt, startedAt,
     roster: roster.map((r) => {
-      const [slot, wallet, collection, mint] = r as unknown[];
-      return {
+      const [slot, wallet, collection, mint, skr] = r as unknown[];
+      const entry: RosterEntry = {
         slot: slot as number,
         wallet: wallet as string,
         collection: (collection ?? null) as string | null,
         mint: (mint ?? null) as string | null,
       };
+      // From log version 9 the roster carries the SKR badge tier.
+      if ((r as unknown[]).length >= 5) entry.skr = skr as number;
+      return entry;
     }),
     ticks: ticks.map((t) => {
       const [tick, inputs] = t as unknown[];
@@ -408,7 +426,12 @@ export function canonicalise(log: MatchLog): string {
         : null,
     ),
   ]);
-  const roster = log.roster.map((r) => [r.slot, r.wallet, r.collection, r.mint]);
+  // From version 9 each roster row also carries its SKR badge tier, 0 for
+  // none. Older logs keep their four columns, so they still hash to what
+  // was written on chain for them.
+  const roster = log.roster.map((r) => log.v >= 9
+    ? [r.slot, r.wallet, r.collection, r.mint, r.skr ?? 0]
+    : [r.slot, r.wallet, r.collection, r.mint]);
   const standings = log.standings.map((s) => [s.slot, s.wallet, s.kills, s.deaths, s.place]);
   return JSON.stringify([
     log.v, log.matchId, log.map, log.spreadSalt, roster, log.startedAt, ticks, standings,

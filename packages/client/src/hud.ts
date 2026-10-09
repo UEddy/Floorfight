@@ -1,5 +1,6 @@
 import { MAX_HP, TICK_HZ, type HitEvent } from "../../shared/sim";
 import { WEAPONS, weaponName } from "../../shared/weapons";
+import { SKR_TIERS, cleanTier, tierName } from "../../shared/skr";
 import type { RosterEntry, SnapshotPlayer, Standing } from "../../shared/protocol";
 import { SLOT_COLORS } from "./render";
 
@@ -66,6 +67,17 @@ export class Hud {
   private ammoKey = "";
   private plateEls: HTMLElement[] = [];
   names: string[] = [];
+  /** SKR badge tier per seat, from the roster the server sent. */
+  tiers: number[] = [];
+
+  /** A small SKR badge for a seat, or nothing. */
+  private badge(slot: number): string {
+    const t = this.tiers[slot] ?? 0;
+    const name = tierName(t);
+    if (!name) return "";
+    const c = SKR_TIERS[t - 1].colour.toString(16).padStart(6, "0");
+    return ` <span class="badge" style="--c:#${c}" title="${name}">SKR</span>`;
+  }
 
   constructor(private localSlot: number) {
     this.buildWeaponBar();
@@ -84,6 +96,9 @@ export class Hud {
 
   setRoster(roster: RosterEntry[]): void {
     this.names = roster.map((r) => `P${r.slot + 1} ${shortWallet(r.wallet)}`);
+    // The server's tier for each seat, cleaned: a roster is still a message
+    // off the wire, and a bad field is no badge rather than a broken page.
+    this.tiers = roster.map((r) => cleanTier(r.skr));
   }
 
   /** Short name for a slot, as used in the feed and the banners. */
@@ -182,7 +197,7 @@ export class Hud {
   kill(e: HitEvent): void {
     const row = document.createElement("div");
     const tag = (s: number) =>
-      `<span style="color:${hex(SLOT_COLORS[s % SLOT_COLORS.length])}">${this.who(s)}</span>`;
+      `<span style="color:${hex(SLOT_COLORS[s % SLOT_COLORS.length])}">${this.who(s)}</span>${this.badge(s)}`;
     row.innerHTML = `${tag(e.shooter)} ${e.head ? "headshot" : "killed"} ${tag(e.victim)}` +
       ` <span class="w">${weaponName(e.weapon)}</span>`;
     if (e.shooter === this.localSlot || e.victim === this.localSlot) row.className = "me";
@@ -330,7 +345,7 @@ export class Hud {
       if (el.dataset.k !== key) {
         el.dataset.k = key;
         const nm = el.querySelector(".nm") as HTMLElement;
-        nm.textContent = this.who(p.slot);
+        nm.innerHTML = `${this.who(p.slot)}${this.badge(p.slot)}`;
         nm.style.color = hex(SLOT_COLORS[p.slot % SLOT_COLORS.length]);
         const bar = el.querySelector(".bar i") as HTMLElement;
         bar.style.width = `${(frac * 100).toFixed(0)}%`;
